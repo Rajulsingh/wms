@@ -419,9 +419,44 @@ correct on the very first load, wrong on every poll after that.
   any `async` click handler that does `await` before touching `e.currentTarget`/`e.target` has this
   bug — capture the element into a variable first, always.
 
+## Recently done (2026-09-19, a ninth pass) — batches "all at once", and real packer visibility
+
+The eighth pass's continuous-flow fix worked but only claimed **one** additional batch per poll —
+so if more orders were open than one cart-load (`cart.slot_count`, 8 by default), a picker saw them
+trickle in one batch every 8s instead of all together. Separately, the packer dashboard
+(`/packer/home`) showed only "assigned to you" / "upcoming, already batched" — a freshly-imported
+order that no picker's page had polled yet was invisible anywhere on it, and there was no way for a
+packer to see what they'd actually finished that day.
+
+- **`getMyBatches` (picker.ts) now loops** `claimAvailableBatch` until it returns `null`, exactly
+  matching the loop `getMyPackBatches` (packer.ts) already used for packing. A picker opening the
+  page (or polling) now gets *every* currently-batchable order swept in at once, split into as many
+  cart-sized batches as needed, in one request — not one batch per tick. Verified live: inserted 12
+  fresh orders (more than one cart-load) while a picker had 2 unrelated orders already open and
+  unfinished, reloaded, and got all 3 batches (2+8+2 orders) on the same page in one shot.
+- **New: `getUnbatchedOrderSummary` (orders.ts)** — counts orders that are `pending`/`allocated`
+  but have no pick_batch at all yet (i.e. imported by the 5-minute Amazon sync cron but not yet
+  swept in by any picker's poll). Surfaced on `/packer/home`'s "Upcoming" section as a banner ("N
+  orders just pulled from Amazon (N units) — not yet batched") so a freshly-pulled order is visible
+  immediately, not only once some picker happens to load their page. Verified live: inserted orders
+  directly into D1 (simulating the cron), confirmed the banner appeared with the right counts before
+  any picker had touched them.
+- **New: `getPackerDailySummary` (packer.ts)** — every order *this* packer has actually finished
+  packing today (`pack_sessions` completed today, `date(completed_at) = date('now')`), with a
+  summary (orders/units packed) and a full list (order id, time, units, completed/partial outcome).
+  Rendered as a "Today — what you've packed" table plus two stat cards at the top of
+  `/packer/home`. This is the "so they know what they have done" piece — the dashboard previously
+  only ever showed work still waiting, never a record of what was already done. Verified live
+  against real pre-existing pack history in dev: 11 orders / 16 units rendered correctly with
+  per-order time and outcome pills.
+- Both new dashboard reads are scoped defensively: `getUnbatchedOrderSummary` never claims or
+  mutates anything (read-only, same as `getUpcomingBatches`), and `getPackerDailySummary` only reads
+  `pack_sessions` already marked `completed`/`partial` by the existing packing flow — neither
+  changes any picking/packing behavior, only what's visible.
+
 ## Next steps — a prioritized plan
 
-Rewritten 2026-09-19 (end of a long day, eight passes — see "Recently done" entries above for the
+Rewritten 2026-09-19 (end of a long day, nine passes — see "Recently done" entries above for the
 full story behind each). What's actually not done yet, ordered by what's blocking vs. not. See
 "Open items" below for full detail on each.
 

@@ -315,6 +315,50 @@ export async function completePackSession(db: D1Database, userId: string, packSe
   return outcome;
 }
 
+export interface PackerDailyOrder {
+  orderId: string;
+  externalOrderId: string;
+  outcome: 'completed' | 'partial';
+  completedAt: string;
+  unitsPacked: number;
+}
+
+export interface PackerDailySummary {
+  orderCount: number;
+  unitsPacked: number;
+  orders: PackerDailyOrder[];
+}
+
+/**
+ * What this packer has actually finished packing today, newest first — "so
+ * they know what they have done" instead of a dashboard that only ever
+ * shows work still waiting. `date(completed_at) = date('now')` scopes to
+ * the server's calendar day, same as any other "today" summary here would.
+ */
+export async function getPackerDailySummary(db: D1Database, warehouseId: string, packerId: string): Promise<PackerDailySummary> {
+  const rows = await db
+    .prepare(
+      `SELECT ps.order_id, o.external_order_id, ps.status, ps.completed_at,
+              (SELECT COALESCE(SUM(oi.quantity_packed), 0) FROM order_items oi WHERE oi.order_id = ps.order_id) AS units_packed
+       FROM pack_sessions ps JOIN orders o ON o.id = ps.order_id
+       WHERE ps.packer_id = ? AND o.warehouse_id = ? AND ps.status IN ('completed', 'partial')
+         AND date(ps.completed_at) = date('now')
+       ORDER BY ps.completed_at DESC`
+    )
+    .bind(packerId, warehouseId)
+    .all<{ order_id: string; external_order_id: string; status: 'completed' | 'partial'; completed_at: string; units_packed: number }>();
+
+  const orders: PackerDailyOrder[] = rows.results.map((r) => ({
+    orderId: r.order_id,
+    externalOrderId: r.external_order_id,
+    outcome: r.status,
+    completedAt: r.completed_at,
+    unitsPacked: r.units_packed
+  }));
+
+  return { orderCount: orders.length, unitsPacked: orders.reduce((sum, o) => sum + o.unitsPacked, 0), orders };
+}
+
 export interface AwbResult {
   shipmentId: string;
   awbCode: string;

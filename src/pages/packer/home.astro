@@ -17,6 +17,8 @@ import TopBar from '../../components/TopBar.astro';
   </div>
 
   <script>
+    import { escapeHtml } from '../../lib/ui';
+
     interface MyBatch {
       batchId: string;
       orderCount: number;
@@ -29,6 +31,23 @@ import TopBar from '../../components/TopBar.astro';
       orderCount: number;
       skuCount: number;
       unitCount: number;
+    }
+    interface UnbatchedSummary {
+      orderCount: number;
+      skuCount: number;
+      unitCount: number;
+    }
+    interface DailyOrder {
+      orderId: string;
+      externalOrderId: string;
+      outcome: 'completed' | 'partial';
+      completedAt: string;
+      unitsPacked: number;
+    }
+    interface DailySummary {
+      orderCount: number;
+      unitsPacked: number;
+      orders: DailyOrder[];
     }
 
     const app = document.getElementById('app')!;
@@ -82,15 +101,30 @@ import TopBar from '../../components/TopBar.astro';
     async function load() {
       try {
         const data = await api(`/api/packer/dashboard?warehouseId=${warehouseId}`);
-        render(data.myBatches ?? [], data.upcoming ?? []);
+        render(data.myBatches ?? [], data.upcoming ?? [], data.unbatched ?? null, data.today ?? null);
       } catch (err) {
         app.innerHTML = `<div class="banner banner-danger">${(err as Error).message}</div>`;
       }
     }
 
-    function render(myBatches: MyBatch[], upcoming: UpcomingBatch[]) {
+    function formatTime(iso: string): string {
+      return new Date(iso).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+    }
+
+    function render(myBatches: MyBatch[], upcoming: UpcomingBatch[], unbatched: UnbatchedSummary | null, today: DailySummary | null) {
       app.innerHTML = `
-        <div class="stack" style="gap: 10px;">
+        <div class="stat-grid">
+          <div class="stat-card stat-card-accent-success">
+            <span class="stat-card-value">${today?.orderCount ?? 0}</span>
+            <span class="stat-card-label">Orders packed today</span>
+          </div>
+          <div class="stat-card stat-card-accent-neutral">
+            <span class="stat-card-value">${today?.unitsPacked ?? 0}</span>
+            <span class="stat-card-label">Units packed today</span>
+          </div>
+        </div>
+
+        <div class="stack" style="gap: 10px; margin-top: 8px;">
           <span class="eyebrow">Assigned to you</span>
           ${
             myBatches.length
@@ -115,6 +149,11 @@ import TopBar from '../../components/TopBar.astro';
         <div class="stack" style="gap: 10px; margin-top: 8px;">
           <span class="eyebrow">Upcoming — pulled, not yet assigned</span>
           ${
+            unbatched && unbatched.orderCount > 0
+              ? `<div class="banner banner-warning">${unbatched.orderCount} order${unbatched.orderCount > 1 ? 's' : ''} just pulled from Amazon (${unbatched.unitCount} unit${unbatched.unitCount > 1 ? 's' : ''}) — not yet batched. This happens automatically once a picker's page is open.</div>`
+              : ''
+          }
+          ${
             upcoming.length
               ? `<div class="stack" style="gap: 8px;">
                   ${upcoming
@@ -130,7 +169,32 @@ import TopBar from '../../components/TopBar.astro';
                     )
                     .join('')}
                 </div>`
-              : `<p>Nothing waiting — every pulled batch is already assigned.</p>`
+              : !unbatched || unbatched.orderCount === 0
+                ? `<p>Nothing waiting — every pulled order is already assigned.</p>`
+                : ''
+          }
+        </div>
+
+        <div class="stack" style="gap: 10px; margin-top: 8px;">
+          <span class="eyebrow">Today — what you've packed</span>
+          ${
+            today && today.orders.length
+              ? `<div class="table-scroll"><table>
+                  <thead><tr><th>Order ID</th><th>Time</th><th>Units</th><th>Outcome</th></tr></thead>
+                  <tbody>
+                    ${today.orders
+                      .map(
+                        (o) => `<tr>
+                          <td style="font-weight:700; font-variant-numeric: tabular-nums;">${escapeHtml(o.externalOrderId)}</td>
+                          <td>${formatTime(o.completedAt)}</td>
+                          <td>${o.unitsPacked}</td>
+                          <td><span class="status-pill ${o.outcome === 'completed' ? 'status-success' : 'status-warning'}">${o.outcome}</span></td>
+                        </tr>`
+                      )
+                      .join('')}
+                  </tbody>
+                </table></div>`
+              : `<p>Nothing packed yet today.</p>`
           }
         </div>`;
     }

@@ -68,6 +68,40 @@ export async function importAmazonOrders(db: D1Database, warehouseId: string, or
   return summary;
 }
 
+export interface UnbatchedOrderSummary {
+  orderCount: number;
+  skuCount: number;
+  unitCount: number;
+}
+
+/**
+ * Orders sitting open (imported/entered, not yet swept into any pick_batch)
+ * right now — the raw pending pool `createPickBatch` sweeps from, before any
+ * batch exists. Since the Amazon sync cron auto-imports every 5 minutes but
+ * never auto-batches (batching only happens when a picker's page polls, see
+ * claimAvailableBatch in picker.ts), a freshly-pulled order can sit here for
+ * a real stretch if nobody's actively picking. Shown on the packer dashboard
+ * so a freshly-pulled order is visible immediately, not only once some
+ * picker's poll happens to sweep it into a batch. Read-only — visibility
+ * only, not a claim action. See HANDOFF.md.
+ */
+export async function getUnbatchedOrderSummary(db: D1Database, warehouseId: string): Promise<UnbatchedOrderSummary> {
+  const rows = await db
+    .prepare(
+      `SELECT oi.sku_id, oi.quantity_ordered, o.id AS order_id
+       FROM order_items oi JOIN orders o ON o.id = oi.order_id
+       WHERE o.warehouse_id = ? AND o.status IN ('pending', 'allocated') AND oi.status = 'pending'`
+    )
+    .bind(warehouseId)
+    .all<{ sku_id: string; quantity_ordered: number; order_id: string }>();
+
+  return {
+    orderCount: new Set(rows.results.map((r) => r.order_id)).size,
+    skuCount: new Set(rows.results.map((r) => r.sku_id)).size,
+    unitCount: rows.results.reduce((sum, r) => sum + r.quantity_ordered, 0)
+  };
+}
+
 export interface CreateBatchResult {
   batchId: string;
   orderCount: number;

@@ -429,13 +429,19 @@ export async function getMyActiveBatches(db: D1Database, warehouseId: string, pi
  */
 export async function getMyBatches(db: D1Database, warehouseId: string, pickerId: string): Promise<Array<{ batchId: string; rows: PickListRow[] }>> {
   const batchIds = await getMyActiveBatches(db, warehouseId, pickerId);
-  // Always also try to pick up anything freshly available — not gated on
-  // "only when I have none" — so this doubles as the continuous-flow poll:
-  // orders that land mid-walk get swept into a new batch and appended to
-  // the picker's page on the next tick, instead of waiting for them to
-  // finish everything already open. See claimAvailableBatch. HANDOFF.md.
-  const claimed = await claimAvailableBatch(db, warehouseId, pickerId);
-  if (claimed) batchIds.push(claimed);
+  // Sweep in everything currently available, not just one — not gated on
+  // "only when I have none" either, so this doubles as the continuous-flow
+  // poll: orders that land mid-walk (or were just sitting open when the
+  // picker first opened the page) get swept into fresh batches and appended
+  // to the picker's page all at once, instead of trickling in one cart-load
+  // per 8s poll tick. Mirrors packing's getMyPackBatches, which already
+  // loops the same way. claimAvailableBatch is naturally bounded — it stops
+  // once there's nothing left open to batch. See HANDOFF.md.
+  for (;;) {
+    const claimed = await claimAvailableBatch(db, warehouseId, pickerId);
+    if (!claimed) break;
+    batchIds.push(claimed);
+  }
   const out: Array<{ batchId: string; rows: PickListRow[] }> = [];
   for (const batchId of batchIds) {
     out.push({ batchId, rows: await getPickListView(db, batchId) });
