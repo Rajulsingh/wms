@@ -69,6 +69,7 @@ import TopBar from '../../components/TopBar.astro';
     let batchList: BatchEntry[] = [];
     let labelQueue: PackBatchOrder[] = [];
     let sortMode: SortMode = 'sku';
+    let selectedOrderIds = new Set<string>();
     let lastError = '';
     let pollTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -289,6 +290,11 @@ import TopBar from '../../components/TopBar.astro';
       const readyEntries = getReadyEntries();
       const readyOrderCount = readyEntries.reduce((sum, e) => sum + e.pack.orders.length, 0);
 
+      // Drop any selected id that's no longer selectable (already packed by
+      // now, or vanished from the list) so the count shown never lags reality.
+      const selectableIds = new Set(rows.filter((r) => !r.order.allPacked && r.items.length > 0).map((r) => r.order.orderId));
+      for (const id of selectedOrderIds) if (!selectableIds.has(id)) selectedOrderIds.delete(id);
+
       app.innerHTML = `
         ${errorBanner()}
         <div class="row" style="justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
@@ -301,7 +307,18 @@ import TopBar from '../../components/TopBar.astro';
             <option value="order">Sort by order ID</option>
           </select>
         </div>
-        ${readyOrderCount > 0 ? `<button class="btn btn-primary" id="finish-all">Finish packing — apply labels (${readyOrderCount})</button>` : ''}
+        ${
+          selectedOrderIds.size > 0
+            ? `<div class="row" style="justify-content: space-between; align-items: center; gap: 10px; background: var(--surface-2); padding: 10px 14px; border-radius: var(--radius); margin-top: 10px;">
+                 <span style="font-weight: 600; font-size: 0.85rem;">${selectedOrderIds.size} selected</span>
+                 <div class="row" style="width: auto; gap: 8px;">
+                   <button class="btn btn-ghost" id="clear-selection" style="width: auto;">Clear</button>
+                   <button class="btn btn-primary" id="bulk-pack" style="width: auto;">Mark ${selectedOrderIds.size} packed</button>
+                 </div>
+               </div>`
+            : ''
+        }
+        ${readyOrderCount > 0 ? `<button class="btn btn-primary" id="finish-all" style="margin-top: 10px;">Finish packing — apply labels (${readyOrderCount})</button>` : ''}
         <div class="stack" id="order-container" style="gap: 14px; margin-top: 6px;"></div>`;
 
       const select = document.getElementById('sort-select') as unknown as HTMLSelectElement;
@@ -311,6 +328,11 @@ import TopBar from '../../components/TopBar.astro';
         render();
       });
       document.getElementById('finish-all')?.addEventListener('click', finishAllReady);
+      document.getElementById('bulk-pack')?.addEventListener('click', handleBulkMarkPacked);
+      document.getElementById('clear-selection')?.addEventListener('click', () => {
+        selectedOrderIds.clear();
+        render();
+      });
 
       const container = document.getElementById('order-container')!;
       for (const row of rows) container.appendChild(renderOrderCard(row));
@@ -328,12 +350,17 @@ import TopBar from '../../components/TopBar.astro';
       // a routine single-item order — easy to under-pack by habit otherwise.
       const isMultiItem = items.length > 1;
       const isMultiQty = items.some((i) => i.quantity_required > 1);
+      // Selectable for the bulk "mark packed" action below — same
+      // eligibility as the individual button (not already packed, has
+      // something to pack).
+      const selectable = !order.allPacked && !nothingToPack;
 
       const el = document.createElement('div');
       el.className = 'card';
       el.innerHTML = `
         <div class="row" style="justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap;">
-          <div class="row" style="width: auto; gap: 6px; align-items: center;">
+          <div class="row" style="width: auto; gap: 10px; align-items: center;">
+            ${selectable ? `<input type="checkbox" class="order-select" style="width: 20px; height: 20px; flex-shrink: 0;" ${selectedOrderIds.has(order.orderId) ? 'checked' : ''} />` : ''}
             <span style="font-weight: 700; font-variant-numeric: tabular-nums;">${escapeHtml(order.externalOrderId)}</span>
             ${isMultiItem ? '<span class="status-pill status-warning">Multi-item</span>' : ''}
             ${isMultiQty ? '<span class="status-pill status-warning">Multi-qty</span>' : ''}
@@ -343,10 +370,16 @@ import TopBar from '../../components/TopBar.astro';
         ${order.notes ? `<div class="banner banner-warning" style="margin-top: 6px; padding: 8px 12px;">${escapeHtml(order.notes)}</div>` : ''}
         ${nothingToPack ? '<p style="font-size: 0.8rem; margin: 8px 0 0;">Nothing to pack — every item on this order came back short or damaged while picking. It still needs a label.</p>' : ''}
         <div class="stack" id="lines-${order.packSessionId}" style="gap: 10px; margin-top: 10px;"></div>
-        ${!order.allPacked && !nothingToPack ? `<button class="btn btn-primary" data-action="pack-order" style="margin-top: 10px;">Mark order packed</button>` : ''}`;
+        ${selectable ? `<button class="btn btn-primary" data-action="pack-order" style="margin-top: 10px;">Mark order packed</button>` : ''}`;
 
       const linesEl = el.querySelector(`#lines-${order.packSessionId}`)!;
       for (const item of items) linesEl.appendChild(renderOrderLine(item, order.allPacked));
+
+      el.querySelector('.order-select')?.addEventListener('change', () => {
+        if (selectedOrderIds.has(order.orderId)) selectedOrderIds.delete(order.orderId);
+        else selectedOrderIds.add(order.orderId);
+        render();
+      });
 
       el.querySelector('[data-action="pack-order"]')?.addEventListener('click', async () => {
         const lines = items.map((item) => {
@@ -406,6 +439,37 @@ import TopBar from '../../components/TopBar.astro';
         lastError = (err as Error).message;
         render();
       }
+    }
+
+    // Bulk version of handleMarkPacked — every selected order at once, each
+    // submitted at its own full required quantity (no per-line adjustment in
+    // a bulk flow; a packer who needs to short-pack one specific order does
+    // that individually via its own "Mark order packed" instead of selecting
+    // it here). Failures across the batch are collected into one message
+    // rather than each order's own attempt clobbering the last, since
+    // there's no single call to fail or succeed here — many independent ones.
+    async function handleBulkMarkPacked() {
+      const ids = [...selectedOrderIds];
+      if (!ids.length) return;
+      const rows = flattenOrders().filter((r) => ids.includes(r.order.orderId) && !r.order.allPacked && r.items.length > 0);
+
+      lastError = '';
+      const failed: string[] = [];
+      for (const row of rows) {
+        const snapshot = row.entry.pack.items.map((i) => ({ ...i }));
+        const lines = row.items.map((i) => ({ orderItemId: i.order_item_id, quantity: i.quantity_required }));
+        applyOptimisticPackOrder(row.entry.pack.items, lines);
+        render();
+        try {
+          row.entry.pack = await api('/api/packer/mark-item', { pickBatchId: row.entry.pack.pickBatchId, orderId: row.order.orderId, lines });
+        } catch {
+          row.entry.pack.items = snapshot;
+          failed.push(row.order.externalOrderId);
+        }
+      }
+      if (failed.length) lastError = `Could not mark packed: ${failed.join(', ')}`;
+      selectedOrderIds.clear();
+      render();
     }
 
     // The single, page-level "Finish packing" action: completes every

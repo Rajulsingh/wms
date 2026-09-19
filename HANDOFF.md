@@ -769,9 +769,37 @@ A round of concrete UI feedback across the picker, packer, and dashboard screens
   separately; the dashboard's "Assigned to you" correctly collapsed 15 individually-claimed orders
   into one card/button; packed one order and confirmed its photo rendered in the "Today" table.
 
+## Recently done (2026-09-20, an eighteenth pass) — multi-unit highlighting, bulk packing
+
+Two more pieces of concrete floor-UI feedback, one for picking and one for packing:
+
+- **`/picker`'s multi-unit orders are now their own highlighted badges, not folded into a count.**
+  Previously "N multi-unit orders" was a single plain-text number; now every multi-unit order gets
+  its own `status-warning` pill showing its actual quantity ("3×", "2×", ...) next to a "Multi-unit:"
+  label, so a picker sees exactly how many to set aside for each one at a glance, not just that some
+  exist. The single-unit count stays as before, plain text. Also renamed the primary action button
+  from "Mark done" to **"Picked"** — the reason-flow button (short/damaged) and the packing side's
+  own "Mark order packed" are unchanged, this was specifically the picker's default confirm button.
+- **`/packer` gets multi-select + bulk "Mark N packed"**: a checkbox on every order card that's
+  still selectable (not already packed, has something to pack) — same eligibility as its own
+  individual button. Selecting any brings up a toolbar ("N selected · Clear · Mark N packed").
+  Bulk-marking submits every selected order at its own full required quantity in one action
+  (`handleBulkMarkPacked`, packer/index.astro) — no per-line adjustment in the bulk flow; a packer
+  who needs to short-pack one specific order still does that individually via its own button,
+  which stays untouched and fully independent of the bulk one. Selection is pruned automatically
+  on every render against whatever's currently selectable, so a stale selection (an order that
+  became packed some other way, or scrolled out of the list) never lingers in the count.
+- **Verified live in dev**: three orders needing quantities 1/2/3 of the same SKU rendered as "1
+  single-unit order" (the qty-1 order) plus two separate highlighted badges, "2×" and "3×" (the
+  other two), and the button read "Picked"; selected three separate packing orders via checkbox, confirmed the "3 selected"
+  toolbar and correct button label, clicked "Mark 3 packed" once, and confirmed all three flipped to
+  `Packed` server-side (`order_items.status`, order status `'packing'` — same as marking each
+  individually, just in one tap) with the selection cleared and checkboxes correctly gone once
+  packed.
+
 ## Next steps — a prioritized plan
 
-Rewritten 2026-09-20 (seventeen passes across two days — see "Recently done" entries above for the
+Rewritten 2026-09-20 (eighteen passes across two days — see "Recently done" entries above for the
 full story behind each). What's actually not done yet, ordered by what's blocking vs. not. See
 "Open items" below for full detail on each.
 
