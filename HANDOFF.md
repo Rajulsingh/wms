@@ -601,13 +601,65 @@ at a time, instead of once for the whole batch of orders a packer had just finis
   scanning through all three in sequence down to an empty queue — all three reached
   `ready_to_ship`.
 
+## Recently done (2026-09-20, a thirteenth pass) — the real "not fetching all the orders" bug
+
+The user reported orders going missing from the WMS entirely — specifically worried about an order
+whose Amazon Easy Ship pickup gets scheduled the night before but still needs to be physically
+picked the next morning. Traced to two real bugs in `fetchUnfulfilledOrders` (`amazon.ts`), found
+by testing against the real production SP-API account (read-only — `GetOrders`/`GetOrderItems`,
+no scheduling/purchasing, per the standing safety rule):
+
+- **The real root cause**: the per-order `GetOrderItems` call inside the fetch loop had no error
+  handling — if it failed for even *one* order (a transient SP-API rate limit or 500; this endpoint
+  has a tight per-second limit and the loop calls it once per order back-to-back with no
+  throttling), the whole function *threw*, discarding every order already fetched in that same
+  call — not just the failing one. `importAmazonOrders` got zero orders back for that entire sync
+  tick, silently (the cron's own catch just `console.error`s and moves on). This is a very
+  plausible explanation for orders seeming to vanish: one flaky order among several overnight
+  arrivals could wipe out the whole batch's import, and it would only self-heal on a later cron
+  tick if that same order didn't fail again. Fixed: a failing order's item-fetch is now caught,
+  logged, and skipped — every other order in the same call still gets returned and imported.
+- **`OrderStatuses` filter widened** from `Unshipped,PartiallyShipped` to
+  `Pending,Unshipped,PartiallyShipped` — an order can sit as `Pending` overnight (payment/COD
+  confirmation) and be released for fulfillment by morning; excluding it meant it never entered
+  our system at all until its Amazon-side status happened to flip before some later sync caught it,
+  which isn't guaranteed. `reserveOrderForPicking` handles a `Pending` order exactly like any
+  other; if Amazon later cancels it, `syncOrderStatuses` (`amazon-sync.ts`) already catches that.
+- **The Easy-Ship-scheduled-the-night-before scenario itself was already fine**, verified by
+  reading the code path rather than guessing: `scheduleEasyShipForOrder` (`shipping.ts`) never
+  touches `orders.status` at all — scheduling a pickup only ever creates local `packages`/
+  `shipments`/`awbs` rows (with `pack_session_id` left `NULL`, matched up later by the packer's own
+  AWB scan — see `applyAwb` in `packer.ts`). An order stays in the normal pick/pack pipeline exactly
+  as if nothing had been scheduled; scheduling early doesn't fast-forward or hide it. Nothing to fix
+  there — the actual bug was the fetch-loop one above.
+- **Verified against the real account**: with both fixes in place, one real import call against
+  production Amazon returned 30 real orders in one pass (0 silently dropped) — 30 of those came
+  back reported as short-on-stock across a wide set of SKUs (`DOG-BKM-5`, `GWM-5`, `KTN3`,
+  `U8-9OI6-L4OE`, `JC-82IW-CSC1`, and others), each with an exact "needs X, only 0 in stock"
+  reason. **This is real, actionable backlog, not a bug** — those orders are correctly staying
+  `pending`/blocked until stock is received for those SKUs (see the eleventh pass's retry
+  mechanism — `retryBlockedOrdersForSku` will resolve each one automatically the moment stock
+  lands, or admin can force it sooner via "Retry blocked orders"). Flagging here since it surfaced
+  during this fix and the user should know: a real chunk of recent orders across many SKUs are
+  currently unfulfillable for lack of stock.
+- **Known limitation, not fixed this pass**: no throttling/backoff between the per-order
+  `GetOrderItems` calls — the catch-and-skip fix tolerates an occasional failure but doesn't reduce
+  how often one happens. Fine at the current order volume (a few dozen per sync); would need a
+  small delay between calls (or batching) if volume grows enough to hit SP-API's rate limit
+  routinely rather than occasionally.
+
 ## Next steps — a prioritized plan
 
-Rewritten 2026-09-20 (twelve passes across two days — see "Recently done" entries above for the
+Rewritten 2026-09-20 (thirteen passes across two days — see "Recently done" entries above for the
 full story behind each). What's actually not done yet, ordered by what's blocking vs. not. See
 "Open items" below for full detail on each.
 
-1. **Get the Amazon Easy Ship SP-API role granted.** Still the one thing blocking real use of
+1. **Receive stock for the SKUs currently blocking real orders.** Surfaced by the thirteenth
+   pass's fetch fix, not caused by it: `DOG-BKM-5`, `GWM-5`, `KTN3`, `U8-9OI6-L4OE`,
+   `JC-82IW-CSC1`, and others are all at zero stock with real orders waiting on them. Receive stock
+   for each via `/admin/inbound` — every matching blocked order resolves automatically the moment
+   its SKU gets stock (no further action needed per order).
+2. **Get the Amazon Easy Ship SP-API role granted.** Still the one thing blocking real use of
    shipping (single-order, bulk, everything) *and* packing's bulk-label piece (part 2 of 3, see
    "Open items" #14). It's on the user, not something to keep investigating from this end — check
    Seller Central's app-authorization page for an "Easy Ship" scope. Once granted, the very first
@@ -619,30 +671,32 @@ full story behind each). What's actually not done yet, ordered by what's blockin
    the way `scheduleEasyShipBulk` assumes (flagged since item 13, still unverified). None of that
    has ever been exercised against a live account. The bulk/single ship pages now have a
    confirmation step before anything fires, so this smoke test won't happen by accident.
-2. **Work through the remaining SKU-duplicate merges.** The fifth pass fixed all 34 *exact*-name
+3. **Work through the remaining SKU-duplicate merges.** The fifth pass fixed all 34 *exact*-name
    duplicate groups live in one sweep, but `/admin/inventory`'s scanner only catches exact matches
    — near-duplicates (a trailing "(Classic)", a punctuation difference) still need manual review.
    Run "Scan for duplicates" again next session to see what's accumulated since (new orders keep
    auto-creating SKUs for SellerSKU variants never seen before — that's expected, not a bug).
-3. **Real box sizes.** Only demo/test boxes existed as of the start of this session — confirm with
+4. **Real box sizes.** Only demo/test boxes existed as of the start of this session — confirm with
    the user whether their actual box dimensions have been entered in `/admin/settings` yet.
-4. **Confirm the ship-from address is real**, not a placeholder — check `/admin/settings` before
+5. **Confirm the ship-from address is real**, not a placeholder — check `/admin/settings` before
    the first real label purchase.
-5. **Decide the 30-day data-disposal scope** (see open item, below) — this was *committed to
+6. **Decide the 30-day data-disposal scope** (see open item, below) — this was *committed to
    Amazon in writing* with no enforcement code yet. Needs three scoping answers from the user
    before it can be built safely; the cron infrastructure already exists (`src/worker.ts`) so the
    actual job is easy to add once those answers exist.
-6. **Ask-before-building items**: individually-strengthened admin auth (currently same weak PIN
+7. **Ask-before-building items**: individually-strengthened admin auth (currently same weak PIN
    as floor workers), a public privacy policy URL for ecomglider.com, what should happen when an
    Amazon cancellation lands on an order already fully picked/packed (currently just an exception
    event for manual putback), whether the Amazon catalog sync should become automatic (periodic
    cron) rather than a manual button, and the broader HTML-escaping audit flagged as Open item #16
    (the notes feature is covered; older fields like `first_item_name`'s title attribute aren't).
    None of these are urgent; don't build them unprompted.
-7. **Minor cleanup, low priority**: `src/pages/api/picker/scan-item.ts` (and `verifyItemScan` in
+8. **Minor cleanup, low priority**: `src/pages/api/picker/scan-item.ts` (and `verifyItemScan` in
    `picker.ts`) is dead code from before the picker dropped mandatory scanning — nothing calls it.
    `Warehouse` type in `types.ts` is missing the `ship_from_*` columns (cosmetic, nothing breaks).
-8. **If the user says the UI looks off somewhere**, the fix pattern is established (see "Design
+   No throttling between per-order `GetOrderItems` calls in `fetchUnfulfilledOrders` (see the
+   thirteenth pass) — fine at current volume, revisit if SP-API rate-limit errors become frequent.
+9. **If the user says the UI looks off somewhere**, the fix pattern is established (see "Design
    system") — reuse `AdminShell`/existing component classes. If it's a *mobile* complaint, verify
    with `document.documentElement.scrollWidth` at 375px before guessing — this has caught two real
    bugs this session that weren't visible on desktop (the Required/Picked stat block, and the bare

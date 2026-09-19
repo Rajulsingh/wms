@@ -138,7 +138,15 @@ export async function fetchUnfulfilledOrders(since: Date): Promise<AmazonOrder[]
   } else {
     url.searchParams.set('LastUpdatedAfter', since.toISOString());
     url.searchParams.set('FulfillmentChannels', 'MFN');
-    url.searchParams.set('OrderStatuses', 'Unshipped,PartiallyShipped');
+    // Pending included alongside Unshipped/PartiallyShipped — an order can
+    // sit as Pending overnight (payment/COD confirmation) and be released
+    // for fulfillment by morning; excluding it meant it never entered our
+    // system at all until its status happened to flip before the next sync,
+    // which isn't guaranteed. Amazon is still the source of truth for
+    // whether it's actually ready — reserveOrderForPicking (orders.ts)
+    // handles a Pending order the same as any other; if Amazon later
+    // cancels it, syncOrderStatuses (amazon-sync.ts) catches that.
+    url.searchParams.set('OrderStatuses', 'Pending,Unshipped,PartiallyShipped');
   }
 
   const res = await fetch(url, { headers: { 'x-amz-access-token': accessToken } });
@@ -162,13 +170,27 @@ export async function fetchUnfulfilledOrders(since: Date): Promise<AmazonOrder[]
     // Sandbox's getOrderItems only recognizes the literal path "TEST_CASE_200"
     // — the real order id it just handed us in the GetOrders response 400s.
     const itemsOrderId = isSandbox ? 'TEST_CASE_200' : orderId;
-    const itemsRes = await fetch(`${baseUrl(env)}/orders/v0/orders/${itemsOrderId}/orderItems`, {
-      headers: { 'x-amz-access-token': accessToken }
-    });
-    if (!itemsRes.ok) {
-      throw new Error(`SP-API GetOrderItems failed for ${orderId}: ${itemsRes.status} ${await itemsRes.text()}`);
+
+    // One order's item-fetch failing (a transient SP-API rate limit or
+    // 500 is common here — GetOrderItems has a tight per-second limit and
+    // this loop calls it once per order with no throttling) must not throw
+    // away every other order already fetched in this same call. Previously
+    // it did: the whole function threw, so the caller (importAmazonOrders)
+    // got zero orders back for the entire sync tick, silently — "not
+    // fetching all the orders" traced back to exactly this. Skip just the
+    // failing order and keep going; it's still in Amazon's system and will
+    // be retried on the next sync since `since` always looks back 24h.
+    let itemsData: { payload?: { OrderItems?: Array<Record<string, unknown>> } };
+    try {
+      const itemsRes = await fetch(`${baseUrl(env)}/orders/v0/orders/${itemsOrderId}/orderItems`, {
+        headers: { 'x-amz-access-token': accessToken }
+      });
+      if (!itemsRes.ok) throw new Error(`${itemsRes.status} ${await itemsRes.text()}`);
+      itemsData = (await itemsRes.json()) as { payload: { OrderItems: Array<Record<string, unknown>> } };
+    } catch (err) {
+      console.error(`SP-API GetOrderItems failed for ${orderId}, skipping this order for now:`, err);
+      continue;
     }
-    const itemsData = (await itemsRes.json()) as { payload: { OrderItems: Array<Record<string, unknown>> } };
 
     orders.push({
       amazonOrderId: orderId,
