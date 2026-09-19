@@ -32,6 +32,17 @@ const hints = new Map<DecodeHintType, unknown>([
   ]
 ]);
 
+// Higher than the browser's low-res default so a small/far barcode actually
+// resolves — still light enough to decode fast at the tight poll interval
+// below. `advanced` focus constraints are ignored harmlessly where
+// unsupported (Safari/iOS) rather than failing the whole request.
+const videoConstraints: MediaTrackConstraints = {
+  facingMode: 'environment',
+  width: { ideal: 1280 },
+  height: { ideal: 720 },
+  advanced: [{ focusMode: 'continuous' } as MediaTrackConstraintSet]
+};
+
 export function stopScanning(): void {
   activeControls?.stop();
   activeControls = null;
@@ -49,31 +60,35 @@ export async function scanOnce(videoEl: HTMLVideoElement): Promise<string> {
 
   return new Promise<string>((resolve, reject) => {
     reader
-      .decodeFromConstraints(
-        {
-          video: {
-            facingMode: 'environment',
-            // Higher than the browser's low-res default so a small/far
-            // barcode actually resolves — still light enough to decode
-            // fast at 75ms intervals. `advanced` focus constraints are
-            // ignored harmlessly where unsupported (Safari/iOS) rather
-            // than failing the whole request.
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
-            advanced: [{ focusMode: 'continuous' } as MediaTrackConstraintSet]
-          }
-        },
-        videoEl,
-        (result, _err, controls) => {
-          activeControls = controls;
-          if (result) {
-            controls.stop();
-            activeControls = null;
-            resolve(result.getText());
-          }
-          // NotFoundException fires continuously while no code is in frame — not a real error, ignore it.
+      .decodeFromConstraints({ video: videoConstraints }, videoEl, (result, _err, controls) => {
+        activeControls = controls;
+        if (result) {
+          controls.stop();
+          activeControls = null;
+          resolve(result.getText());
         }
-      )
+        // NotFoundException fires continuously while no code is in frame — not a real error, ignore it.
+      })
       .catch((err) => reject(err));
   });
+}
+
+/**
+ * Keeps the camera open and calls `onDetect` for *every* code found, rather
+ * than resolving once and stopping — the Scan page's whole point is a
+ * packer working through a pile of boxes without a click per box. Caller
+ * must call `stopScanning()` when done (e.g. a "Stop scanning" button).
+ * `delayBetweenScanSuccess` is longer than the poll interval so the same
+ * barcode, still in frame right after a hit, isn't immediately re-fired
+ * before the packer has moved the next box into view.
+ */
+export function startContinuousScan(videoEl: HTMLVideoElement, onDetect: (text: string) => void, onError: (err: unknown) => void): void {
+  stopScanning();
+  const reader = new BrowserMultiFormatReader(hints, { delayBetweenScanAttempts: 75, delayBetweenScanSuccess: 1200 });
+  reader
+    .decodeFromConstraints({ video: videoConstraints }, videoEl, (result, _err, controls) => {
+      activeControls = controls;
+      if (result) onDetect(result.getText());
+    })
+    .catch(onError);
 }

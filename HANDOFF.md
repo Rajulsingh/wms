@@ -797,9 +797,66 @@ Two more pieces of concrete floor-UI feedback, one for picking and one for packi
   individually, just in one tap) with the selection cleared and checkboxes correctly gone once
   packed.
 
+## Recently done (2026-09-20, a nineteenth pass) — AWB scanning decoupled into its own record-keeping Scan section
+
+The user's objection to the fourteenth pass's inline scan screen: it made a packer pre-select "this
+specific order, now scan its label," one at a time, with a fresh click per order — "how is one
+supposed to match order id and scan label to that order id, this matching system makes less sense."
+Confirmed directly: **"this is just for record keeping"** — no clever verification wanted, just a
+packer scanning a pile of already-packed, already-labeled boxes continuously, with the system
+logging each one and building a table live. Planned in EnterPlanMode given the real design fork
+(what happens when a scanned code doesn't match anything) and a genuine accuracy question worth
+getting right before touching the shipping pipeline; simplified once during planning after the
+"record keeping" clarification dropped a tracking-id verification branch that wasn't wanted.
+
+- **Matching is pure FIFO, nothing smarter**: a scanned code always resolves to whichever order has
+  been sitting in the pending-label pool the longest (`getPendingLabels`, warehouse-wide — any
+  packer's completed order, not just the scanning packer's own), via the new
+  `applyAwbByScan(db, userId, warehouseId, awbCode)` (`packer.ts`). Replaces the old
+  `applyAwb(packSessionId, awbCode)`, which required a pre-selected order and did a mismatch check
+  against an expected tracking id — both gone.
+- **One wrinkle handled without reintroducing verification**: if admin already pre-purchased a real
+  Amazon label for the FIFO-matched order (`scheduleEasyShipForOrder`, before or during packing), a
+  `packages` row already exists for it with `pack_session_id` still `NULL`. `applyAwbByScan` looks
+  this up **by order id**, not by comparing codes, and links to that existing row instead of
+  creating a second one — otherwise the real purchased label would end up orphaned and untracked.
+  Verified live: pre-inserted a fake unlinked package+shipment (`tracking_id =
+  'REAL-AMZN-TRACKING-999'`) for a pending order, scanned that exact code, and confirmed the
+  *existing* shipment id came back — no duplicate package created.
+- **New `awb_scans` table** (migration `0013`, applied to both `--local` and `--remote`) — the
+  "separate database of scanned awb" the user asked for: a pure append-only log (code, matched
+  order, packer, timestamp), independent of `awbs` (one row per shipment). Deliberately never
+  deleted by `resetPickPackData` — a real gap found and fixed mid-verification: the reset's
+  `includeReadyToShip` path (sixteenth pass) hit a fresh FK violation the moment it tried to delete
+  shipments that `awb_scans` now referenced. Fixed the same way `exception_events` already handles
+  this — null the FK columns (`order_id`, `shipment_id`) before deleting the rows they point to,
+  keeping the scan log itself permanent.
+- **New `/packer/scan` page** — a real third destination, not just the "Scan" pill routing back to
+  `/packer` (the eighteenth pass's actual bug, now fixed on all three TopBars: `picker/index.astro`,
+  `packer/index.astro`, `packer/home.astro`). Shows "N waiting to be scanned" plus a compact preview
+  (photo, order id, SKU code, unit count) of what's coming, oldest first. "Start scanning" opens the
+  camera via a new `startContinuousScan` (`scanner-client.ts` — same hints/constraints as `scanOnce`
+  but never stops after the first hit); every detected code auto-submits with **no click required
+  per box**, flashes a one-line result, and prepends to a results table rebuilt from `getTodayScans`
+  on every load so nothing is lost on refresh. A manual-entry text field stays live alongside the
+  camera as a fallback. A real implementation bug caught and fixed before shipping: the first draft
+  called a full-page re-render after every scan, which would have destroyed and reopened the live
+  `<video>` element on every single box — exactly the per-box friction this page exists to remove.
+  Fixed by splitting the page into a `#scan-area` (built once when scanning starts, never touched
+  again until "Stop scanning") and a `#results-area` updated independently after each scan.
+- **`/packer`'s "Finish packing"** no longer builds a label queue or navigates into a scan screen —
+  it just completes the pack session(s) and shows a plain success banner pointing to `/packer/scan`.
+  Button relabeled from "Finish packing — apply labels (N)" to **"Finish packing (N)"**.
+- **Verified live end-to-end in dev**: packed and finished three orders roughly 2 seconds apart,
+  confirmed the Scan page listed them oldest-first with photo/SKU/units; scanned two arbitrary codes
+  and confirmed they matched the two oldest orders in order (never the same one twice); the
+  pre-purchased-package case above; a duplicate-code scan correctly rejected without touching the
+  still-pending order; and a full page reload correctly rebuilt the "scanned today" table from the
+  database rather than losing it.
+
 ## Next steps — a prioritized plan
 
-Rewritten 2026-09-20 (eighteen passes across two days — see "Recently done" entries above for the
+Rewritten 2026-09-20 (nineteen passes across two days — see "Recently done" entries above for the
 full story behind each). What's actually not done yet, ordered by what's blocking vs. not. See
 "Open items" below for full detail on each.
 
@@ -927,9 +984,11 @@ full story behind each). What's actually not done yet, ordered by what's blockin
 
 Core chain: `warehouses → zones → locations (racks/bins) → inventory (SKU×location, many-to-
 many) → skus`. Orders: `orders → order_items → pick_batches → pick_tasks → cart_slots`.
-Packing: `pack_sessions → packages → shipments → awbs`. Inbound: `inbound_receipts →
-inbound_receipt_lines` (increments `inventory.quantity_on_hand` directly — the counterpart to
-`reserveInventory`, which only ever takes stock out).
+Packing: `pack_sessions → packages → shipments → awbs`, plus `awb_scans` (migration `0013`) — a
+separate, permanent append-only scan log (order/shipment references nulled on reset, never the
+row itself), independent of `awbs`. Inbound: `inbound_receipts → inbound_receipt_lines`
+(increments `inventory.quantity_on_hand` directly — the counterpart to `reserveInventory`, which
+only ever takes stock out).
 
 Full schema is the migrations, read in order — each one is a real fix or feature, not a rewrite.
 Notable ones:

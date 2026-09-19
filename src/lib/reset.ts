@@ -16,8 +16,8 @@ export interface ResetResult {
  *
  * Stops at the shipping-label boundary by default: orders already at
  * 'ready_to_ship' are left untouched, since one may carry a REAL
- * Amazon-scheduled pickup/label (see applyAwb's pre-purchased-label path in
- * packer.ts) — resetting it would desync us from a commitment Amazon
+ * Amazon-scheduled pickup/label (see applyAwbByScan's pre-purchased-label path
+ * in packer.ts) — resetting it would desync us from a commitment Amazon
  * already has, not just clear local test state. `includeReadyToShip` is an
  * explicit opt-in (a checkbox on the admin button, defaulting off) for when
  * that's exactly what's wanted anyway — e.g. retesting a fully-completed
@@ -67,6 +67,12 @@ export async function resetPickPackData(db: D1Database, warehouseId: string, use
     }
   }
 
+  // The scan log is deliberately permanent record-keeping (see
+  // applyAwbByScan in packer.ts) — never deleted, but its FK references to
+  // orders/shipments about to disappear here have to be cleared first,
+  // same pattern already used for exception_events below.
+  await db.prepare(`UPDATE awb_scans SET order_id = NULL WHERE order_id IN (${orderPh})`).bind(...orderIds).run();
+
   // Packing rows for these orders — child tables first to satisfy FKs.
   const packSessions = await db.prepare(`SELECT id FROM pack_sessions WHERE order_id IN (${orderPh})`).bind(...orderIds).all<{ id: string }>();
   const sessionIds = packSessions.results.map((s) => s.id);
@@ -76,6 +82,10 @@ export async function resetPickPackData(db: D1Database, warehouseId: string, use
     const packageIds = packages.results.map((p) => p.id);
     if (packageIds.length) {
       const packagePh = packageIds.map(() => '?').join(',');
+      await db
+        .prepare(`UPDATE awb_scans SET shipment_id = NULL WHERE shipment_id IN (SELECT id FROM shipments WHERE package_id IN (${packagePh}))`)
+        .bind(...packageIds)
+        .run();
       await db.prepare(`DELETE FROM awbs WHERE shipment_id IN (SELECT id FROM shipments WHERE package_id IN (${packagePh}))`).bind(...packageIds).run();
       await db.prepare(`DELETE FROM shipments WHERE package_id IN (${packagePh})`).bind(...packageIds).run();
       await db.prepare(`DELETE FROM packages WHERE id IN (${packagePh})`).bind(...packageIds).run();

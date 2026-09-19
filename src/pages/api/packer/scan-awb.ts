@@ -1,19 +1,18 @@
 import type { APIRoute } from 'astro';
 import { getDb } from '../../../lib/db';
 import { requireUser, AuthError } from '../../../lib/auth';
-import { getMyPackBatches, PackerFlowError } from '../../../lib/packer';
+import { applyAwbByScan, PackerFlowError } from '../../../lib/packer';
 
-// Also used for polling once a station is active, not just the initial tap-in
-// — returns every batch this packer currently has open there, plus a sweep
-// for anything freshly ready, on every call. See getMyPackBatches in lib/packer.ts.
+// Pure record-keeping, FIFO-matched — see applyAwbByScan in lib/packer.ts
+// for why there's no order pre-selection or code-matching verification here.
 export const POST: APIRoute = async (context) => {
   const db = getDb();
   try {
     const user = await requireUser(context, db, ['packer']);
-    const body = await context.request.json<{ warehouseId: string; stationQrToken: string }>();
+    const body = await context.request.json<{ warehouseId: string; awbCode: string }>();
 
-    const state = await getMyPackBatches(db, user.id, body.stationQrToken, body.warehouseId);
-    return new Response(JSON.stringify(state), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    const result = await applyAwbByScan(db, user.id, body.warehouseId, body.awbCode);
+    return new Response(JSON.stringify(result), { status: 200, headers: { 'Content-Type': 'application/json' } });
   } catch (err) {
     if (err instanceof AuthError) return new Response(JSON.stringify({ error: err.message }), { status: err.status });
     if (err instanceof PackerFlowError) return new Response(JSON.stringify({ error: err.message, code: err.code }), { status: 409 });

@@ -8,7 +8,7 @@ import TopBar from '../../components/TopBar.astro';
     <TopBar section="Packing" homeHref="/packer/home">
       <a href="/picker" class="pill tab-pill" style="text-decoration: none;">Pick<span class="badge-dot" id="badge-pick"></span></a>
       <a href="/packer" class="pill tab-pill active" style="text-decoration: none;">Pack<span class="badge-dot" id="badge-pack"></span></a>
-      <a href="/packer" class="pill tab-pill" style="text-decoration: none;">Scan</a>
+      <a href="/packer/scan" class="pill tab-pill" style="text-decoration: none;">Scan</a>
     </TopBar>
     <div id="app" class="stack" style="flex: 1;">
       <p>Loading…</p>
@@ -45,14 +45,12 @@ import TopBar from '../../components/TopBar.astro';
     }
 
     // Each entry is one order's own packing ticket (batching no longer
-    // bundles several orders together — see HANDOFF.md). Labeling is NOT
-    // per-entry any more: a packer marks orders packed one at a time as
-    // they go, then a single page-level "Finish packing" action (see
-    // finishAllReady below) completes every ready order at once and hands
-    // off to one shared AWB-scanning queue — matches the real floor
-    // workflow described by the user: pack several, then label the batch
-    // of finished ones together, not one scan screen per order. See
-    // HANDOFF.md.
+    // bundles several orders together — see HANDOFF.md). Labeling happens
+    // entirely on the separate /packer/scan page now — "Finish packing"
+    // here just completes the pack session(s) and removes them from this
+    // list; scanning/labeling is a later, decoupled step a packer does from
+    // a pile of already-packed boxes, not something this page walks them
+    // through inline. See HANDOFF.md.
     interface BatchEntry {
       pack: PackBatchState;
     }
@@ -67,10 +65,10 @@ import TopBar from '../../components/TopBar.astro';
     let warehouseId = '';
     let currentStationToken = '';
     let batchList: BatchEntry[] = [];
-    let labelQueue: PackBatchOrder[] = [];
     let sortMode: SortMode = 'sku';
     let selectedOrderIds = new Set<string>();
     let lastError = '';
+    let lastSuccess = '';
     let pollTimer: ReturnType<typeof setInterval> | null = null;
 
     function stopPolling() {
@@ -167,16 +165,6 @@ import TopBar from '../../components/TopBar.astro';
       return { pack };
     }
 
-    interface PendingLabelOrder {
-      orderId: string;
-      externalOrderId: string;
-      packSessionId: string;
-      notes: string | null;
-    }
-    function toLabelOrder(o: PendingLabelOrder): PackBatchOrder {
-      return { orderId: o.orderId, externalOrderId: o.externalOrderId, packSessionId: o.packSessionId, notes: o.notes, allPacked: true };
-    }
-
     async function startSession(stationQrToken: string, btn?: HTMLButtonElement) {
       stopScanning();
       currentStationToken = stationQrToken;
@@ -187,14 +175,6 @@ import TopBar from '../../components/TopBar.astro';
         const batches: PackBatchState[] = result?.batches ?? [];
         stopPolling();
         batchList = batches.map(toEntry);
-        // Server truth on a fresh tap-in — always resumes any outstanding
-        // AWB scans left over from before (a reload, a browser-back, a
-        // dropped connection mid-labeling), instead of losing track of them.
-        // Scanning is mandatory: render() shows this queue before anything
-        // else whenever it's non-empty, so there's no way to reach the
-        // normal packing list while one of these is still outstanding. See
-        // getPendingLabelQueue in lib/packer.ts.
-        labelQueue = ((result?.pendingLabels ?? []) as PendingLabelOrder[]).map(toLabelOrder);
         render();
         // Always polling from here on, not just while empty — a station stays
         // tapped in and new batches keep getting picked; freshly ready ones
@@ -215,13 +195,6 @@ import TopBar from '../../components/TopBar.astro';
         const newOnes = incoming.filter((b) => !batchList.some((e) => e.pack.pickBatchId === b.pickBatchId));
         if (newOnes.length) {
           batchList.push(...newOnes.map(toEntry));
-          render();
-        }
-
-        const incomingLabels = ((result?.pendingLabels ?? []) as PendingLabelOrder[]).map(toLabelOrder);
-        const newLabels = incomingLabels.filter((o) => !labelQueue.some((q) => q.orderId === o.orderId));
-        if (newLabels.length) {
-          labelQueue.push(...newLabels);
           render();
         }
       } catch {
@@ -265,16 +238,13 @@ import TopBar from '../../components/TopBar.astro';
     }
 
     function render() {
-      if (labelQueue.length) {
-        renderLabelScreen();
-        return;
-      }
-
       if (!batchList.length) {
         app.innerHTML = `
           <div class="stack" style="flex:1; justify-content:center; text-align:center;">
+            ${lastSuccess ? `<div class="banner banner-success">${escapeHtml(lastSuccess)}</div>` : ''}
             <p>No orders waiting to pack — this checks automatically, or tap to check now.</p>
             <button class="btn" id="retry">Check again</button>
+            <a class="btn btn-ghost" href="/packer/scan" style="text-decoration: none;">Go to Scan</a>
             <button class="btn btn-ghost" id="change-station">Switch station</button>
           </div>`;
         document.getElementById('retry')?.addEventListener('click', (e) => startSession(currentStationToken, e.currentTarget as HTMLButtonElement));
@@ -297,6 +267,7 @@ import TopBar from '../../components/TopBar.astro';
 
       app.innerHTML = `
         ${errorBanner()}
+        ${lastSuccess ? `<div class="banner banner-success">${escapeHtml(lastSuccess)}</div>` : ''}
         <div class="row" style="justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
           <div class="row" id="summary" style="width: auto; gap: 16px; flex-wrap: wrap;">
             <span class="pill">${rows.length} orders</span>
@@ -318,7 +289,7 @@ import TopBar from '../../components/TopBar.astro';
                </div>`
             : ''
         }
-        ${readyOrderCount > 0 ? `<button class="btn btn-primary" id="finish-all" style="margin-top: 10px;">Finish packing — apply labels (${readyOrderCount})</button>` : ''}
+        ${readyOrderCount > 0 ? `<button class="btn btn-primary" id="finish-all" style="margin-top: 10px;">Finish packing (${readyOrderCount})</button>` : ''}
         <div class="stack" id="order-container" style="gap: 14px; margin-top: 6px;"></div>`;
 
       const select = document.getElementById('sort-select') as unknown as HTMLSelectElement;
@@ -474,96 +445,31 @@ import TopBar from '../../components/TopBar.astro';
 
     // The single, page-level "Finish packing" action: completes every
     // order that's currently packed-and-ready (across every entry, not just
-    // one), removes those entries from the working list, and hands off to
-    // one shared label-scanning queue — so a packer packs several orders
-    // one at a time, then labels the finished batch of them together in one
-    // continuous scan-and-go screen, instead of a separate scan screen
-    // popping up after every single order. See HANDOFF.md.
+    // one) and removes those entries from the working list. Labeling is a
+    // separate, later step on /packer/scan — this just marks the pack
+    // session done so the order becomes visible there. See HANDOFF.md.
     async function finishAllReady() {
       const readyEntries = getReadyEntries();
       if (!readyEntries.length) return;
 
       lastError = '';
-      const queue: PackBatchOrder[] = [];
+      lastSuccess = '';
+      let completedCount = 0;
       const completed: BatchEntry[] = [];
       for (const entry of readyEntries) {
         try {
           const { results } = await api('/api/packer/complete', { pickBatchId: entry.pack.pickBatchId });
-          for (const r of results as Array<{ orderId: string }>) {
-            const order = entry.pack.orders.find((o) => o.orderId === r.orderId);
-            if (order) queue.push(order);
-          }
+          completedCount += (results as Array<{ orderId: string }>).length;
           completed.push(entry);
         } catch (err) {
           lastError = (err as Error).message;
         }
       }
       batchList = batchList.filter((e) => !completed.includes(e));
-      labelQueue.push(...queue);
-      render();
-    }
-
-    function renderLabelScreen() {
-      const order = labelQueue[0];
-      app.innerHTML = `
-        <div class="stack" style="flex:1; justify-content:center; text-align:center;">
-          <span class="eyebrow">Apply label · ${labelQueue.length} left</span>
-          <div class="big-label">${escapeHtml(order.externalOrderId)}</div>
-          ${order.notes ? `<div class="banner banner-warning">${escapeHtml(order.notes)}</div>` : ''}
-          <p>Scan AWB</p>
-          <video class="scanner" id="video" style="display:none;"></video>
-          <button class="btn btn-primary" id="scan-awb">Scan AWB barcode</button>
-          <button class="btn btn-ghost" id="manual-awb">Enter AWB manually</button>
-        </div>`;
-
-      document.getElementById('scan-awb')?.addEventListener('click', async () => {
-        const video = document.getElementById('video') as HTMLVideoElement;
-        video.style.display = 'block';
-        try {
-          const text = await scanOnce(video);
-          await handleAwb(order, text);
-        } catch {
-          showError('Could not open camera — use manual entry.');
-          render();
-        }
-      });
-      document.getElementById('manual-awb')?.addEventListener('click', () => {
-        // No "correct" AWB to suggest (it's arbitrary carrier text) — offer a fresh unique one instead of making you invent a string each time.
-        renderManualEntry(
-          'AWB code',
-          (code) => handleAwb(order, code),
-          () => render(),
-          `TEST-AWB-${Math.random().toString(36).slice(2, 8).toUpperCase()}`
-        );
-      });
-    }
-
-    async function handleAwb(order: PackBatchOrder, awbCode: string) {
-      stopScanning();
-      // Immediate feedback the moment a code is scanned/submitted — AWB
-      // application is a hard-block safety check (duplicate/mismatch), so
-      // the outcome itself can't be guessed optimistically, but the tap
-      // shouldn't sit there looking inert while that check runs.
-      lastError = '';
-      app.innerHTML = `
-        <div class="stack" style="flex:1; justify-content:center; text-align:center;">
-          <span class="eyebrow">Apply label · ${labelQueue.length} left</span>
-          <div class="big-label">${escapeHtml(order.externalOrderId)}</div>
-          <p>Checking ${escapeHtml(awbCode)}…</p>
-        </div>`;
-      try {
-        await api('/api/packer/apply-awb', { packSessionId: order.packSessionId, awbCode });
-        labelQueue = labelQueue.filter((o) => o.orderId !== order.orderId);
-        render();
-      } catch (err) {
-        // Hard block — AWB mismatch/duplicate. Deliberately does not fall through to ready-to-ship.
-        app.innerHTML = `
-          <div class="stack" style="flex:1; justify-content:center; text-align:center;">
-            <div class="banner banner-danger" style="font-size:1.2rem;">${escapeHtml((err as Error).message)}</div>
-            <button class="btn" id="retry-awb">Try again</button>
-          </div>`;
-        document.getElementById('retry-awb')?.addEventListener('click', render);
+      if (completedCount > 0) {
+        lastSuccess = `${completedCount} order${completedCount > 1 ? 's' : ''} completed — head to Scan to label ${completedCount > 1 ? 'them' : 'it'}.`;
       }
+      render();
     }
 
     function errorBanner() {

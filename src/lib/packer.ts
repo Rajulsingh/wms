@@ -315,44 +315,58 @@ export interface PendingLabelOrder {
   externalOrderId: string;
   packSessionId: string;
   notes: string | null;
+  completedAt: string;
+  imageUrl: string | null;
+  skuSummary: string;
+  unitCount: number;
 }
 
 /**
- * Orders this packer has already marked packed (`pack_sessions` status
- * `completed`/`partial`) but hasn't scanned an AWB for yet — the mandatory
- * next step, still outstanding. Needed because completing a pack session
- * moves the order's status past `'picked'`, out of `getMyPackBatches`'
- * own query entirely — without this, a packer who navigates away (or the
- * page reloads) mid-labeling would lose every trace of which orders still
- * need a label: stuck, with no way back to finish them, since the normal
- * packing list no longer has anywhere to show them.
- *
- * Checked on every tap-in/poll (`start-session.ts`) and always takes
- * precedence over the normal packing list client-side, so labeling can't
- * be skipped just by leaving the page and coming back. Scoped to this
- * packer's own pack_sessions, same ownership model as everything else here.
- * "Not yet labeled" = no `packages` row references this pack_session yet —
- * that's exactly what `applyAwb` sets the moment a label is actually
- * applied, whether matching a pre-purchased label or creating a fresh one.
+ * Orders that have been marked packed (`pack_sessions` status
+ * `completed`/`partial`) but haven't been scanned/labeled yet — warehouse-
+ * wide, not scoped to whichever packer happens to be looking (the scan
+ * station is a shared, later step; any packer can pick up any box). Oldest
+ * first, since scanning is pure FIFO — see `applyAwbByScan` below. "Not yet
+ * labeled" = no `packages` row references this pack_session yet, which is
+ * exactly what a scan sets the moment it's applied, whether linking a
+ * pre-purchased label or creating a fresh one.
  */
-export async function getPendingLabelQueue(db: D1Database, packerId: string): Promise<PendingLabelOrder[]> {
+export async function getPendingLabels(db: D1Database, warehouseId: string): Promise<PendingLabelOrder[]> {
   const rows = await db
     .prepare(
-      `SELECT ps.id AS pack_session_id, ps.order_id, o.external_order_id, o.notes
+      `SELECT ps.id AS pack_session_id, ps.order_id, ps.completed_at, o.external_order_id, o.notes,
+              (SELECT sk.image_url FROM order_items oi JOIN skus sk ON sk.id = oi.sku_id WHERE oi.order_id = ps.order_id ORDER BY oi.id LIMIT 1) AS image_url,
+              (SELECT sk.sku_code FROM order_items oi JOIN skus sk ON sk.id = oi.sku_id WHERE oi.order_id = ps.order_id ORDER BY oi.id LIMIT 1) AS first_sku_code,
+              (SELECT COUNT(*) FROM order_items oi WHERE oi.order_id = ps.order_id) AS item_count,
+              (SELECT COALESCE(SUM(oi.quantity_packed), 0) FROM order_items oi WHERE oi.order_id = ps.order_id) AS unit_count
        FROM pack_sessions ps
        JOIN orders o ON o.id = ps.order_id
-       WHERE ps.packer_id = ? AND ps.status IN ('completed', 'partial')
+       WHERE o.warehouse_id = ? AND ps.status IN ('completed', 'partial')
          AND NOT EXISTS (SELECT 1 FROM packages p WHERE p.pack_session_id = ps.id)
        ORDER BY ps.completed_at ASC`
     )
-    .bind(packerId)
-    .all<{ pack_session_id: string; order_id: string; external_order_id: string; notes: string | null }>();
+    .bind(warehouseId)
+    .all<{
+      pack_session_id: string;
+      order_id: string;
+      completed_at: string;
+      external_order_id: string;
+      notes: string | null;
+      image_url: string | null;
+      first_sku_code: string | null;
+      item_count: number;
+      unit_count: number;
+    }>();
 
   return rows.results.map((r) => ({
     orderId: r.order_id,
     externalOrderId: r.external_order_id,
     packSessionId: r.pack_session_id,
-    notes: r.notes
+    notes: r.notes,
+    completedAt: r.completed_at,
+    imageUrl: r.image_url,
+    skuSummary: r.item_count > 1 ? `${r.first_sku_code ?? '—'} +${r.item_count - 1} more` : (r.first_sku_code ?? '—'),
+    unitCount: r.unit_count
   }));
 }
 
@@ -408,66 +422,124 @@ export interface AwbResult {
   awbCode: string;
 }
 
+export interface ScanResult extends AwbResult {
+  orderId: string;
+  externalOrderId: string;
+  skuSummary: string;
+  unitCount: number;
+}
+
 /**
- * Hard-blocks on a duplicate/mismatched AWB or a session that isn't
- * actually pack-complete — exactly the safeguard from the original spec (§6).
+ * Pure record-keeping, matched by FIFO — not verification. The scanned code
+ * is applied to whichever order has been sitting in the pending-label pool
+ * the longest (`getPendingLabels`, warehouse-wide), no matter what the code
+ * actually is; the scan itself *is* the record that a box got labeled and
+ * is going out. There's deliberately no "does this code match what we
+ * expected" check — see HANDOFF.md for why (this used to require a packer
+ * to pre-select which specific order they were scanning, which made no
+ * sense as a floor workflow).
  *
- * Two paths: if admin already purchased a real Amazon shipping label for
- * this order (via the Merchant Fulfillment API, before packing started —
- * see §"admin picks box size" flow), a package/shipment/awb row already
- * exists with `pack_session_id` still NULL. The packer's scan here just has
- * to MATCH that pre-existing tracking id and link it to this pack session —
- * never create a second one. Orders without a pre-purchased label (manual/
- * CSV orders) fall back to the original create-on-scan behavior.
+ * One exception, not a verification step: if admin already purchased a real
+ * Amazon shipping label for the FIFO-matched order before packing (a
+ * `packages` row already exists for it with `pack_session_id` still NULL —
+ * see the "admin picks box size" flow), the scan links to *that* existing
+ * row instead of creating a second one, so the real purchased label doesn't
+ * end up orphaned. This is a lookup by order id, not by comparing codes.
  */
-export async function applyAwb(db: D1Database, userId: string, packSessionId: string, awbCode: string): Promise<AwbResult> {
-  const session = await db.prepare(`SELECT * FROM pack_sessions WHERE id = ?`).bind(packSessionId).first<{ id: string; order_id: string; status: string }>();
-  if (!session) throw new PackerFlowError('not_found', 'Pack session not found');
-  if (session.status !== 'completed' && session.status !== 'partial') {
-    throw new PackerFlowError('not_packed', 'This order is not marked packed yet — cannot apply a label');
+export async function applyAwbByScan(db: D1Database, userId: string, warehouseId: string, awbCode: string): Promise<ScanResult> {
+  const pending = await getPendingLabels(db, warehouseId);
+  const next = pending[0];
+  if (!next) throw new PackerFlowError('nothing_pending', 'Nothing is waiting to be scanned right now.');
+
+  const dupe = await db.prepare(`SELECT id FROM awbs WHERE awb_code = ?`).bind(awbCode).first<{ id: string }>();
+  if (dupe) {
+    await logException(db, { type: 'duplicate_awb', orderId: next.orderId, userId, notes: `AWB ${awbCode} already applied to another package` });
+    throw new PackerFlowError('duplicate_awb', 'This AWB has already been scanned for another order.');
   }
 
   const existing = await db
     .prepare(
-      `SELECT p.id as package_id, s.id as shipment_id, s.tracking_id
+      `SELECT p.id as package_id, s.id as shipment_id
        FROM packages p JOIN shipments s ON s.package_id = p.id
        WHERE p.order_id = ? AND p.pack_session_id IS NULL
        ORDER BY p.created_at DESC LIMIT 1`
     )
-    .bind(session.order_id)
-    .first<{ package_id: string; shipment_id: string; tracking_id: string | null }>();
+    .bind(next.orderId)
+    .first<{ package_id: string; shipment_id: string }>();
 
+  let shipmentId: string;
   if (existing) {
-    if (existing.tracking_id && existing.tracking_id !== awbCode) {
-      await logException(db, { type: 'awb_mismatch', orderId: session.order_id, packSessionId, userId, notes: `Scanned "${awbCode}", expected the pre-purchased label's tracking id` });
-      throw new PackerFlowError('awb_mismatch', 'This AWB does not match the label already purchased for this order.');
-    }
-    await db.prepare(`UPDATE packages SET pack_session_id = ?, status = 'labeled' WHERE id = ?`).bind(packSessionId, existing.package_id).run();
+    await db.prepare(`UPDATE packages SET pack_session_id = ?, status = 'labeled' WHERE id = ?`).bind(next.packSessionId, existing.package_id).run();
     await db.prepare(`UPDATE shipments SET status = 'ready_to_ship' WHERE id = ?`).bind(existing.shipment_id).run();
-    await db.prepare(`UPDATE orders SET status = 'ready_to_ship' WHERE id = ? AND status IN ('packed', 'partial')`).bind(session.order_id).run();
-    await logAudit(db, { userId, action: 'scan.awb', entityType: 'shipment', entityId: existing.shipment_id, metadata: { awbCode, prePurchased: true } });
-    return { shipmentId: existing.shipment_id, awbCode };
+    await db
+      .prepare(`INSERT INTO awbs (id, shipment_id, awb_code, scanned_at, verified) VALUES (?, ?, ?, datetime('now'), 1)`)
+      .bind(newId(), existing.shipment_id, awbCode)
+      .run();
+    shipmentId = existing.shipment_id;
+  } else {
+    const packageId = newId();
+    await db.prepare(`INSERT INTO packages (id, order_id, pack_session_id, status) VALUES (?, ?, ?, 'labeled')`).bind(packageId, next.orderId, next.packSessionId).run();
+    shipmentId = newId();
+    await db.prepare(`INSERT INTO shipments (id, package_id, status) VALUES (?, ?, 'ready_to_ship')`).bind(shipmentId, packageId).run();
+    await db
+      .prepare(`INSERT INTO awbs (id, shipment_id, awb_code, scanned_at, verified) VALUES (?, ?, ?, datetime('now'), 1)`)
+      .bind(newId(), shipmentId, awbCode)
+      .run();
   }
 
-  const dupe = await db.prepare(`SELECT id FROM awbs WHERE awb_code = ?`).bind(awbCode).first<{ id: string }>();
-  if (dupe) {
-    await logException(db, { type: 'duplicate_awb', orderId: session.order_id, packSessionId, userId, notes: `AWB ${awbCode} already applied to another package` });
-    throw new PackerFlowError('duplicate_awb', 'This AWB has already been used on another package. Cannot mark ready to ship.');
-  }
-
-  const packageId = newId();
-  await db.prepare(`INSERT INTO packages (id, order_id, pack_session_id, status) VALUES (?, ?, ?, 'labeled')`).bind(packageId, session.order_id, packSessionId).run();
-
-  const shipmentId = newId();
-  await db.prepare(`INSERT INTO shipments (id, package_id, status) VALUES (?, ?, 'ready_to_ship')`).bind(shipmentId, packageId).run();
-
+  await db.prepare(`UPDATE orders SET status = 'ready_to_ship' WHERE id = ? AND status IN ('packed', 'partial')`).bind(next.orderId).run();
   await db
-    .prepare(`INSERT INTO awbs (id, shipment_id, awb_code, scanned_at, verified) VALUES (?, ?, ?, datetime('now'), 1)`)
-    .bind(newId(), shipmentId, awbCode)
+    .prepare(`INSERT INTO awb_scans (id, warehouse_id, awb_code, order_id, shipment_id, scanned_by) VALUES (?, ?, ?, ?, ?, ?)`)
+    .bind(newId(), warehouseId, awbCode, next.orderId, shipmentId, userId)
     .run();
+  await logAudit(db, { userId, action: 'scan.awb', entityType: 'shipment', entityId: shipmentId, metadata: { awbCode, orderId: next.orderId, prePurchased: !!existing } });
 
-  await db.prepare(`UPDATE orders SET status = 'ready_to_ship' WHERE id = ? AND status IN ('packed', 'partial')`).bind(session.order_id).run();
-  await logAudit(db, { userId, action: 'scan.awb', entityType: 'shipment', entityId: shipmentId, metadata: { awbCode } });
+  return { shipmentId, awbCode, orderId: next.orderId, externalOrderId: next.externalOrderId, skuSummary: next.skuSummary, unitCount: next.unitCount };
+}
 
-  return { shipmentId, awbCode };
+export interface ScanLogRow {
+  awbCode: string;
+  orderId: string;
+  externalOrderId: string;
+  scannedAt: string;
+  imageUrl: string | null;
+  skuSummary: string;
+  unitCount: number;
+}
+
+/** Today's scans, newest first — rebuilds the Scan page's results table from the database on every load, never held only in the browser. */
+export async function getTodayScans(db: D1Database, warehouseId: string): Promise<ScanLogRow[]> {
+  const rows = await db
+    .prepare(
+      `SELECT sc.awb_code, sc.order_id, sc.scanned_at, o.external_order_id,
+              (SELECT sk.image_url FROM order_items oi JOIN skus sk ON sk.id = oi.sku_id WHERE oi.order_id = o.id ORDER BY oi.id LIMIT 1) AS image_url,
+              (SELECT sk.sku_code FROM order_items oi JOIN skus sk ON sk.id = oi.sku_id WHERE oi.order_id = o.id ORDER BY oi.id LIMIT 1) AS first_sku_code,
+              (SELECT COUNT(*) FROM order_items oi WHERE oi.order_id = o.id) AS item_count,
+              (SELECT COALESCE(SUM(oi.quantity_packed), 0) FROM order_items oi WHERE oi.order_id = o.id) AS unit_count
+       FROM awb_scans sc JOIN orders o ON o.id = sc.order_id
+       WHERE sc.warehouse_id = ? AND date(sc.scanned_at) = date('now')
+       ORDER BY sc.scanned_at DESC
+       LIMIT 100`
+    )
+    .bind(warehouseId)
+    .all<{
+      awb_code: string;
+      order_id: string;
+      scanned_at: string;
+      external_order_id: string;
+      image_url: string | null;
+      first_sku_code: string | null;
+      item_count: number;
+      unit_count: number;
+    }>();
+
+  return rows.results.map((r) => ({
+    awbCode: r.awb_code,
+    orderId: r.order_id,
+    externalOrderId: r.external_order_id,
+    scannedAt: r.scanned_at,
+    imageUrl: r.image_url,
+    skuSummary: r.item_count > 1 ? `${r.first_sku_code ?? '—'} +${r.item_count - 1} more` : (r.first_sku_code ?? '—'),
+    unitCount: r.unit_count
+  }));
 }
