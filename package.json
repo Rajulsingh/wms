@@ -20,6 +20,7 @@
     "fflate": "^0.8.3",
     "jsbarcode": "^3.12.3",
     "pdf-lib": "^1.17.1",
+    "unpdf": "^1.8.1",
     "wrangler": "^4.135.0"
   },
   "allowScripts": {

@@ -1,0 +1,415 @@
+---
+import AdminShell from '../../components/AdminShell.astro';
+import { getDb } from '../../lib/db';
+import { requireAdminPage } from '../../lib/auth';
+
+const redirectTo = await requireAdminPage(Astro, getDb());
+if (redirectTo) return Astro.redirect(redirectTo);
+---
+
+<AdminShell title="Schedule pickup" current="schedule-pickup">
+  <div id="app" class="stack" style="max-width: 820px;">
+    <p>Loading…</p>
+  </div>
+
+  <script>
+    import { escapeHtml } from '../../lib/ui';
+
+    interface OrderRow {
+      id: string;
+      external_order_id: string;
+      source: string;
+      status: string;
+      first_item_name: string | null;
+    }
+    interface BoxSize {
+      id: string;
+      name: string;
+      length: number;
+      width: number;
+      height: number;
+      dimension_unit: string;
+    }
+    interface LineState {
+      selected: boolean;
+      boxSizeId: string;
+      weightGrams: string;
+      invoiceId: string;
+      merchantIdentifier: string;
+    }
+    interface MatchedResult {
+      shipmentId: string;
+      orderId: string;
+      externalOrderId: string;
+      pageCount: number;
+    }
+    interface UnmatchedPage {
+      pageIndex: number;
+      snippet: string;
+    }
+
+    const app = document.getElementById('app')!;
+    let warehouseId = '';
+    let boxSizes: BoxSize[] = [];
+    let shippableOrders: OrderRow[] = [];
+    let lines = new Map<string, LineState>();
+    let pickupDate = '';
+    let pickupTime: '11:00 AM' | '2:00 PM' = '11:00 AM';
+
+    // Batch/upload state — survives across "generate" and "upload labels"
+    // since they're two separate real-world trips (Seller Central in
+    // between). The uploaded PDF's bytes stay here in memory (never
+    // persisted) so a manual page assignment can re-copy from the same
+    // source without asking the admin to re-upload.
+    let batchId: string | null = null;
+    let generatedFiles: string[] = [];
+    let uploadedPdfBase64: string | null = null;
+    let matched: MatchedResult[] = [];
+    let unmatchedPages: UnmatchedPage[] = [];
+    let pendingOrders: OrderRow[] = []; // this batch's orders, for the manual-assign dropdown
+
+    async function api(path: string, body?: unknown) {
+      const res = await fetch(path, {
+        method: body === undefined ? 'GET' : 'POST',
+        headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body)
+      });
+      const data: any = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error ?? `Request failed (${res.status})`);
+      return data;
+    }
+
+    function selectedOrderIds(): string[] {
+      return shippableOrders.filter((o) => lines.get(o.id)?.selected).map((o) => o.id);
+    }
+
+    function boxOptionsHtml(currentId: string): string {
+      return boxSizes.map((b) => `<option value="${b.id}" ${b.id === currentId ? 'selected' : ''}>${escapeHtml(b.name)} (${b.length}×${b.width}×${b.height} ${b.dimension_unit})</option>`).join('');
+    }
+
+    function renderPicker(error?: string) {
+      app.innerHTML = `
+        ${error ? `<div class="banner banner-danger">${escapeHtml(error)}</div>` : ''}
+        <div class="card stack">
+          <h2>1. Generate the Schedule Pickup file</h2>
+          <p>Pick the orders going out in this pickup, set each one's box/weight, then download a
+          file ready to upload at Seller Central → Order → Upload Order Related Files → Schedule
+          Pickup.</p>
+          <div class="table-scroll"><table>
+            <thead><tr><th></th><th>Order</th><th>Box</th><th>Weight (g)</th><th>Invoice id</th><th>Label identifier</th></tr></thead>
+            <tbody id="order-rows"></tbody>
+          </table></div>
+          <div class="row" id="bulk-bar" style="align-items: center; gap: 10px; flex-wrap: wrap; display: none; border-top: 1px solid var(--border); padding-top: 12px; margin-top: 4px;">
+            <span class="pill" id="bulk-count" style="flex: 0 0 auto;"></span>
+            <select id="bulk-box" style="width: auto; flex: 1; min-width: 180px;">${boxOptionsHtml('')}</select>
+            <input type="number" id="bulk-weight" placeholder="Weight (g)" style="width: auto; flex: 0 0 110px; min-height: 44px; padding: 8px 10px;" />
+            <button class="btn" id="bulk-apply" style="width: auto;">Update box</button>
+          </div>
+          <div class="row" style="gap: 12px; flex-wrap: wrap; margin-top: 12px; align-items: flex-end;">
+            <div class="stack" style="gap: 4px;">
+              <label style="font-size: 0.78rem; color: var(--muted);">Pickup date</label>
+              <input type="date" id="pickup-date" value="${pickupDate}" style="min-height: 44px;" />
+            </div>
+            <div class="stack" style="gap: 4px;">
+              <label style="font-size: 0.78rem; color: var(--muted);">Pickup slot</label>
+              <select id="pickup-time" style="min-height: 44px;">
+                <option value="11:00 AM" ${pickupTime === '11:00 AM' ? 'selected' : ''}>11:00 AM</option>
+                <option value="2:00 PM" ${pickupTime === '2:00 PM' ? 'selected' : ''}>2:00 PM</option>
+              </select>
+            </div>
+          </div>
+          <p style="font-size: 0.72rem; color: var(--muted);">Amazon expects the pickup date within 2 working days of uploading the file — pick accordingly.</p>
+          <button class="btn btn-primary" id="generate-btn" style="margin-top: 8px;">Generate Schedule Pickup file</button>
+        </div>
+        <div id="batch-section"></div>`;
+
+      const rowsEl = document.getElementById('order-rows')!;
+      rowsEl.innerHTML = shippableOrders
+        .map((o) => {
+          const line = lines.get(o.id)!;
+          return `<tr data-order-id="${o.id}">
+            <td><input type="checkbox" class="order-check" ${line.selected ? 'checked' : ''} style="width: 20px; height: 20px;" /></td>
+            <td style="font-weight: 700; white-space: nowrap;">${escapeHtml(o.external_order_id)}<br /><span style="font-weight: 400; font-size: 0.75rem; color: var(--muted);">${escapeHtml(o.first_item_name ?? '')}</span></td>
+            <td><select class="box-select" style="min-height: 40px;">${boxOptionsHtml(line.boxSizeId)}</select></td>
+            <td><input type="number" class="weight-input" value="${line.weightGrams}" placeholder="e.g. 450" style="min-height: 40px; width: 90px;" /></td>
+            <td><input type="text" class="invoice-input" value="${escapeHtml(line.invoiceId)}" style="min-height: 40px; width: 130px;" /></td>
+            <td><input type="text" class="pkg-input" value="${escapeHtml(line.merchantIdentifier)}" style="min-height: 40px;" /></td>
+          </tr>`;
+        })
+        .join('');
+
+      rowsEl.querySelectorAll('tr').forEach((tr) => {
+        const orderId = (tr as HTMLElement).dataset.orderId!;
+        const line = lines.get(orderId)!;
+        tr.querySelector('.order-check')?.addEventListener('change', (e) => {
+          line.selected = (e.target as HTMLInputElement).checked;
+          updateBulkBar();
+        });
+        tr.querySelector('.box-select')?.addEventListener('change', (e) => {
+          line.boxSizeId = (e.target as HTMLSelectElement).value;
+        });
+        tr.querySelector('.weight-input')?.addEventListener('input', (e) => {
+          line.weightGrams = (e.target as HTMLInputElement).value;
+        });
+        tr.querySelector('.invoice-input')?.addEventListener('input', (e) => {
+          line.invoiceId = (e.target as HTMLInputElement).value;
+        });
+        tr.querySelector('.pkg-input')?.addEventListener('input', (e) => {
+          line.merchantIdentifier = (e.target as HTMLInputElement).value;
+        });
+      });
+
+      updateBulkBar();
+
+      document.getElementById('bulk-apply')?.addEventListener('click', () => {
+        const boxSizeId = (document.getElementById('bulk-box') as unknown as HTMLSelectElement).value;
+        const weightGrams = (document.getElementById('bulk-weight') as HTMLInputElement).value;
+        for (const orderId of selectedOrderIds()) {
+          const line = lines.get(orderId)!;
+          if (boxSizeId) line.boxSizeId = boxSizeId;
+          if (weightGrams) line.weightGrams = weightGrams;
+        }
+        renderPicker();
+      });
+
+      document.getElementById('pickup-date')?.addEventListener('input', (e) => {
+        pickupDate = (e.target as HTMLInputElement).value;
+      });
+      document.getElementById('pickup-time')?.addEventListener('change', (e) => {
+        pickupTime = (e.target as HTMLSelectElement).value as '11:00 AM' | '2:00 PM';
+      });
+
+      document.getElementById('generate-btn')?.addEventListener('click', generate);
+
+      if (batchId) renderBatchSection();
+    }
+
+    function updateBulkBar() {
+      const bar = document.getElementById('bulk-bar');
+      const countEl = document.getElementById('bulk-count');
+      if (!bar || !countEl) return;
+      const n = selectedOrderIds().length;
+      bar.style.display = n > 0 ? 'flex' : 'none';
+      countEl.textContent = `${n} selected`;
+    }
+
+    async function generate() {
+      const selectedIds = selectedOrderIds();
+      if (!selectedIds.length) {
+        renderPicker('Select at least one order.');
+        return;
+      }
+      if (!pickupDate) {
+        renderPicker('Pick a pickup date.');
+        return;
+      }
+      const missing = selectedIds.find((id) => {
+        const l = lines.get(id)!;
+        return !l.boxSizeId || !Number(l.weightGrams) || !l.invoiceId.trim();
+      });
+      if (missing) {
+        renderPicker('Every selected order needs a box size, weight and invoice id.');
+        return;
+      }
+
+      const orders = selectedIds.map((orderId) => {
+        const l = lines.get(orderId)!;
+        return {
+          orderId,
+          boxSizeId: l.boxSizeId,
+          weightGrams: Number(l.weightGrams),
+          invoiceId: l.invoiceId.trim(),
+          merchantIdentifier: l.merchantIdentifier.trim()
+        };
+      });
+
+      try {
+        const result = await api('/api/admin/schedule-pickup/generate', { warehouseId, pickupDate, pickupTime, orders });
+        batchId = result.batchId;
+        generatedFiles = result.files;
+        pendingOrders = shippableOrders.filter((o) => selectedIds.includes(o.id));
+        matched = [];
+        unmatchedPages = [];
+        uploadedPdfBase64 = null;
+        renderBatchSection();
+      } catch (err) {
+        renderPicker((err as Error).message);
+      }
+    }
+
+    function downloadText(filename: string, text: string) {
+      const blob = new Blob([text], { type: 'text/plain' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    function renderBatchSection() {
+      const section = document.getElementById('batch-section');
+      if (!section || !batchId) return;
+
+      section.innerHTML = `
+        <div class="card stack" style="margin-top: 16px;">
+          <h2>2. Upload to Amazon, then bring the labels back</h2>
+          <p>Download the file below and upload it at Seller Central. Once Amazon processes it and
+          you've downloaded the label+invoice PDF from there, upload that PDF here — it'll be split
+          into one stamped label per order automatically.</p>
+          <div class="stack" id="file-downloads" style="gap: 6px;"></div>
+          <div class="row" style="gap: 10px; align-items: center; margin-top: 10px; flex-wrap: wrap;">
+            <input type="file" id="pdf-upload" accept="application/pdf" />
+            <button class="btn btn-primary" id="process-btn" style="width: auto;">Process labels</button>
+          </div>
+          <div id="upload-result"></div>
+        </div>`;
+
+      const filesEl = document.getElementById('file-downloads')!;
+      generatedFiles.forEach((text, i) => {
+        const btn = document.createElement('button');
+        btn.className = 'btn btn-ghost';
+        btn.style.width = 'auto';
+        btn.textContent = generatedFiles.length > 1 ? `Download file ${i + 1} of ${generatedFiles.length}` : 'Download Schedule Pickup file';
+        btn.addEventListener('click', () => downloadText(`schedule-pickup-${batchId}-${i + 1}.txt`, text));
+        filesEl.appendChild(btn);
+      });
+
+      document.getElementById('process-btn')?.addEventListener('click', processLabels);
+      renderUploadResult();
+    }
+
+    async function processLabels() {
+      const fileInput = document.getElementById('pdf-upload') as HTMLInputElement;
+      const file = fileInput.files?.[0];
+      if (!file) {
+        alert('Choose the label PDF you downloaded from Seller Central first.');
+        return;
+      }
+      const buffer = await file.arrayBuffer();
+      let binary = '';
+      const bytes = new Uint8Array(buffer);
+      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+      uploadedPdfBase64 = btoa(binary);
+
+      try {
+        const result = await api('/api/admin/schedule-pickup/upload-labels', { warehouseId, batchId, pdfBase64: uploadedPdfBase64 });
+        matched = result.matched;
+        unmatchedPages = result.unmatchedPages;
+        renderUploadResult();
+      } catch (err) {
+        const resultEl = document.getElementById('upload-result');
+        if (resultEl) resultEl.innerHTML = `<div class="banner banner-danger">${escapeHtml((err as Error).message)}</div>`;
+      }
+    }
+
+    function renderUploadResult() {
+      const resultEl = document.getElementById('upload-result');
+      if (!resultEl) return;
+
+      if (!matched.length && !unmatchedPages.length) {
+        resultEl.innerHTML = '';
+        return;
+      }
+
+      const matchedOrderIds = new Set(matched.map((m) => m.orderId));
+      const stillWaiting = pendingOrders.filter((o) => !matchedOrderIds.has(o.id));
+
+      resultEl.innerHTML = `
+        <div class="stack" style="gap: 10px; margin-top: 14px;">
+          ${
+            matched.length
+              ? `<div class="banner banner-success">${matched.length} label${matched.length > 1 ? 's' : ''} matched and stamped — those orders are now ready to ship.</div>
+                 <div class="table-scroll"><table>
+                   <thead><tr><th>Order</th><th>Pages</th></tr></thead>
+                   <tbody>${matched.map((m) => `<tr><td style="font-weight:700;">${escapeHtml(m.externalOrderId)}</td><td>${m.pageCount}</td></tr>`).join('')}</tbody>
+                 </table></div>`
+              : ''
+          }
+          ${
+            unmatchedPages.length
+              ? `<div class="banner banner-warning">${unmatchedPages.length} page${unmatchedPages.length > 1 ? 's' : ''} couldn't be matched automatically — assign them below.</div>
+                 <div class="stack" id="unmatched-rows" style="gap: 10px;"></div>`
+              : ''
+          }
+        </div>`;
+
+      if (!unmatchedPages.length) return;
+      const rowsEl = document.getElementById('unmatched-rows')!;
+      unmatchedPages.forEach((p) => {
+        const row = document.createElement('div');
+        row.className = 'card stack';
+        row.style.gap = '8px';
+        row.innerHTML = `
+          <div class="row" style="justify-content: space-between; align-items: center;">
+            <span style="font-weight: 700;">Page ${p.pageIndex + 1}</span>
+          </div>
+          <p style="font-size: 0.78rem; color: var(--muted); white-space: pre-wrap;">${escapeHtml(p.snippet) || '(no extractable text on this page)'}</p>
+          <div class="row" style="gap: 8px; align-items: center;">
+            <select class="assign-select" style="flex: 1;">
+              <option value="">Assign to order…</option>
+              ${stillWaiting.map((o) => `<option value="${o.id}">${escapeHtml(o.external_order_id)}</option>`).join('')}
+            </select>
+            <button class="btn assign-btn" style="width: auto;">Assign</button>
+          </div>`;
+        row.querySelector('.assign-btn')?.addEventListener('click', async () => {
+          const select = row.querySelector('.assign-select') as unknown as HTMLSelectElement;
+          const orderId = select.value;
+          if (!orderId) return;
+          try {
+            await api('/api/admin/schedule-pickup/assign-page', { warehouseId, batchId, orderId, pdfBase64: uploadedPdfBase64, pageIndices: [p.pageIndex] });
+            const order = pendingOrders.find((o) => o.id === orderId);
+            matched.push({ shipmentId: '', orderId, externalOrderId: order?.external_order_id ?? orderId, pageCount: 1 });
+            unmatchedPages = unmatchedPages.filter((up) => up.pageIndex !== p.pageIndex);
+            renderUploadResult();
+          } catch (err) {
+            alert((err as Error).message);
+          }
+        });
+        rowsEl.appendChild(row);
+      });
+    }
+
+    async function boot() {
+      const me = await api('/api/auth/me');
+      if (!me.user) {
+        window.location.href = '/login';
+        return;
+      }
+      if (me.user.role !== 'admin') {
+        app.innerHTML = `<p>This account is a "${me.user.role}", not an admin.</p>`;
+        return;
+      }
+      warehouseId = me.user.warehouseId;
+
+      const [orders, boxes] = await Promise.all([api(`/api/admin/orders?warehouseId=${warehouseId}`), api(`/api/admin/box-sizes?warehouseId=${warehouseId}`)]);
+      boxSizes = boxes;
+      shippableOrders = orders.filter((o: OrderRow) => o.source === 'amazon' && o.status !== 'ready_to_ship' && o.status !== 'shipped');
+
+      if (!boxSizes.length) {
+        app.innerHTML = `<p>No box sizes configured yet. <a href="/admin/settings">Add one in Settings</a> first.</p>`;
+        return;
+      }
+
+      const defaultBoxId = boxSizes[0].id;
+      lines = new Map(
+        shippableOrders.map((o) => [
+          o.id,
+          { selected: false, boxSizeId: defaultBoxId, weightGrams: '', invoiceId: o.external_order_id.replace(/\D/g, ''), merchantIdentifier: o.external_order_id }
+        ])
+      );
+
+      const today = new Date();
+      today.setDate(today.getDate() + 2);
+      pickupDate = today.toISOString().slice(0, 10);
+
+      if (!shippableOrders.length) {
+        app.innerHTML = '<div class="card"><p>No unshipped Amazon orders right now.</p></div>';
+        return;
+      }
+      renderPicker();
+    }
+
+    boot();
+  </script>
+</AdminShell>

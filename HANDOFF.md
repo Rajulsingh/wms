@@ -854,9 +854,81 @@ getting right before touching the shipping pipeline; simplified once during plan
   still-pending order; and a full page reload correctly rebuilt the "scanned today" table from the
   database rather than losing it.
 
+## Recently done (2026-09-20, a twentieth pass) — over-pick bug fix, and a manual (file-based) Easy Ship path alongside the SP-API one
+
+Two unrelated items this pass.
+
+**Real bug: picker's over-pick block fired with the wrong number.** User report: "6 qty was rqd
+and i picked 6 in it 2 single unit and 2 2x qty" but got "Cannot pick more than the required 4."
+Traced (not reproduced from a live report — the failed attempt itself is never audit-logged, since
+`confirmGroupQuantity` throws before writing anything) to `renderSkuGroup` in `picker/index.astro`:
+`remainingNeeded` was `required - picked` summed over *every* row in the card, but a row already
+resolved earlier as a short pick (`quantity_picked` left at 0, status no longer `'pending'`) still
+counts its full `quantity_required` toward `required` without contributing to `picked` — so the
+input's shown ceiling didn't match what `pendingIds` (the tasks actually submitted) could accept,
+which is exactly what the server's real check enforces. Fixed: `remainingNeeded` is now the sum of
+`quantity_required` over `pendingRows` only. Deployed, verified against no other regressions via
+`npx astro check`.
+
+**The bigger piece: Amazon Seller Central has its own manual, file-based Easy Ship flow that needs
+no SP-API access at all** — Order → Upload Order Related Files → Schedule Pickup. The user found
+this as a better near-term path than waiting on the still-ungranted SP-API role (see "Next steps"
+#3, below — that path is *not* removed, just no longer the only option). Built a parallel pipeline:
+
+- **Generate the Schedule Pickup file.** New `/admin/schedule-pickup` (nav: Fulfillment → Schedule
+  pickup) — same per-order box/weight-row UI as `bulk-ship.astro`, plus an invoice id (defaults to
+  the order's digits-only external order id, editable) and a pickup date/slot (Amazon only accepts
+  "11:00 AM"/"2:00 PM"). `generateScheduleFile` (`lib/schedule-pickup.ts`) creates local
+  `packages`/`shipments` rows (same loose "committed" status semantics the SP-API path already
+  uses — see `scheduleEasyShipForOrder`) and returns a tab-delimited `.txt`, exact column order
+  confirmed against Amazon's own template (`order_id`, `invoice_id`, `package_weight`,
+  `package_length/width/height`, `schedule_pickup_date`, `schedule_pickup_time`,
+  `merchant_additional_identifier`, `transparency_code`), largest-dimension-first per Amazon's
+  stated assumption, chunked at 500 rows/file per Amazon's stated cap. New table
+  `schedule_pickup_batches` + `shipments.invoice_id`/`schedule_batch_id`/`manual_schedule_status`
+  (migration `0014`, free-form status column — deliberately not fighting `shipments.status`'s
+  existing CHECK enum for a sub-state it was never meant to carry).
+- **Split/match/stamp the label PDF that comes back.** Admin uploads the label+invoice PDF
+  downloaded from Seller Central (outside the app, after Amazon processes the file). New
+  `lib/label-pdf.ts`: `extractPageTexts` (via `unpdf` — added as a dependency specifically because
+  it's built for edge/serverless runtimes; **confirmed working under the real `workerd` runtime**
+  via a throwaway spike route hit through both `astro dev` — Node — and a real `wrangler dev`
+  instance, not just assumed) pulls per-page text; `matchPagesToOrders` assigns each page to
+  whichever of *that batch's own* pending orders' `order_id`/`invoice_id` appears in its text — not
+  a generic order-id-shaped regex, since the exact small candidate set is already known. A page
+  with no id of its own (a trailing invoice/compliance page) inherits whichever order's pages came
+  immediately before it; a page with nothing preceding it either goes to the "unmatched" list for
+  manual assignment via a new `assign-page` endpoint. Matched pages get copied into a fresh small
+  PDF (`pdf-lib`) and stamped with the package identifier + SKU short-code summary — extended
+  `label-stamp.ts`'s single-line `stampPackageIdentifier` into a shared `stampCornerLines` so both
+  paths draw the same way. Stores the result on the *same* `shipments.label_base64`/`label_status`
+  columns the SP-API path uses (deliberately sets `label_status = 'document_ready'` too, not just
+  `manual_schedule_status`) — confirmed `/api/admin/shipping/label-status` and bulk-ship's own
+  print/download UI work unchanged against a manually-produced label without knowing which path
+  made it.
+- **Real bug caught mid-spike, not by symptom report**: `unpdf`/pdf.js **detaches the input
+  `ArrayBuffer`** after extracting text (confirmed directly with a Node repro — not documented
+  anywhere) — a second read of the same bytes (e.g. `pdf-lib` loading them afterward to build the
+  stamped per-order PDF) throws "No PDF header found" against what looks like the identical buffer.
+  Fixed by giving `extractPageTexts` a `.slice()`'d copy, never the original.
+- **Verified live end-to-end in dev** against real seeded orders: generated a file for 2 real
+  orders, uploaded a synthetic 4-page PDF (label+invoice for order A, label+invoice-lookalike for
+  order B where the invoice page repeats only the *invoice id*, not the order id, plus a trailing
+  unrelated "warranty terms" page) — confirmed correct 2-page grouping per order (the trailing
+  unrelated page correctly inherited into whichever order's pages preceded it, matching the
+  intentional "don't assume a fixed page pattern" design, not a bug); confirmed the stamp text
+  (SKU code + order id) actually appears on the rendered PDF's last page; confirmed a genuinely
+  *leading* unmatched page (nothing before it to inherit from) was correctly surfaced rather than
+  silently dropped, and that manual assignment resolves it. Old `/admin/ship`/`/admin/bulk-ship`
+  confirmed to still load with zero changes.
+- **Not yet seen**: a real Amazon-exported label+invoice PDF. The matching logic is deliberately
+  text-based rather than positional so it should tolerate whatever the real page layout turns out
+  to be, but this is still unverified against a genuine Seller Central export — check this first
+  the next time a real pickup goes through this path.
+
 ## Next steps — a prioritized plan
 
-Rewritten 2026-09-20 (nineteen passes across two days — see "Recently done" entries above for the
+Rewritten 2026-09-20 (twenty passes across two days — see "Recently done" entries above for the
 full story behind each). What's actually not done yet, ordered by what's blocking vs. not. See
 "Open items" below for full detail on each.
 
@@ -871,9 +943,10 @@ full story behind each). What's actually not done yet, ordered by what's blockin
    timed against a real barcode, and the bigger-photo/aggregate-order-count picker layout was never
    seen on an actual small screen. Neither should be *broken*, but "feels fast enough" and "looks
    right on a phone" are real-device calls, not sandbox ones.
-3. **Get the Amazon Easy Ship SP-API role granted.** Still the one thing blocking real use of
-   shipping (single-order, bulk, everything) *and* packing's bulk-label piece (part 2 of 3, see
-   "Open items" #14). It's on the user, not something to keep investigating from this end — check
+3. **Get the Amazon Easy Ship SP-API role granted — no longer the only shipping path, but still
+   worth getting** for anything the manual file-based path (twentieth pass, `/admin/schedule-pickup`)
+   doesn't cover as smoothly, e.g. not needing a human round-trip through Seller Central per batch.
+   It's on the user, not something to keep investigating from this end — check
    Seller Central's app-authorization page for an "Easy Ship" scope. Once granted, the very first
    thing to do is a live smoke test of `/admin/ship` on one real order, watching closely for: the
    real `labelFileType` Amazon returns, which page of the combined PDF is actually the label
@@ -986,7 +1059,10 @@ Core chain: `warehouses → zones → locations (racks/bins) → inventory (SKU�
 many) → skus`. Orders: `orders → order_items → pick_batches → pick_tasks → cart_slots`.
 Packing: `pack_sessions → packages → shipments → awbs`, plus `awb_scans` (migration `0013`) — a
 separate, permanent append-only scan log (order/shipment references nulled on reset, never the
-row itself), independent of `awbs`. Inbound: `inbound_receipts → inbound_receipt_lines`
+row itself), independent of `awbs`. `schedule_pickup_batches` (migration `0014`) groups the
+`shipments` rows the manual Schedule Pickup file path (twentieth pass) creates before a real label
+exists — `shipments.invoice_id`/`schedule_batch_id`/`manual_schedule_status` support that path
+without touching `shipments.status`'s existing enum. Inbound: `inbound_receipts → inbound_receipt_lines`
 (increments `inventory.quantity_on_hand` directly — the counterpart to `reserveInventory`, which
 only ever takes stock out).
 
