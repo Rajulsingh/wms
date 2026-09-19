@@ -14,19 +14,25 @@ export interface ResetResult {
  * reservations, un-marks bins reportDamaged flagged), and deletes the
  * pick/pack rows themselves so the next "create batch" / claim starts clean.
  *
- * Deliberately stops at the shipping-label boundary: orders already at
- * 'ready_to_ship' or 'shipped', and 'cancelled' orders, are left untouched.
- * A ready_to_ship order may carry a REAL Amazon-scheduled pickup/label (see
- * applyAwb's pre-purchased-label path in packer.ts) — resetting those would
- * desync us from a commitment Amazon already has, not just clear local test
- * state. This only clears picking/packing, never shipping. See HANDOFF.md.
+ * Stops at the shipping-label boundary by default: orders already at
+ * 'ready_to_ship' are left untouched, since one may carry a REAL
+ * Amazon-scheduled pickup/label (see applyAwb's pre-purchased-label path in
+ * packer.ts) — resetting it would desync us from a commitment Amazon
+ * already has, not just clear local test state. `includeReadyToShip` is an
+ * explicit opt-in (a checkbox on the admin button, defaulting off) for when
+ * that's exactly what's wanted anyway — e.g. retesting a fully-completed
+ * order end to end. 'shipped' (a real carrier event, never ours to
+ * self-report — see amazon-sync.ts) and 'cancelled' orders are never
+ * touched either way. See HANDOFF.md.
  */
-export async function resetPickPackData(db: D1Database, warehouseId: string, userId: string): Promise<ResetResult> {
+export async function resetPickPackData(db: D1Database, warehouseId: string, userId: string, includeReadyToShip = false): Promise<ResetResult> {
+  const statuses = includeReadyToShip
+    ? ['allocated', 'batched', 'picking', 'picked', 'packing', 'packed', 'partial', 'ready_to_ship']
+    : ['allocated', 'batched', 'picking', 'picked', 'packing', 'packed', 'partial'];
+  const statusPh = statuses.map(() => '?').join(',');
   const targetOrders = await db
-    .prepare(
-      `SELECT id FROM orders WHERE warehouse_id = ? AND status IN ('allocated', 'batched', 'picking', 'picked', 'packing', 'packed', 'partial')`
-    )
-    .bind(warehouseId)
+    .prepare(`SELECT id FROM orders WHERE warehouse_id = ? AND status IN (${statusPh})`)
+    .bind(warehouseId, ...statuses)
     .all<{ id: string }>();
   const orderIds = targetOrders.results.map((r) => r.id);
   if (!orderIds.length) return { orderCount: 0, batchCount: 0 };
@@ -100,7 +106,7 @@ export async function resetPickPackData(db: D1Database, warehouseId: string, use
     action: 'admin.reset_pick_pack',
     entityType: 'warehouse',
     entityId: warehouseId,
-    metadata: { orderCount: orderIds.length, batchCount: batchIds.length }
+    metadata: { orderCount: orderIds.length, batchCount: batchIds.length, includeReadyToShip }
   });
 
   return { orderCount: orderIds.length, batchCount: batchIds.length };

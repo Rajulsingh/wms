@@ -704,9 +704,35 @@ The user reported the camera scanner (station labels, AWB codes — `scanner-cli
   existing graceful fallback to manual entry still works unchanged. **Worth a real-device check**
   next time someone's on the floor with a phone.
 
+## Recently done (2026-09-20, a sixteenth pass) — reset can now optionally include ready-to-ship
+
+`resetPickPackData` (`reset.ts`) deliberately stopped at the shipping-label boundary since the
+eighth pass — `ready_to_ship` orders were always left alone, since one might carry a real
+Amazon-scheduled pickup/label that resetting would desync us from. The user wanted that boundary
+to be optional rather than fixed, for retesting an order all the way through labeling.
+
+- **New `includeReadyToShip` parameter** (`resetPickPackData`, defaults `false` — unchanged
+  behavior unless explicitly opted into). When `true`, `'ready_to_ship'` joins the target status
+  list; nothing else about the function changed — the existing packages/shipments/awbs cleanup
+  already worked generically off whichever orders land in scope, since a `ready_to_ship` order's
+  package is always already linked to its `pack_session` by the time `applyAwb` gets it there.
+  `'shipped'` (a real carrier event, never self-reported — see `amazon-sync.ts`) and `'cancelled'`
+  stay untouched either way.
+- **New checkbox on `/admin`**: "Also reset ready-to-ship orders", unchecked by default, right next
+  to the Reset button. Checking it swaps in a stronger warning in the `confirmDangerousAction`
+  modal (explicitly calling out the real-Amazon-commitment risk) before the same button fires.
+- **Verified live in dev, deliberately against real accumulated state, not an isolated test order**:
+  took one fresh order through pick → pack → label to `ready_to_ship`, confirmed resetting
+  *without* the checkbox left it untouched (`orderCount: 0`), then *with* it checked the reset
+  correctly picked up **14** `ready_to_ship` orders at once (my one plus 13 pre-existing demo/test
+  orders already sitting at that status from earlier passes this session) — all 14 landed back at
+  `pending` cleanly, inventory restored correctly for all of them, no FK errors, no negative
+  inventory anywhere afterward. A good real-world stress test of the generic cleanup logic across
+  a genuinely varied set of orders, not just a single controlled case.
+
 ## Next steps — a prioritized plan
 
-Rewritten 2026-09-20 (fifteen passes across two days — see "Recently done" entries above for the
+Rewritten 2026-09-20 (sixteen passes across two days — see "Recently done" entries above for the
 full story behind each). What's actually not done yet, ordered by what's blocking vs. not. See
 "Open items" below for full detail on each.
 

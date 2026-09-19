@@ -10,10 +10,16 @@ if (redirectTo) return Astro.redirect(redirectTo);
 <AdminShell title="Orders" current="orders">
   <span class="pill" id="user-pill" slot="actions">…</span>
 
-  <div class="row">
+  <div class="row" style="flex-wrap: wrap;">
     <button class="btn btn-primary" id="import-btn" style="width: auto;">Import from Amazon</button>
     <button class="btn" id="retry-btn" style="width: auto;">Retry blocked orders</button>
-    <button class="btn btn-ghost" id="reset-btn" style="width: auto; margin-left: auto;">Reset picking &amp; packing</button>
+    <div class="row" style="width: auto; margin-left: auto; align-items: center; gap: 10px;">
+      <label class="row" style="width: auto; align-items: center; gap: 6px; font-size: 0.82rem; color: var(--muted);">
+        <input type="checkbox" id="reset-include-shipped" style="width: 18px; height: 18px;" />
+        Also reset ready-to-ship orders
+      </label>
+      <button class="btn btn-ghost" id="reset-btn" style="width: auto;">Reset picking &amp; packing</button>
+    </div>
   </div>
   <div id="action-result" class="banner" style="display:none;"></div>
 
@@ -326,23 +332,27 @@ if (redirectTo) return Astro.redirect(redirectTo);
     });
 
     document.getElementById('reset-btn')?.addEventListener('click', async (e) => {
-      // Capture the button before the confirm modal's await — `e.currentTarget`
-      // goes null once the click event finishes dispatching, so reading it
-      // after an `await` (found the hard way: withLoading threw reading
-      // `.textContent` off null, silently skipping the actual reset call).
+      // Capture the button (and checkbox state) before the confirm modal's
+      // await — `e.currentTarget` goes null once the click event finishes
+      // dispatching, so reading it after an `await` (found the hard way:
+      // withLoading threw reading `.textContent` off null, silently
+      // skipping the actual reset call).
       const btn = e.currentTarget as HTMLButtonElement;
+      const includeReadyToShip = (document.getElementById('reset-include-shipped') as HTMLInputElement).checked;
       const ok = await confirmDangerousAction({
         title: 'Reset picking & packing',
-        message: 'This puts every order currently batched/picking/packing back to "pending" — deleting its pick batch, pick tasks, and pack sessions — and restores the inventory it had reserved or consumed. Orders already ready to ship or shipped are left alone. Use this to retest the same orders from scratch.',
+        message: includeReadyToShip
+          ? 'This puts every order currently batched/picking/packing/ready-to-ship back to "pending" — deleting its pick batch, pick tasks, pack sessions, and any label/AWB already applied — and restores the inventory it had reserved or consumed. This also resets orders that may carry a REAL Amazon-scheduled pickup or label — resetting those will desync us from that commitment. Only proceed if you mean to include them.'
+          : 'This puts every order currently batched/picking/packing back to "pending" — deleting its pick batch, pick tasks, and pack sessions — and restores the inventory it had reserved or consumed. Orders already ready to ship or shipped are left alone. Use this to retest the same orders from scratch.',
         continueLabel: 'Reset'
       });
       if (!ok) return;
       try {
-        const result = await withLoading(btn, 'Resetting…', () => api('/api/admin/reset-pick-pack', { warehouseId }));
+        const result = await withLoading(btn, 'Resetting…', () => api('/api/admin/reset-pick-pack', { warehouseId, includeReadyToShip }));
         showResult(
           result.orderCount
             ? `Reset ${result.orderCount} order${result.orderCount > 1 ? 's' : ''} across ${result.batchCount} batch${result.batchCount > 1 ? 'es' : ''} back to pending.`
-            : 'Nothing to reset — no orders are currently batched/picking/packing.'
+            : 'Nothing to reset — no matching orders right now.'
         );
         await loadOrders();
       } catch (err) {
