@@ -1,7 +1,6 @@
 import type { APIRoute } from 'astro';
 import { getDb, logAudit, newId } from '../../../lib/db';
 import { requireUser, AuthError } from '../../../lib/auth';
-import { autoBatchNewOrders } from '../../../lib/orders';
 
 /** Manual order entry / CSV-row-at-a-time import (§11 MVP: "manual + CSV/API"). One order per call; a CSV upload UI can call this in a loop. */
 export const POST: APIRoute = async (context) => {
@@ -39,10 +38,8 @@ export const POST: APIRoute = async (context) => {
         .run();
     }
 
-    const batch = await autoBatchNewOrders(db, body.warehouseId);
-
     await logAudit(db, { userId: user.id, action: 'order.manual_create', entityType: 'order', entityId: orderId });
-    return new Response(JSON.stringify({ orderId, unmatchedSkus, batch }), { status: 201, headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({ orderId, unmatchedSkus }), { status: 201, headers: { 'Content-Type': 'application/json' } });
   } catch (err) {
     if (err instanceof AuthError) return new Response(JSON.stringify({ error: err.message }), { status: err.status });
     return new Response(JSON.stringify({ error: (err as Error).message }), { status: 500 });

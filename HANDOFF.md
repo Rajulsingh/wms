@@ -265,7 +265,8 @@ shell below targets desktop admin use and doesn't follow it.
   India is EU-region, not NA; extend this map if a new marketplace 403s the same way).
 - **Automatic Amazon sync** (`src/worker.ts`, `src/lib/sync-job.ts`, `src/lib/amazon-sync.ts`) —
   a Cloudflare Cron Trigger fires every 5 minutes and, per warehouse: pulls new orders (same as
-  the manual "Import from Amazon" button, then auto-batches them), and separately checks Amazon's
+  the manual "Import from Amazon" button — orders land as `pending`, batching happens separately
+  at claim time, see "Claim-time pick-batch creation" below), and separately checks Amazon's
   *current* `OrderStatus` for every local Amazon order that isn't yet `shipped`/`cancelled`
   (`fetchOrderStatuses` in `amazon.ts`, using the `AmazonOrderIds` targeted-lookup parameter, not
   a broad re-pull). Amazon is treated as authoritative **only for the two terminal states**:
@@ -287,13 +288,39 @@ shell below targets desktop admin use and doesn't follow it.
   (`user_id: null`, the sync job's signature) created a few seconds later, and confirmed 5 real
   Amazon orders actually flipped to `status = 'shipped'` in production as a direct result — not
   a simulated/local test, the real thing running unattended.
-- **Automatic pick-batch creation** — batches are created the moment orders arrive (Amazon import
-  or manual entry), not on a manual button click. `autoBatchNewOrders` in `orders.ts`, wired into
-  both order-arrival API routes. The manual "Create pick batch" button still exists for explicit
-  re-checks (e.g. after receiving more stock for a previously-short order). Batch creation itself
-  still leaves out any order that can't be *fully* reserved (doesn't partially reserve) — that's
-  deliberate, not a bug; the failure message now says exactly which SKU is short and links to
-  Receiving instead of a generic "couldn't batch."
+- **Claim-time pick-batch creation** (changed 2026-09-19 — see below for why). Orders sit as
+  plain `pending` the moment they arrive (Amazon import or manual entry) — nothing batches them
+  automatically on a timer or on arrival anymore. Batching happens in `claimNextBatch`
+  (`picker.ts`), the moment a picker asks for work and there's no batch already waiting: it
+  sweeps every currently-open order into one fresh batch, capped at the active cart's
+  `slot_count` (not an arbitrary number — a batch bigger than the cart can physically hold isn't
+  walkable in one pass anyway), and hands it straight to that picker. `autoBatchNewOrders` (the
+  old eager-batch-on-arrival function) no longer exists — removed from `orders.ts` and its three
+  call sites (`sync-job.ts`'s cron, `import-amazon-orders.ts`, the manual order-entry POST route).
+  The manual "Create pick batch" button on `/admin` still exists and is unchanged — it still calls
+  `createPickBatch` directly, so admin can force a batch early (e.g. to preview/print before a
+  picker starts) without waiting for one to be claimed.
+  **Why this changed**: the user observed real fragmentation — "many lists with just one order."
+  With eager batching, every 5-minute Amazon sync (or every manual order entry) that landed even
+  one order closed the books immediately and spawned its own small batch, since anything already
+  batched had its status flipped away from `pending`/`allocated` and dropped out of the sweep.
+  Claim-time batching fixes this with no added latency (a picker who's ready gets work exactly as
+  fast as before) while naturally consolidating whatever piled up since the last claim into one
+  walk-efficient batch — which is what actually matters, since a picker's list was already sorted
+  `location, then SKU` within a batch (`getPickListView`), so same-SKU items across orders were
+  always adjacent; they just weren't landing in the same batch often enough for that to help.
+  Verified end-to-end locally: three orders entered independently (simulating separate arrival
+  events) stayed `pending` with zero batches created, then a single `claimNextBatch` call swept
+  all three into one batch ("3 orders, 3 lines" on the picker's own screen) — also confirmed
+  against a real Amazon import (6 real orders landed as `pending`, no batch auto-created).
+  **Known pre-existing limitation, not introduced by this change**: `createPickBatch`'s "which
+  orders are still open" read isn't wrapped in a transaction/lock, so two pickers calling
+  `claimNextBatch` in the same instant with no batch waiting could theoretically both sweep and
+  claim the same order into two different batches. This risk already existed under eager batching
+  (a cron tick racing a manual import) and is unlikely for a small team; a real fix would need
+  D1-level locking or a Durable Object, which HANDOFF already documents as a deliberate "not
+  needed yet" upgrade path for the same reason inventory reservation uses optimistic concurrency
+  instead.
 - **Picking** (`/picker`, `picker.ts`) — flat, zone/bin-sorted list across the whole batch, no
   scanning, tap "Picked" per line with photo/name shown. "Report issue" for damaged/short-pick.
   Resumable. Admin printable version at `/admin/pick-list`.

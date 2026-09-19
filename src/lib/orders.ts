@@ -195,22 +195,3 @@ export async function createPickBatch(
   return { batchId, orderCount: includedOrderCount, taskCount, shortOrders };
 }
 
-/**
- * Auto-batches whatever's open right now — called right after an order
- * arrives (Amazon import or manual entry), per the user's explicit call:
- * "no pick list needed by admin", batches should appear the moment orders
- * do, not wait for someone to click a button (the button still exists for
- * an explicit re-check, e.g. after receiving more stock for a short order).
- * Best-effort: never throws past the caller — a batching hiccup shouldn't
- * fail the import/order-creation request that triggered it.
- */
-export async function autoBatchNewOrders(db: D1Database, warehouseId: string): Promise<CreateBatchResult | null> {
-  const cart = await db.prepare(`SELECT id FROM carts WHERE warehouse_id = ? AND active = 1 LIMIT 1`).bind(warehouseId).first<{ id: string }>();
-  if (!cart) return null; // no cart configured yet — same precondition the manual button already required
-
-  try {
-    return await createPickBatch(db, warehouseId, { cartId: cart.id, maxOrders: 200 });
-  } catch {
-    return null;
-  }
-}

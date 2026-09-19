@@ -233,12 +233,12 @@ if (redirectTo) return Astro.redirect(redirectTo);
     document.getElementById('import-btn')?.addEventListener('click', async () => {
       try {
         const summary = await api('/api/admin/import-amazon-orders', { warehouseId, sinceHours: 72 });
-        let msg = `Imported ${summary.imported}, skipped ${summary.skipped}${summary.newSkusCreated.length ? `, ${summary.newSkusCreated.length} new SKUs pulled from Amazon's catalog` : ''}.`;
-        if (summary.batch?.batchId) {
-          msg += ` Auto-batched: ${summary.batch.orderCount} orders, ${summary.batch.taskCount} pick tasks. <a href="/admin/pick-list?batchId=${summary.batch.batchId}">View pick list</a>`;
-        } else if (summary.batch?.shortOrders?.length) {
-          msg += ` Couldn't auto-batch — short on stock:<br>${summary.batch.shortOrders.map((s: { reason: string }) => s.reason).join('<br>')}`;
-        }
+        // Orders are no longer auto-batched on import — batching happens the
+        // moment a picker next asks for work, so whatever's open here gets
+        // consolidated into one batch then instead of fragmenting into a new
+        // small one every time this runs. Use "Create pick batch" below to
+        // force one now (e.g. to preview/print before a picker starts).
+        const msg = `Imported ${summary.imported}, skipped ${summary.skipped}${summary.newSkusCreated.length ? `, ${summary.newSkusCreated.length} new SKUs pulled from Amazon's catalog` : ''}.`;
         showResult(msg);
         await loadOrders();
       } catch (err) {

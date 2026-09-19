@@ -1,5 +1,6 @@
 import { newId, logAudit, logException } from './db';
 import { confirmPick, releaseReservation } from './inventory';
+import { createPickBatch } from './orders';
 import type { PickTaskView } from './types';
 
 export class PickerFlowError extends Error {
@@ -13,6 +14,16 @@ export class PickerFlowError extends Error {
  * reload or dropped connection shouldn't lose their place — §9: offline/
  * intermittent connectivity), otherwise atomically claims the next
  * unassigned batch (§9: "two pickers must never claim the same task/batch").
+ *
+ * Batching happens here, at claim time, not when orders arrive. Orders sit
+ * as plain "pending" the moment they're imported/entered — nothing batches
+ * them automatically on a timer. The first picker who shows up with no
+ * batch already waiting is the trigger: sweep every order that's open right
+ * now into one fresh batch and hand it to them. This maximizes what one
+ * walk covers (whatever piled up since the last batch was claimed) instead
+ * of fragmenting into a new small batch every time an Amazon sync happens
+ * to land a couple of orders, and it adds no latency — nothing waits any
+ * longer than it already would have. See HANDOFF.md.
  */
 export async function claimNextBatch(db: D1Database, warehouseId: string, pickerId: string): Promise<string | null> {
   const resumable = await db
@@ -23,11 +34,26 @@ export async function claimNextBatch(db: D1Database, warehouseId: string, picker
     .first<{ id: string }>();
   if (resumable) return resumable.id;
 
-  const candidate = await db
+  let candidate = await db
     .prepare(`SELECT id FROM pick_batches WHERE warehouse_id = ? AND status = 'pending' ORDER BY created_at ASC LIMIT 1`)
     .bind(warehouseId)
     .first<{ id: string }>();
-  if (!candidate) return null;
+
+  if (!candidate) {
+    // Cap the sweep at the cart's actual slot count, not an arbitrary number
+    // — a batch bigger than the physical cart can hold isn't walkable in one
+    // pass anyway. Any orders left over (more open than the cart can carry)
+    // simply form the next batch the next time someone claims.
+    const cart = await db
+      .prepare(`SELECT id, slot_count FROM carts WHERE warehouse_id = ? AND active = 1 LIMIT 1`)
+      .bind(warehouseId)
+      .first<{ id: string; slot_count: number }>();
+    if (!cart) return null;
+
+    const result = await createPickBatch(db, warehouseId, { cartId: cart.id, maxOrders: cart.slot_count });
+    if (!result.batchId) return null;
+    candidate = { id: result.batchId };
+  }
 
   const result = await db
     .prepare(`UPDATE pick_batches SET status = 'assigned', assigned_picker_id = ? WHERE id = ? AND status = 'pending'`)

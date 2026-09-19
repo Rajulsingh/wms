@@ -2,7 +2,7 @@ import type { APIRoute } from 'astro';
 import { getDb, logAudit } from '../../../lib/db';
 import { requireUser, AuthError } from '../../../lib/auth';
 import { fetchUnfulfilledOrders } from '../../../lib/amazon';
-import { importAmazonOrders, autoBatchNewOrders } from '../../../lib/orders';
+import { importAmazonOrders } from '../../../lib/orders';
 
 export const POST: APIRoute = async (context) => {
   const db = getDb();
@@ -13,10 +13,9 @@ export const POST: APIRoute = async (context) => {
 
     const amazonOrders = await fetchUnfulfilledOrders(since);
     const summary = await importAmazonOrders(db, body.warehouseId, amazonOrders);
-    const batch = summary.imported > 0 ? await autoBatchNewOrders(db, body.warehouseId) : null;
 
     await logAudit(db, { userId: user.id, action: 'import.amazon_orders', metadata: summary });
-    return new Response(JSON.stringify({ ...summary, batch }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify(summary), { status: 200, headers: { 'Content-Type': 'application/json' } });
   } catch (err) {
     if (err instanceof AuthError) return new Response(JSON.stringify({ error: err.message }), { status: err.status });
     return new Response(JSON.stringify({ error: (err as Error).message }), { status: 500 });
