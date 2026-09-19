@@ -8,7 +8,7 @@ import TopBar from '../../components/TopBar.astro';
     <TopBar section="Packing" homeHref="/packer/home">
       <a href="/picker" class="pill tab-pill" style="text-decoration: none;">Pick<span class="badge-dot" id="badge-pick"></span></a>
       <a href="/packer" class="pill tab-pill active" style="text-decoration: none;">Pack<span class="badge-dot" id="badge-pack"></span></a>
-      <span class="pill" id="user-pill">…</span>
+      <a href="/packer" class="pill tab-pill" style="text-decoration: none;">Scan</a>
     </TopBar>
     <div id="app" class="stack" style="flex: 1;">
       <p>Loading…</p>
@@ -64,7 +64,6 @@ import TopBar from '../../components/TopBar.astro';
     }
 
     const app = document.getElementById('app')!;
-    const userPill = document.getElementById('user-pill')!;
     let warehouseId = '';
     let currentStationToken = '';
     let batchList: BatchEntry[] = [];
@@ -115,7 +114,6 @@ import TopBar from '../../components/TopBar.astro';
         app.innerHTML = `<p>This account is a "${me.user.role}", not a packer.</p>`;
         return;
       }
-      userPill.textContent = me.user.name;
       warehouseId = me.user.warehouseId;
       pollWorkBadge();
       renderStationPrompt();

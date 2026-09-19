@@ -327,6 +327,15 @@ p {
   flex-shrink: 0;
 }
 
+/* Bigger variant for the picker's SKU cards — a picker identifies the
+   physical item mostly by photo, and 44px was too small to actually help
+   with that; stacks with .thumb, only overriding size. */
+.thumb-lg {
+  width: 72px;
+  height: 72px;
+  border-radius: 10px;
+}
+
 .item-row .name {
   flex: 1;
 }

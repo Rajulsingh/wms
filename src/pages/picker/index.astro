@@ -8,7 +8,7 @@ import TopBar from '../../components/TopBar.astro';
     <TopBar section="Picking" homeHref="/packer/home">
       <a href="/picker" class="pill tab-pill active" style="text-decoration: none;">Pick<span class="badge-dot" id="badge-pick"></span></a>
       <a href="/packer" class="pill tab-pill" style="text-decoration: none;">Pack<span class="badge-dot" id="badge-pack"></span></a>
-      <span class="pill" id="user-pill">…</span>
+      <a href="/packer" class="pill tab-pill" style="text-decoration: none;">Scan</a>
     </TopBar>
 
     <div id="app" class="stack" style="flex: 1;">
@@ -54,7 +54,6 @@ import TopBar from '../../components/TopBar.astro';
     }
 
     const app = document.getElementById('app')!;
-    const userPill = document.getElementById('user-pill')!;
     let warehouseId = '';
     let batchList: BatchEntry[] = [];
     let lastError = '';
@@ -87,7 +86,6 @@ import TopBar from '../../components/TopBar.astro';
         app.innerHTML = `<p>This account is a "${me.user.role}" — picking needs a packer login.</p>`;
         return;
       }
-      userPill.textContent = me.user.name;
       warehouseId = me.user.warehouseId;
       pollWorkBadge();
 
@@ -227,22 +225,39 @@ import TopBar from '../../components/TopBar.astro';
       const pendingRows = sg.rows.filter((r) => r.status === 'pending');
       const done = pendingRows.length === 0;
       const remainingNeeded = required - picked;
-      const orderCount = new Set(sg.rows.map((r) => r.external_order_id)).size;
       const reasonState = pendingReasonFor[groupKey];
 
-      const orderBreakdown = sg.rows
-        .map((r) => {
-          const base = `${escapeHtml(r.external_order_id)} ×${r.quantity_required}${r.status !== 'pending' ? ` (got ${r.quantity_picked}, ${r.status})` : ''}`;
-          return r.order_notes ? `${base} <strong style="color: var(--warning-fg);">— ${escapeHtml(r.order_notes)}</strong>` : base;
-        })
+      // Which orders need this SKU, collapsed into a count instead of
+      // listing every order id — a card for a popular SKU could otherwise
+      // list a dozen order numbers a picker has no use for. "Multi" here
+      // means multiple units of *this* SKU on that order, not multiple
+      // distinct products (that's a packing-side concept).
+      const singleUnitCount = sg.rows.filter((r) => r.quantity_required === 1).length;
+      const multiUnitCount = sg.rows.filter((r) => r.quantity_required > 1).length;
+      const orderSummaryParts: string[] = [];
+      if (singleUnitCount) orderSummaryParts.push(`${singleUnitCount} single-unit order${singleUnitCount > 1 ? 's' : ''}`);
+      if (multiUnitCount) orderSummaryParts.push(`${multiUnitCount} multi-unit order${multiUnitCount > 1 ? 's' : ''}`);
+      const orderSummary = orderSummaryParts.join(' · ');
+
+      // Notes are the exception worth naming an order for — everything
+      // routine stays in the aggregate count above.
+      const notedRows = sg.rows.filter((r) => r.order_notes);
+      const notesHtml = notedRows
+        .map((r) => `<strong style="color: var(--warning-fg);">${escapeHtml(r.external_order_id)} — ${escapeHtml(r.order_notes!)}</strong>`)
         .join(' · ');
 
       let actionHtml: string;
       if (done) {
         const short = picked < required;
-        actionHtml = short
-          ? `<div class="banner banner-warning" style="margin-top: 10px; padding: 8px 12px;">Short — ${required - picked} unresolved</div>`
-          : `<div class="banner banner-success" style="margin-top: 10px; padding: 8px 12px;">Done</div>`;
+        if (short) {
+          // A short/damaged outcome is exactly when knowing *which* order(s)
+          // matters — named here even though the routine line above stays aggregate.
+          const shortRows = sg.rows.filter((r) => r.status !== 'pending' && r.quantity_picked < r.quantity_required);
+          const shortDetail = shortRows.map((r) => `${escapeHtml(r.external_order_id)} (got ${r.quantity_picked}/${r.quantity_required})`).join(' · ');
+          actionHtml = `<div class="banner banner-warning" style="margin-top: 10px; padding: 8px 12px;">Short — ${required - picked} unresolved${shortDetail ? `<div style="font-size: 0.72rem; margin-top: 4px; font-weight: 400;">${shortDetail}</div>` : ''}</div>`;
+        } else {
+          actionHtml = `<div class="banner banner-success" style="margin-top: 10px; padding: 8px 12px;">Done</div>`;
+        }
       } else if (reasonState) {
         actionHtml = `
           <div class="stack" style="margin-top: 10px; gap: 8px; border-top: 1px dashed var(--border); padding-top: 10px;">
@@ -273,11 +288,11 @@ import TopBar from '../../components/TopBar.astro';
       const el = document.createElement('div');
       el.className = 'card';
       el.innerHTML = `
-        <div class="row" style="align-items: center; gap: 12px;">
-          ${sg.image_url ? `<img class="thumb" src="${sg.image_url}" alt="" />` : '<div class="thumb"></div>'}
+        <div class="row" style="align-items: center; gap: 14px;">
+          ${sg.image_url ? `<img class="thumb thumb-lg" src="${sg.image_url}" alt="" />` : '<div class="thumb thumb-lg"></div>'}
           <div class="stack" style="gap: 2px; flex: 1; min-width: 0;">
-            <span style="font-weight: 600;">${sg.sku_name}</span>
-            <span style="font-size: 0.8rem; color: var(--muted);">${sg.sku_code} · ${orderCount} order${orderCount > 1 ? 's' : ''}</span>
+            <span class="qty" style="font-size: 1.05rem;">${escapeHtml(sg.sku_code)}</span>
+            <span style="font-size: 0.78rem; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${escapeHtml(sg.sku_name)}</span>
           </div>
         </div>
         <div class="row" style="gap: 24px; margin-top: 10px;">
@@ -290,7 +305,8 @@ import TopBar from '../../components/TopBar.astro';
             <span class="qty" style="font-size: 1.15rem; ${done && picked < required ? 'color: var(--danger);' : ''}">${picked}</span>
           </div>
         </div>
-        <div style="font-size: 0.72rem; color: var(--muted); margin-top: 6px;">${orderBreakdown}</div>
+        ${orderSummary ? `<div style="font-size: 0.72rem; color: var(--muted); margin-top: 6px;">${orderSummary}</div>` : ''}
+        ${notesHtml ? `<div style="font-size: 0.72rem; margin-top: 4px;">${notesHtml}</div>` : ''}
         ${actionHtml}`;
 
       const pendingIds = pendingRows.map((r) => r.pick_task_id);

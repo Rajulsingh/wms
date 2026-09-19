@@ -730,9 +730,48 @@ to be optional rather than fixed, for retesting an order all the way through lab
   inventory anywhere afterward. A good real-world stress test of the generic cleanup logic across
   a genuinely varied set of orders, not just a single controlled case.
 
+## Recently done (2026-09-20, a seventeenth pass) — floor-screen UI cleanup
+
+A round of concrete UI feedback across the picker, packer, and dashboard screens:
+
+- **Top nav simplified everywhere** (`picker/index.astro`, `packer/index.astro`,
+  `packer/home.astro`): the username pill is gone from all three, replaced by a third "Scan"
+  quick-access pill alongside "Pick"/"Pack" — Scan links to `/packer`, same as Pack, since that's
+  genuinely the one place all scanning (station tap-in, AWB) already lives; the destination page
+  already shows whichever phase is actually relevant (the mandatory label queue takes priority
+  automatically — see the fourteenth pass), so the two labels are just different mental-model
+  entry points into the same flow, not different pages.
+- **`/packer/home`'s "Assigned to you" collapsed from one card+button per order to one aggregate
+  card.** Since the eleventh pass's batching removal, a picker/packer claiming everything currently
+  open could mean a dozen-plus individual "Go to picking" buttons stacked on the dashboard — now
+  it's one card ("N orders in progress, M lines still to pick") and one button, still routing to
+  picking or packing depending on whether any picking is still outstanding.
+- **"Today — what you've packed" gets a product photo column** — `getPackerDailySummary`
+  (`packer.ts`) now also returns each order's first item's `image_url` (same
+  first-item-image pattern `admin/orders.ts` already uses), rendered via the existing
+  `.table-thumb` class.
+- **`/picker`'s SKU cards reworked**: photo grows from 44px to 72px (new `.thumb-lg` modifier in
+  `global.css`, layered on the base `.thumb` rather than replacing it, so every other `.thumb` usage
+  — admin tables, packer order lines — is untouched); SKU code now leads (bold, prominent) with the
+  product name underneath, single-line-truncated instead of wrapping and dominating the card —
+  the code plus a short glance at the photo is what a picker actually needs on the shelf, not the
+  full Amazon listing title. Also fixed a real pre-existing gap while touching this line: `sg.sku_name`
+  was rendered unescaped (a stored-XSS hole via Amazon catalog data) — now goes through `escapeHtml`
+  like every other user-sourced string on this page.
+- **The order-id breakdown line replaced with an aggregate count**: "N single-unit orders · M
+  multi-unit orders" instead of listing every order id needing that SKU — a popular SKU could
+  otherwise list a dozen order numbers with no real use to the picker. Order notes are the one
+  exception still named individually (still operationally important — "Fragile", "gift wrap",
+  etc.), and a short-pick outcome still names exactly which order(s) came up short and by how much,
+  since that's precisely when knowing which order matters.
+- **Verified live in dev**: two orders (one single-unit, one multi-unit with a note) landed in one
+  merged SKU card reading "N single-unit orders · M multi-unit orders" plus the note called out
+  separately; the dashboard's "Assigned to you" correctly collapsed 15 individually-claimed orders
+  into one card/button; packed one order and confirmed its photo rendered in the "Today" table.
+
 ## Next steps — a prioritized plan
 
-Rewritten 2026-09-20 (sixteen passes across two days — see "Recently done" entries above for the
+Rewritten 2026-09-20 (seventeen passes across two days — see "Recently done" entries above for the
 full story behind each). What's actually not done yet, ordered by what's blocking vs. not. See
 "Open items" below for full detail on each.
 
