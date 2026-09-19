@@ -12,7 +12,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
 
   <div class="row">
     <button class="btn btn-primary" id="import-btn" style="width: auto;">Import from Amazon</button>
-    <button class="btn" id="batch-btn" style="width: auto;">Create pick batch</button>
+    <button class="btn" id="retry-btn" style="width: auto;">Retry blocked orders</button>
     <button class="btn btn-ghost" id="reset-btn" style="width: auto; margin-left: auto;">Reset picking &amp; packing</button>
   </div>
   <div id="action-result" class="banner" style="display:none;"></div>
@@ -90,7 +90,6 @@ if (redirectTo) return Astro.redirect(redirectTo);
     const statusTabs = document.getElementById('status-tabs')!;
     const statGrid = document.getElementById('stat-grid')!;
     let warehouseId = '';
-    let cartId = '';
     let allOrders: OrderRow[] = [];
     let skuCount: number | null = null;
     let activeTab = 'all';
@@ -273,9 +272,6 @@ if (redirectTo) return Astro.redirect(redirectTo);
       userPill.textContent = me.user.name;
       warehouseId = me.user.warehouseId;
 
-      const carts = await api(`/api/admin/carts?warehouseId=${warehouseId}`);
-      cartId = carts[0]?.id ?? '';
-
       await loadOrders();
       loadSkuCount();
 
@@ -295,12 +291,13 @@ if (redirectTo) return Astro.redirect(redirectTo);
       const btn = e.currentTarget as HTMLButtonElement;
       try {
         const summary = await withLoading(btn, 'Importing…', () => api('/api/admin/import-amazon-orders', { warehouseId, sinceHours: 72 }));
-        // Orders are no longer auto-batched on import — batching happens the
-        // moment a picker next asks for work, so whatever's open here gets
-        // consolidated into one batch then instead of fragmenting into a new
-        // small one every time this runs. Use "Create pick batch" below to
-        // force one now (e.g. to preview/print before a picker starts).
-        const msg = `Imported ${summary.imported}, skipped ${summary.skipped}${summary.newSkusCreated.length ? `, ${summary.newSkusCreated.length} new SKUs pulled from Amazon's catalog` : ''}.`;
+        // Every imported order reserves its own stock immediately (see
+        // reserveOrderForPicking in lib/orders.ts) — no separate "create a
+        // batch" step needed any more.
+        let msg = `Imported ${summary.imported}, skipped ${summary.skipped}${summary.newSkusCreated.length ? `, ${summary.newSkusCreated.length} new SKUs pulled from Amazon's catalog` : ''}.`;
+        if (summary.shortOrders?.length) {
+          msg += `<br>${summary.shortOrders.length} blocked — short on stock:<br>${summary.shortOrders.map((s: { reason: string }) => s.reason).join('<br>')}<br><a href="/admin/inbound">Receive stock</a> to fix this.`;
+        }
         showResult(msg);
         await loadOrders();
       } catch (err) {
@@ -308,25 +305,19 @@ if (redirectTo) return Astro.redirect(redirectTo);
       }
     });
 
-    document.getElementById('batch-btn')?.addEventListener('click', async (e) => {
-      if (!cartId) {
-        showResult('No cart configured for this warehouse yet.', 'danger');
-        return;
-      }
+    document.getElementById('retry-btn')?.addEventListener('click', async (e) => {
       const btn = e.currentTarget as HTMLButtonElement;
       try {
-        const result = await withLoading(btn, 'Creating…', () => api('/api/admin/batches', { warehouseId, cartId, maxOrders: 8 }));
-        if (!result.batchId) {
-          if (result.shortOrders?.length) {
-            showResult(
-              `No orders could be fully reserved — short on stock:<br>${result.shortOrders.map((s: { reason: string }) => s.reason).join('<br>')}<br><a href="/admin/inbound">Receive stock</a> to fix this.`,
-              'danger'
-            );
-          } else {
-            showResult('No open orders waiting to be batched right now.', 'danger');
-          }
+        const result = await withLoading(btn, 'Retrying…', () => api('/api/admin/batches', { warehouseId }));
+        if (!result.retried) {
+          showResult('Nothing blocked right now — every order is already reserved.');
+        } else if (result.shortOrders?.length) {
+          showResult(
+            `Retried ${result.retried}, ${result.succeeded} resolved. Still short on stock:<br>${result.shortOrders.map((s: { reason: string }) => s.reason).join('<br>')}<br><a href="/admin/inbound">Receive stock</a> to fix this.`,
+            result.succeeded > 0 ? 'success' : 'danger'
+          );
         } else {
-          showResult(`Batch created: ${result.orderCount} orders, ${result.taskCount} pick tasks. <a href="/admin/pick-list?batchId=${result.batchId}">View / print pick list</a>`);
+          showResult(`Retried ${result.retried} — all ${result.succeeded} resolved.`);
         }
         await loadOrders();
       } catch (err) {

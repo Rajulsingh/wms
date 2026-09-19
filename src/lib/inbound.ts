@@ -1,5 +1,6 @@
 import { newId, logAudit } from './db';
 import { resolveSkuIdByCode } from './skus';
+import { retryBlockedOrdersForSku } from './orders';
 
 export class InboundError extends Error {
   constructor(public code: string, message: string) {
@@ -89,6 +90,11 @@ export async function receiveStock(
       .prepare(`INSERT INTO inbound_receipt_lines (id, receipt_id, sku_id, location_id, quantity) VALUES (?, ?, ?, ?, ?)`)
       .bind(newId(), receiptId, skuId, line.locationId, line.quantity)
       .run();
+
+    // Stock just arrived for this SKU — resolve any order that was blocked
+    // on it immediately, rather than waiting for a picker's next poll or an
+    // admin's manual retry. See retryBlockedOrdersForSku in lib/orders.ts.
+    await retryBlockedOrdersForSku(db, warehouseId, skuId);
 
     results.push({ skuId, skuCode, locationId: line.locationId, quantity: line.quantity });
   }

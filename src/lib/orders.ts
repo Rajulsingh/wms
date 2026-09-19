@@ -1,5 +1,5 @@
 import { newId } from './db';
-import { reserveInventory, InsufficientStockError } from './inventory';
+import { reserveInventory, releaseReservation, InsufficientStockError } from './inventory';
 import { fetchCatalogItemDetails, type AmazonOrder } from './amazon';
 import { resolveSkuIdByCode } from './skus';
 
@@ -7,12 +7,13 @@ export interface ImportSummary {
   imported: number;
   skipped: number;
   newSkusCreated: string[];
+  shortOrders: Array<{ orderId: string; reason: string }>;
 }
 
 /**
- * Upserts Amazon orders + items. Does NOT reserve inventory yet — that
- * happens at batch creation (§5/§11), so an order sitting in the queue
- * doesn't lock stock other orders could still use.
+ * Upserts Amazon orders + items, then reserves inventory for each newly
+ * imported order immediately (see `reserveOrderForPicking`) — stock locks
+ * the moment an order lands, not whenever a picker happens to next poll.
  *
  * A SellerSKU we haven't seen before is created on the fly from Amazon's own
  * catalog data (real title + main image via Catalog Items, not a placeholder)
@@ -20,7 +21,7 @@ export interface ImportSummary {
  * inventory until receiving/admin records real stock for it.
  */
 export async function importAmazonOrders(db: D1Database, warehouseId: string, orders: AmazonOrder[]): Promise<ImportSummary> {
-  const summary: ImportSummary = { imported: 0, skipped: 0, newSkusCreated: [] };
+  const summary: ImportSummary = { imported: 0, skipped: 0, newSkusCreated: [], shortOrders: [] };
 
   for (const order of orders) {
     const existing = await db
@@ -63,6 +64,8 @@ export async function importAmazonOrders(db: D1Database, warehouseId: string, or
     }
 
     summary.imported++;
+    const reserved = await reserveOrderForPicking(db, warehouseId, orderId);
+    if (!reserved.reserved && reserved.reason) summary.shortOrders.push({ orderId, reason: reserved.reason });
   }
 
   return summary;
@@ -75,15 +78,12 @@ export interface UnbatchedOrderSummary {
 }
 
 /**
- * Orders sitting open (imported/entered, not yet swept into any pick_batch)
- * right now — the raw pending pool `createPickBatch` sweeps from, before any
- * batch exists. Since the Amazon sync cron auto-imports every 5 minutes but
- * never auto-batches (batching only happens when a picker's page polls, see
- * claimAvailableBatch in picker.ts), a freshly-pulled order can sit here for
- * a real stretch if nobody's actively picking. Shown on the packer dashboard
- * so a freshly-pulled order is visible immediately, not only once some
- * picker's poll happens to sweep it into a batch. Read-only — visibility
- * only, not a claim action. See HANDOFF.md.
+ * Orders sitting open with an unreserved item, right now — since
+ * `reserveOrderForPicking` runs immediately at import/creation, an order
+ * only ever lands here when that reservation actually failed (insufficient
+ * stock) or hasn't happened yet for some other reason. Shown on the packer
+ * dashboard as "blocked" — visibility only, not a claim action. See
+ * HANDOFF.md.
  */
 export async function getUnbatchedOrderSummary(db: D1Database, warehouseId: string): Promise<UnbatchedOrderSummary> {
   const rows = await db
@@ -102,134 +102,146 @@ export async function getUnbatchedOrderSummary(db: D1Database, warehouseId: stri
   };
 }
 
-export interface CreateBatchResult {
-  batchId: string;
-  orderCount: number;
+export interface ReserveOrderResult {
+  reserved: boolean;
+  batchId?: string;
   taskCount: number;
-  shortOrders: Array<{ orderId: string; skuId: string; reason: string }>;
+  reason?: string;
 }
 
 /**
- * MVP batching (§11: "simple wave: all open orders at generation time,
- * capped by cart capacity"). Reserves inventory per order item as it's added
- * to the batch — an order that can't be fully reserved is left out of this
- * batch entirely (not partially reserved) so it doesn't hold units hostage;
- * it stays "pending" and is picked up by the next batch run.
+ * Reserves inventory for one order's items and generates its pick_tasks,
+ * called immediately at import/creation (not deferred to claim time) — so
+ * stock locks and shortages surface the moment an order lands, not whenever
+ * a picker next happens to poll. All-or-nothing per order: if any item comes
+ * up short, everything already reserved for this order is rolled back and
+ * it's left `'pending'` untouched, to be retried later (see the retry hook
+ * in inbound.ts's receiveStock, and picker.ts's self-healing fallback).
+ *
+ * Creates exactly one `pick_batches` row per order (no `cart_id`/cart_slots
+ * — there's no multi-order sweep to bundle here) rather than removing the
+ * pick_batches/pack_sessions machinery outright: every function scoped by
+ * `pick_batch_id` (claim/assign, completion checks, packing, labeling)
+ * already operates correctly per batch, so a batch that's always exactly
+ * one order makes all of that correct per order for free. See HANDOFF.md.
  */
-export async function createPickBatch(
-  db: D1Database,
-  warehouseId: string,
-  opts: { maxOrders: number; cartId: string }
-): Promise<CreateBatchResult> {
-  const openOrders = await db
-    .prepare(
-      `SELECT id FROM orders WHERE warehouse_id = ? AND status IN ('pending', 'allocated') ORDER BY priority DESC, created_at ASC LIMIT ?`
-    )
-    .bind(warehouseId, opts.maxOrders)
-    .all<{ id: string }>();
+export async function reserveOrderForPicking(db: D1Database, warehouseId: string, orderId: string): Promise<ReserveOrderResult> {
+  const items = await db
+    .prepare(`SELECT id, sku_id, quantity_ordered FROM order_items WHERE order_id = ? AND status = 'pending'`)
+    .bind(orderId)
+    .all<{ id: string; sku_id: string; quantity_ordered: number }>();
+  if (!items.results.length) return { reserved: false, taskCount: 0, reason: 'No items to reserve' };
 
-  if (!openOrders.results.length) {
-    return { batchId: '', orderCount: 0, taskCount: 0, shortOrders: [] };
+  const orderReservations: Array<{ inventoryId: string; locationId: string; quantity: number; orderItemId: string; skuId: string }> = [];
+
+  for (const item of items.results) {
+    try {
+      const claims = await reserveInventory(db, item.sku_id, warehouseId, item.quantity_ordered);
+      for (const claim of claims) orderReservations.push({ ...claim, orderItemId: item.id, skuId: item.sku_id });
+    } catch (err) {
+      if (err instanceof InsufficientStockError) {
+        for (const r of orderReservations) await releaseReservation(db, r.inventoryId, r.quantity);
+        const sku = await db.prepare(`SELECT sku_code FROM skus WHERE id = ?`).bind(item.sku_id).first<{ sku_code: string }>();
+        const orderRow = await db.prepare(`SELECT external_order_id FROM orders WHERE id = ?`).bind(orderId).first<{ external_order_id: string }>();
+        return {
+          reserved: false,
+          taskCount: 0,
+          reason: `${orderRow?.external_order_id ?? orderId}: needs ${err.requested} of ${sku?.sku_code ?? item.sku_id}, only ${err.available} in stock`
+        };
+      }
+      throw err;
+    }
   }
 
   const batchId = newId();
-  const shortOrders: CreateBatchResult['shortOrders'] = [];
-  let includedOrderCount = 0;
   let taskCount = 0;
-  let slotNumber = 0;
-
-  await db
-    .prepare(`INSERT INTO pick_batches (id, warehouse_id, cart_id, status) VALUES (?, ?, ?, 'pending')`)
-    .bind(batchId, warehouseId, opts.cartId)
-    .run();
-
-  for (const order of openOrders.results) {
-    const items = await db
-      .prepare(`SELECT id, sku_id, quantity_ordered FROM order_items WHERE order_id = ? AND status = 'pending'`)
-      .bind(order.id)
-      .all<{ id: string; sku_id: string; quantity_ordered: number }>();
-    if (!items.results.length) continue;
-
-    // Reserve everything for this order first; roll back the order's own reservations if any item comes up short.
-    const orderReservations: Array<{ inventoryId: string; locationId: string; quantity: number; orderItemId: string; skuId: string }> = [];
-    let orderOk = true;
-
-    for (const item of items.results) {
-      try {
-        const claims = await reserveInventory(db, item.sku_id, warehouseId, item.quantity_ordered);
-        for (const claim of claims) {
-          orderReservations.push({ ...claim, orderItemId: item.id, skuId: item.sku_id });
-        }
-      } catch (err) {
-        if (err instanceof InsufficientStockError) {
-          const sku = await db.prepare(`SELECT sku_code FROM skus WHERE id = ?`).bind(item.sku_id).first<{ sku_code: string }>();
-          const orderRow = await db.prepare(`SELECT external_order_id FROM orders WHERE id = ?`).bind(order.id).first<{ external_order_id: string }>();
-          shortOrders.push({
-            orderId: order.id,
-            skuId: item.sku_id,
-            reason: `${orderRow?.external_order_id ?? order.id}: needs ${err.requested} of ${sku?.sku_code ?? item.sku_id}, only ${err.available} in stock`
-          });
-          orderOk = false;
-          break;
-        }
-        throw err;
-      }
-    }
-
-    if (!orderOk) {
-      const { releaseReservation } = await import('./inventory');
-      for (const r of orderReservations) await releaseReservation(db, r.inventoryId, r.quantity);
-      continue;
-    }
-
-    // From here, any failure (a constraint error, anything unexpected) must not
-    // crash the whole batch: it must release this order's reservations and
-    // move on, the same as a stock shortfall — otherwise a single bad order
-    // leaves leaked reservations and an inconsistent batch for everyone else in it.
-    let cartSlotId: string | undefined;
-    let insertedTasksThisOrder = 0;
-    try {
-      cartSlotId = newId();
+  try {
+    await db.prepare(`INSERT INTO pick_batches (id, warehouse_id, status) VALUES (?, ?, 'pending')`).bind(batchId, warehouseId).run();
+    for (const r of orderReservations) {
+      const location = await db
+        .prepare(`SELECT sequence_number FROM locations WHERE id = ?`)
+        .bind(r.locationId)
+        .first<{ sequence_number: number }>();
       await db
-        .prepare(`INSERT INTO cart_slots (id, cart_id, pick_batch_id, slot_number, order_id) VALUES (?, ?, ?, ?, ?)`)
-        .bind(cartSlotId, opts.cartId, batchId, slotNumber++, order.id)
+        .prepare(
+          `INSERT INTO pick_tasks (id, pick_batch_id, order_item_id, sku_id, location_id, quantity_required, sequence_number, status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`
+        )
+        .bind(newId(), batchId, r.orderItemId, r.skuId, r.locationId, r.quantity, location?.sequence_number ?? 0)
         .run();
+      taskCount++;
+    }
+    await db.prepare(`UPDATE orders SET status = 'batched' WHERE id = ?`).bind(orderId).run();
+  } catch (err) {
+    // Same defensive rollback as a stock shortfall — a write failure here
+    // must not leave leaked reservations or an orphaned pick_batches row.
+    for (const r of orderReservations) await releaseReservation(db, r.inventoryId, r.quantity);
+    await db.prepare(`DELETE FROM pick_tasks WHERE pick_batch_id = ?`).bind(batchId).run();
+    await db.prepare(`DELETE FROM pick_batches WHERE id = ?`).bind(batchId).run();
+    return { reserved: false, taskCount: 0, reason: `Reservation write failed: ${(err as Error).message}` };
+  }
 
-      for (const r of orderReservations) {
-        const location = await db
-          .prepare(`SELECT sequence_number FROM locations WHERE id = ?`)
-          .bind(r.locationId)
-          .first<{ sequence_number: number }>();
-        await db
-          .prepare(
-            `INSERT INTO pick_tasks (id, pick_batch_id, order_item_id, sku_id, location_id, cart_slot_id, quantity_required, sequence_number, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')`
-          )
-          .bind(newId(), batchId, r.orderItemId, r.skuId, r.locationId, cartSlotId, r.quantity, location?.sequence_number ?? 0)
-          .run();
-        taskCount++;
-        insertedTasksThisOrder++;
-      }
+  return { reserved: true, batchId, taskCount };
+}
 
-      await db.prepare(`UPDATE orders SET status = 'batched' WHERE id = ?`).bind(order.id).run();
-      includedOrderCount++;
-    } catch (err) {
-      const { releaseReservation } = await import('./inventory');
-      for (const r of orderReservations) await releaseReservation(db, r.inventoryId, r.quantity);
-      taskCount -= insertedTasksThisOrder;
-      if (cartSlotId) {
-        await db.prepare(`DELETE FROM pick_tasks WHERE cart_slot_id = ?`).bind(cartSlotId).run();
-        await db.prepare(`DELETE FROM cart_slots WHERE id = ?`).bind(cartSlotId).run();
-      }
-      shortOrders.push({ orderId: order.id, skuId: '', reason: `Batch write failed: ${(err as Error).message}` });
+export interface RetryBlockedOrdersResult {
+  retried: number;
+  succeeded: number;
+  shortOrders: Array<{ orderId: string; reason: string }>;
+}
+
+/**
+ * Retries `reserveOrderForPicking` for every currently-blocked order in the
+ * warehouse (oldest first) — orders that failed reservation at import time,
+ * almost always for insufficient stock. Admin-triggered manual nudge after
+ * fixing stock, on top of the automatic retry in inbound.ts's receiveStock.
+ * See HANDOFF.md.
+ */
+export async function retryBlockedOrders(db: D1Database, warehouseId: string): Promise<RetryBlockedOrdersResult> {
+  const blocked = await db
+    .prepare(`SELECT id FROM orders WHERE warehouse_id = ? AND status IN ('pending', 'allocated') ORDER BY priority DESC, created_at ASC`)
+    .bind(warehouseId)
+    .all<{ id: string }>();
+
+  const result: RetryBlockedOrdersResult = { retried: 0, succeeded: 0, shortOrders: [] };
+  for (const order of blocked.results) {
+    result.retried++;
+    const reserved = await reserveOrderForPicking(db, warehouseId, order.id);
+    if (reserved.reserved) {
+      result.succeeded++;
+    } else if (reserved.reason) {
+      result.shortOrders.push({ orderId: order.id, reason: reserved.reason });
     }
   }
+  return result;
+}
 
-  if (includedOrderCount === 0) {
-    await db.prepare(`DELETE FROM pick_batches WHERE id = ?`).bind(batchId).run();
-    return { batchId: '', orderCount: 0, taskCount: 0, shortOrders };
+/**
+ * Same retry, scoped to orders needing one specific SKU — called right after
+ * `receiveStock` increases that SKU's on-hand quantity, so an order blocked
+ * on it resolves the moment stock arrives instead of waiting for a picker's
+ * poll or an admin's manual retry. See HANDOFF.md.
+ */
+export async function retryBlockedOrdersForSku(db: D1Database, warehouseId: string, skuId: string): Promise<RetryBlockedOrdersResult> {
+  const blocked = await db
+    .prepare(
+      `SELECT DISTINCT o.id FROM orders o JOIN order_items oi ON oi.order_id = o.id
+       WHERE o.warehouse_id = ? AND o.status IN ('pending', 'allocated') AND oi.sku_id = ?
+       ORDER BY o.priority DESC, o.created_at ASC`
+    )
+    .bind(warehouseId, skuId)
+    .all<{ id: string }>();
+
+  const result: RetryBlockedOrdersResult = { retried: 0, succeeded: 0, shortOrders: [] };
+  for (const order of blocked.results) {
+    result.retried++;
+    const reserved = await reserveOrderForPicking(db, warehouseId, order.id);
+    if (reserved.reserved) {
+      result.succeeded++;
+    } else if (reserved.reason) {
+      result.shortOrders.push({ orderId: order.id, reason: reserved.reason });
+    }
   }
-
-  return { batchId, orderCount: includedOrderCount, taskCount, shortOrders };
+  return result;
 }
 

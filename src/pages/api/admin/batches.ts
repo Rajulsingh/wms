@@ -1,22 +1,24 @@
 import type { APIRoute } from 'astro';
 import { getDb, logAudit } from '../../../lib/db';
 import { requireUser, AuthError } from '../../../lib/auth';
-import { createPickBatch } from '../../../lib/orders';
+import { retryBlockedOrders } from '../../../lib/orders';
 import { assignBatchToPacker, PickerFlowError } from '../../../lib/picker';
 
+// Reservation now happens automatically at import/creation time (see
+// reserveOrderForPicking in lib/orders.ts) — this is the manual nudge for
+// whatever's still blocked (almost always insufficient stock), for an admin
+// to trigger right after fixing it rather than waiting on the automatic
+// retry in receiveStock or a picker's next poll. See HANDOFF.md.
 export const POST: APIRoute = async (context) => {
   const db = getDb();
   try {
     const user = await requireUser(context, db, ['admin']);
-    const body = await context.request.json<{ warehouseId: string; cartId: string; maxOrders?: number }>();
+    const body = await context.request.json<{ warehouseId: string }>();
 
-    const result = await createPickBatch(db, body.warehouseId, {
-      cartId: body.cartId,
-      maxOrders: body.maxOrders ?? 8
-    });
+    const result = await retryBlockedOrders(db, body.warehouseId);
 
-    await logAudit(db, { userId: user.id, action: 'batch.create', entityType: 'pick_batch', entityId: result.batchId, metadata: result });
-    return new Response(JSON.stringify(result), { status: 201, headers: { 'Content-Type': 'application/json' } });
+    await logAudit(db, { userId: user.id, action: 'orders.retry_blocked', entityType: 'warehouse', entityId: body.warehouseId, metadata: result });
+    return new Response(JSON.stringify(result), { status: 200, headers: { 'Content-Type': 'application/json' } });
   } catch (err) {
     if (err instanceof AuthError) return new Response(JSON.stringify({ error: err.message }), { status: err.status });
     return new Response(JSON.stringify({ error: (err as Error).message }), { status: 500 });

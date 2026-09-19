@@ -1,6 +1,6 @@
 import { newId, logAudit, logException } from './db';
 import { confirmPick, releaseReservation } from './inventory';
-import { createPickBatch } from './orders';
+import { reserveOrderForPicking } from './orders';
 import type { PickTaskView } from './types';
 
 export class PickerFlowError extends Error {
@@ -14,16 +14,10 @@ export class PickerFlowError extends Error {
  * reload or dropped connection shouldn't lose their place — §9: offline/
  * intermittent connectivity), otherwise atomically claims the next
  * unassigned batch (§9: "two pickers must never claim the same task/batch").
- *
- * Batching happens here, at claim time, not when orders arrive. Orders sit
- * as plain "pending" the moment they're imported/entered — nothing batches
- * them automatically on a timer. The first picker who shows up with no
- * batch already waiting is the trigger: sweep every order that's open right
- * now into one fresh batch and hand it to them. This maximizes what one
- * walk covers (whatever piled up since the last batch was claimed) instead
- * of fragmenting into a new small batch every time an Amazon sync happens
- * to land a couple of orders, and it adds no latency — nothing waits any
- * longer than it already would have. See HANDOFF.md.
+ * Every batch is exactly one order's reservation ticket now — created at
+ * import/creation time by `reserveOrderForPicking`, not swept together here
+ * — so claiming one is claiming one order, and two pickers claiming
+ * concurrently always get two different orders. See HANDOFF.md.
  */
 export async function claimNextBatch(db: D1Database, warehouseId: string, pickerId: string): Promise<string | null> {
   const resumable = await db
@@ -38,12 +32,19 @@ export async function claimNextBatch(db: D1Database, warehouseId: string, picker
 }
 
 /**
- * The non-resumable half of claimNextBatch — grabs (or sweeps a fresh one
- * from) the pending pool regardless of whether this picker already has an
- * active batch elsewhere. Split out so getMyBatches can call it on every
- * poll, not just when the picker has zero active batches — otherwise orders
- * that land (Amazon sync, admin import) while a picker is mid-walk sit
- * invisible until they finish everything already on their page. See
+ * The non-resumable half of claimNextBatch — grabs the next unclaimed
+ * (already-reserved) order's batch, regardless of whether this picker
+ * already has other work elsewhere. Split out so getMyBatches can call it
+ * on every poll, not just when the picker has zero active batches —
+ * otherwise orders that land mid-walk sit invisible until everything
+ * already open is finished.
+ *
+ * The "no pending batch" branch is a self-healing safety net, not the
+ * normal path: every order should already have a batch from
+ * `reserveOrderForPicking` running at import time. It only fires for an
+ * order that somehow slipped through unreserved — reserves just that one
+ * order on the spot rather than sweeping/creating in bulk (there's nothing
+ * left to sweep; reservation already happens per order, immediately). See
  * HANDOFF.md.
  */
 async function claimAvailableBatch(db: D1Database, warehouseId: string, pickerId: string): Promise<string | null> {
@@ -53,18 +54,19 @@ async function claimAvailableBatch(db: D1Database, warehouseId: string, pickerId
     .first<{ id: string }>();
 
   if (!candidate) {
-    // Cap the sweep at the cart's actual slot count, not an arbitrary number
-    // — a batch bigger than the physical cart can hold isn't walkable in one
-    // pass anyway. Any orders left over (more open than the cart can carry)
-    // simply form the next batch the next time someone claims.
-    const cart = await db
-      .prepare(`SELECT id, slot_count FROM carts WHERE warehouse_id = ? AND active = 1 LIMIT 1`)
+    const orphan = await db
+      .prepare(
+        `SELECT o.id FROM orders o
+         WHERE o.warehouse_id = ? AND o.status IN ('pending', 'allocated')
+           AND NOT EXISTS (SELECT 1 FROM order_items oi JOIN pick_tasks pt ON pt.order_item_id = oi.id WHERE oi.order_id = o.id)
+         ORDER BY o.priority DESC, o.created_at ASC LIMIT 1`
+      )
       .bind(warehouseId)
-      .first<{ id: string; slot_count: number }>();
-    if (!cart) return null;
+      .first<{ id: string }>();
+    if (!orphan) return null;
 
-    const result = await createPickBatch(db, warehouseId, { cartId: cart.id, maxOrders: cart.slot_count });
-    if (!result.batchId) return null;
+    const result = await reserveOrderForPicking(db, warehouseId, orphan.id);
+    if (!result.reserved || !result.batchId) return null;
     candidate = { id: result.batchId };
   }
 

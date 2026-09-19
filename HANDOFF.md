@@ -500,9 +500,71 @@ one unit of something — exactly the thing a packer boxing up one order at a ti
   now-picked orders showed up order-first with quantities visible inline, and "Mark order packed"
   correctly recorded and reflected the packed quantity.
 
+## Recently done (2026-09-20, an eleventh pass) — batching removed as a concept, reserve at import
+
+The user wanted batching gone entirely: reservation should happen the instant an order is
+imported (not deferred to whenever a picker's page next polls), and — critically, as pickers,
+orders, and inventory all grow — a hard guarantee that two people never end up picking or packing
+the same order. Discussed the approach first (recorded in this session's plan); the design that
+came out of it avoids a wide, risky schema migration entirely.
+
+**The key trick: a "batch" now always means exactly one order.** Rather than ripping
+`pick_batches`/`cart_slots`/`pack_sessions.pick_batch_id` out of the schema, each order gets its
+own single-order `pick_batches` row created *at import time* instead of a multi-order sweep
+created at claim time. Almost every existing function was already correct *per `pick_batch_id`* —
+with a batch always exactly one order, those functions became correct *per order* for free, with
+no changes: `claimNextBatch`'s atomic `UPDATE ... WHERE status = 'pending'` already guaranteed one
+batch goes to exactly one picker (now = one order, guaranteed, to exactly one picker — verified
+live with two picker accounts, see below); `checkBatchCompletion`, `claimNextPackBatch`,
+`getPackBatchState`, `markPackOrder`, `completePackingBatch`, `applyAwb` were already scoped by
+`pick_batch_id`, so an order now becomes pickable/packable/labelable the instant *it* is done,
+never waiting on batch-mates. No migration needed either — `pick_batches.cart_id` and
+`pick_tasks.cart_slot_id` were already nullable, so the new single-order path just skips
+cart/cart_slot creation.
+
+- **`reserveOrderForPicking` (orders.ts)** replaces `createPickBatch`'s multi-order sweep — reserves
+  one order's items and creates its single-order batch + pick_tasks immediately, same all-or-
+  nothing-per-order shortfall handling as before (rolls back and leaves the order `'pending'` on
+  any shortage), called right after order+item insertion in both `importAmazonOrders` and the
+  manual/CSV entry point (`api/admin/orders.ts` POST) — the only two places an order is created.
+- **Two retry paths for a genuinely blocked (out-of-stock) order**: `retryBlockedOrdersForSku`
+  fires automatically from `receiveStock` (inbound.ts) the moment stock arrives for the SKU that
+  was blocking it — no picker/admin action needed. `retryBlockedOrders` is the admin-triggered
+  version — repurposed the old "Create pick batch" button into "Retry blocked orders" (same POST
+  endpoint, `api/admin/batches.ts`), since reservation is automatic now and that button would
+  otherwise always report nothing to do.
+- **`claimAvailableBatch` (picker.ts)**'s "sweep a new one" branch shrank to a self-healing safety
+  net — it should basically never fire now (every order reserves at creation), but if one order
+  somehow slips through unreserved it finds and reserves just that one, instead of the old
+  cart-capacity-capped multi-order sweep.
+- **`packer/index.astro`'s "BATCH · N ORDERS" wrapper is gone** — since a batch is always exactly
+  one order now, the wrapper was pure redundant chrome; each order's card renders directly in the
+  continuous list, same pattern `picker/index.astro` already used for SKU cards.
+- **Dead code removed** rather than left behind: `createPickBatch`/`CreateBatchResult`, the
+  `admin/index.astro` "Create pick batch" button's old handler, and `api/admin/carts.ts` (only
+  caller was the cart lookup that button needed — carts/cart_slots stay in the schema, just
+  unused going forward, since dropping them would've meant an actual migration).
+- **Verified live end-to-end in dev**, all four scenarios from the pre-implementation plan:
+  1. A manually-created order with enough stock reserved *immediately* (`status: 'batched'`)
+     before any picker page was ever opened.
+  2. A manually-created order exceeding stock stayed `'pending'`, surfaced as a "blocked — short on
+     stock" banner on both `/admin` and `/packer/home`, then auto-resolved (no action taken) the
+     instant a `receiveStock` call landed for that SKU.
+  3. Two picker accounts (a temporary `TestPacker2` plus the seeded `packer`) each claiming from the
+     same pool always got disjoint orders — one claiming everything currently open left the other
+     with nothing, and a fresh order created afterward went to whichever one claimed next, never
+     both.
+  4. Picked one order fully while three siblings sat mid-pick/blocked/untouched; that one order
+     reached packing, packing, AWB scan, and `ready_to_ship` completely independently, never
+     waiting on any of the other three.
+- **Known, accepted side-effect, not fixed this pass**: `admin/pick-list.astro`'s print dropdown
+  now lists one entry per order (a single-order ticket) instead of a multi-order bundle — denser,
+  prints one order's sheet at a time. Left as-is; revisit only if it turns out to matter in
+  practice.
+
 ## Next steps — a prioritized plan
 
-Rewritten 2026-09-19 (end of a long day, ten passes — see "Recently done" entries above for the
+Rewritten 2026-09-20 (eleven passes across two days — see "Recently done" entries above for the
 full story behind each). What's actually not done yet, ordered by what's blocking vs. not. See
 "Open items" below for full detail on each.
 
@@ -724,39 +786,33 @@ shell below targets desktop admin use and doesn't follow it.
   (`user_id: null`, the sync job's signature) created a few seconds later, and confirmed 5 real
   Amazon orders actually flipped to `status = 'shipped'` in production as a direct result — not
   a simulated/local test, the real thing running unattended.
-- **Claim-time pick-batch creation** (changed 2026-09-19 — see below for why). Orders sit as
-  plain `pending` the moment they arrive (Amazon import or manual entry) — nothing batches them
-  automatically on a timer or on arrival anymore. Batching happens in `claimNextBatch`
-  (`picker.ts`), the moment a picker asks for work and there's no batch already waiting: it
-  sweeps every currently-open order into one fresh batch, capped at the active cart's
-  `slot_count` (not an arbitrary number — a batch bigger than the cart can physically hold isn't
-  walkable in one pass anyway), and hands it straight to that picker. `autoBatchNewOrders` (the
-  old eager-batch-on-arrival function) no longer exists — removed from `orders.ts` and its three
-  call sites (`sync-job.ts`'s cron, `import-amazon-orders.ts`, the manual order-entry POST route).
-  The manual "Create pick batch" button on `/admin` still exists and is unchanged — it still calls
-  `createPickBatch` directly, so admin can force a batch early (e.g. to preview/print before a
-  picker starts) without waiting for one to be claimed.
-  **Why this changed**: the user observed real fragmentation — "many lists with just one order."
-  With eager batching, every 5-minute Amazon sync (or every manual order entry) that landed even
-  one order closed the books immediately and spawned its own small batch, since anything already
-  batched had its status flipped away from `pending`/`allocated` and dropped out of the sweep.
-  Claim-time batching fixes this with no added latency (a picker who's ready gets work exactly as
-  fast as before) while naturally consolidating whatever piled up since the last claim into one
-  walk-efficient batch — which is what actually matters, since a picker's list was already sorted
-  `location, then SKU` within a batch (`getPickListView`), so same-SKU items across orders were
-  always adjacent; they just weren't landing in the same batch often enough for that to help.
-  Verified end-to-end locally: three orders entered independently (simulating separate arrival
-  events) stayed `pending` with zero batches created, then a single `claimNextBatch` call swept
-  all three into one batch ("3 orders, 3 lines" on the picker's own screen) — also confirmed
-  against a real Amazon import (6 real orders landed as `pending`, no batch auto-created).
-  **Known pre-existing limitation, not introduced by this change**: `createPickBatch`'s "which
-  orders are still open" read isn't wrapped in a transaction/lock, so two pickers calling
-  `claimNextBatch` in the same instant with no batch waiting could theoretically both sweep and
-  claim the same order into two different batches. This risk already existed under eager batching
-  (a cron tick racing a manual import) and is unlikely for a small team; a real fix would need
-  D1-level locking or a Durable Object, which HANDOFF already documents as a deliberate "not
-  needed yet" upgrade path for the same reason inventory reservation uses optimistic concurrency
-  instead.
+- **Reserve-at-import, no batching concept** (changed 2026-09-20 — see the eleventh pass above for
+  the full design). An order reserves its own inventory and generates its own pick_tasks the moment
+  it's created — `reserveOrderForPicking` (`orders.ts`), called from both `importAmazonOrders` and
+  the manual order-entry POST route, immediately after inserting the order's items. Nothing waits
+  for a picker to ask for work any more. Each order gets its own single-order `pick_batches` row
+  (a "batch" is now just that order's reservation ticket, never a multi-order bundle) — `cart_id`
+  is left `NULL`, no `cart_slots` row is created, since there's no sweep to bundle and no cart
+  capacity to cap against. `createPickBatch` (the old capacity-capped multi-order sweep) and the
+  `/admin` "Create pick batch" button are gone — replaced by "Retry blocked orders", which retries
+  reservation for whatever's still stuck (almost always insufficient stock), since that's the only
+  way an order can still be unreserved under this model.
+  **Why this changed**: the user wanted stock locked the instant an order lands (not whenever some
+  picker happens to next poll), and — as pickers/orders/inventory all grow — a hard guarantee that
+  two people never end up picking or packing the same order. Reserving per order at creation time,
+  with each order's own single-order batch claimed atomically, delivers both: shortages surface
+  immediately instead of at claim time, and claiming one order's batch is claiming that order,
+  full stop — no bundling means no way for two people to overlap on the same one.
+  A genuinely out-of-stock order stays `pending` (all-or-nothing per order, same as before) and now
+  has two ways to resolve: `retryBlockedOrdersForSku` fires automatically the instant `receiveStock`
+  adds inventory for the SKU that was blocking it, or admin can trigger `retryBlockedOrders` for
+  everything currently stuck via the "Retry blocked orders" button. `claimAvailableBatch`
+  (`picker.ts`) keeps a much narrower self-healing fallback for the rare case an order somehow has
+  no batch yet (reserves just that one order on the spot) — normal operation should never reach it.
+  Verified end-to-end locally (see the eleventh pass above for the full list): immediate reservation
+  on creation, correct all-or-nothing rollback and later auto-resolution on a stock shortage, two
+  picker accounts always claiming disjoint orders never the same one, and one order reaching
+  `ready_to_ship` completely independently of three siblings sitting mid-pick/blocked.
 - **Picking — bulk, grouped by SKU** (`/picker`, `picker.ts`; redesigned 2026-09-19). A picker no
   longer sees one card per order — every order in the batch needing the same SKU from the same
   bin collapses into one aggregate line ("KTN3 required 7, picked 0/7"), pre-filled with the full
@@ -863,8 +919,11 @@ shell below targets desktop admin use and doesn't follow it.
 - **Packer dashboard** (`/packer/home`, added 2026-09-19) — a packer's own home page: what's
   currently assigned to them (`getMyActiveBatches`, with a "Go to picking"/"Go to packing" link
   depending on whether picking is still outstanding), and a read-only "upcoming — pulled, not yet
-  assigned" list (`getUpcomingBatches` — batches admin created via "Create pick batch" that nobody
-  has claimed or been assigned yet; visibility only, not a claim action). The top-bar logo on
+  assigned" list (`getUpcomingBatches` — orders already reserved via `reserveOrderForPicking` at
+  creation time that nobody has claimed or been assigned yet; visibility only, not a claim action).
+  Since the eleventh pass, also shows a "blocked — short on stock" banner
+  (`getUnbatchedOrderSummary`) and a "Today — what you've packed" summary/list
+  (`getPackerDailySummary`) — see that pass's entry above for the full detail. The top-bar logo on
   every picker/packer/admin screen now links back to a home page (`/packer/home` for picker/
   packer via `TopBar`'s new `homeHref` prop, `/admin` for admin's sidebar logo) instead of being
   inert.

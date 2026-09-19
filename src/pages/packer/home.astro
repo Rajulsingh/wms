@@ -150,7 +150,7 @@ import TopBar from '../../components/TopBar.astro';
           <span class="eyebrow">Upcoming — pulled, not yet assigned</span>
           ${
             unbatched && unbatched.orderCount > 0
-              ? `<div class="banner banner-warning">${unbatched.orderCount} order${unbatched.orderCount > 1 ? 's' : ''} just pulled from Amazon (${unbatched.unitCount} unit${unbatched.unitCount > 1 ? 's' : ''}) — not yet batched. This happens automatically once a picker's page is open.</div>`
+              ? `<div class="banner banner-danger">${unbatched.orderCount} order${unbatched.orderCount > 1 ? 's' : ''} blocked — short on stock (${unbatched.unitCount} unit${unbatched.unitCount > 1 ? 's' : ''} needed). <a href="/admin/inbound">Receive stock</a> or ask admin to retry.</div>`
               : ''
           }
           ${

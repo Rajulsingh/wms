@@ -221,51 +221,33 @@ import TopBar from '../../components/TopBar.astro';
         <div class="stack" id="summary" style="flex-direction: row; gap: 16px; flex-wrap: wrap;">
           <span class="pill">${totalOrders} orders</span>
           <span class="pill">${totalSkuLines} SKU lines</span>
-          ${batchList.length > 1 ? `<span class="pill">${batchList.length} batches</span>` : ''}
         </div>
         <div class="stack" id="batch-container" style="gap: 22px;"></div>`;
 
       const container = document.getElementById('batch-container')!;
-      for (const entry of batchList) container.appendChild(renderBatchSection(entry));
+      for (const entry of batchList) container.appendChild(renderEntry(entry));
 
       if (remaining === 0) {
         const banner = document.createElement('div');
         banner.className = 'banner banner-success';
-        banner.textContent = 'All caught up — new batches will appear here automatically.';
+        banner.textContent = 'All caught up — new orders will appear here automatically.';
         container.appendChild(banner);
       }
     }
 
-    function renderBatchSection(entry: BatchEntry): HTMLElement {
-      const wrap = document.createElement('div');
-      wrap.className = 'stack';
-      wrap.style.gap = '12px';
-
-      const orderCount = entry.pack.orders.length;
-      const header = document.createElement('div');
-      header.className = 'row';
-      header.style.justifyContent = 'space-between';
-      header.style.alignItems = 'center';
-      header.innerHTML = `<span class="eyebrow">Batch · ${orderCount} order${orderCount > 1 ? 's' : ''}</span>${
-        entry.phase === 'done' ? '<span class="status-pill status-success">Done</span>' : entry.phase === 'labeling' ? '<span class="status-pill status-progress">Applying labels</span>' : ''
-      }`;
-      wrap.appendChild(header);
-
+    // Each entry is one order's own ticket (batching no longer bundles
+    // several orders together — see HANDOFF.md), so there's no batch-level
+    // wrapper any more, just this order's own phase-dependent content
+    // directly in the list.
+    function renderEntry(entry: BatchEntry): HTMLElement {
       if (entry.phase === 'done') {
         const banner = document.createElement('div');
         banner.className = 'banner banner-success';
         banner.textContent = 'All labels applied.';
-        wrap.appendChild(banner);
-        return wrap;
+        return banner;
       }
-
-      if (entry.phase === 'labeling') {
-        wrap.appendChild(renderLabelCard(entry));
-        return wrap;
-      }
-
-      wrap.appendChild(renderPackingCard(entry));
-      return wrap;
+      if (entry.phase === 'labeling') return renderLabelCard(entry);
+      return renderPackingCard(entry);
     }
 
     // Bulk pack by SKU, not by order: every order in the batch needing the
