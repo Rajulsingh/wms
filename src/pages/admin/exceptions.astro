@@ -1,0 +1,144 @@
+---
+import AdminShell from '../../components/AdminShell.astro';
+import { getDb } from '../../lib/db';
+import { requireAdminPage } from '../../lib/auth';
+
+const redirectTo = await requireAdminPage(Astro, getDb());
+if (redirectTo) return Astro.redirect(redirectTo);
+---
+
+<AdminShell title="Exceptions" current="exceptions">
+  <div id="app" class="stack">
+    <p>Loading…</p>
+  </div>
+
+  <script>
+    import { escapeHtml } from '../../lib/ui';
+
+    interface ExceptionRow {
+      id: string;
+      type: string;
+      notes: string | null;
+      resolved: number;
+      created_at: string;
+      user_name: string | null;
+      order_id: string | null;
+      external_order_id: string | null;
+      sku_code: string | null;
+      sku_name: string | null;
+    }
+
+    const TYPE_LABELS: Record<string, string> = {
+      short_pick: 'Short pick',
+      damaged: 'Damaged',
+      wrong_location: 'Wrong location',
+      wrong_sku_scan: 'Wrong SKU scanned',
+      wrong_qty: 'Wrong quantity',
+      pack_mismatch: 'Pack mismatch',
+      awb_mismatch: 'AWB mismatch',
+      duplicate_awb: 'Duplicate AWB',
+      order_cancelled: 'Order cancelled',
+      substitution: 'Substitution',
+      other: 'Other'
+    };
+
+    const app = document.getElementById('app')!;
+    let warehouseId = '';
+    let includeResolved = false;
+    let rows: ExceptionRow[] = [];
+
+    async function api(path: string, body?: unknown, method?: string) {
+      const res = await fetch(path, {
+        method: method ?? (body === undefined ? 'GET' : 'POST'),
+        headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body)
+      });
+      const data: any = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error ?? `Request failed (${res.status})`);
+      return data;
+    }
+
+    function formatTime(iso: string): string {
+      return new Date(iso + 'Z').toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+    }
+
+    async function load() {
+      rows = await api(`/api/admin/exceptions?warehouseId=${warehouseId}&includeResolved=${includeResolved}`);
+      render();
+    }
+
+    function render() {
+      const unresolvedCount = rows.filter((r) => !r.resolved).length;
+      app.innerHTML = `
+        <div class="row" style="justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+          <div class="row" style="width: auto; gap: 10px;">
+            <span class="pill">${unresolvedCount} unresolved</span>
+          </div>
+          <label class="row" style="width: auto; gap: 6px; align-items: center; font-size: 0.85rem;">
+            <input type="checkbox" id="show-resolved" ${includeResolved ? 'checked' : ''} style="width: 18px; height: 18px;" />
+            Show resolved too
+          </label>
+        </div>
+        ${
+          rows.length
+            ? `<div class="table-scroll" style="margin-top: 12px;"><table>
+                 <thead><tr><th></th><th>Type</th><th>Order</th><th>Product</th><th>Note</th><th>By</th><th>When</th><th></th></tr></thead>
+                 <tbody id="exception-rows"></tbody>
+               </table></div>`
+            : `<p style="margin-top: 12px;">Nothing to show — no exceptions ${includeResolved ? '' : 'unresolved '}right now.</p>`
+        }`;
+
+      document.getElementById('show-resolved')?.addEventListener('change', (e) => {
+        includeResolved = (e.target as HTMLInputElement).checked;
+        load();
+      });
+
+      if (!rows.length) return;
+      const tbody = document.getElementById('exception-rows')!;
+      tbody.innerHTML = rows
+        .map(
+          (r) => `
+        <tr style="${r.resolved ? 'opacity: 0.55;' : ''}">
+          <td><span class="status-pill ${r.resolved ? 'status-success' : 'status-warning'}">${r.resolved ? 'resolved' : 'open'}</span></td>
+          <td style="font-weight: 600; white-space: nowrap;">${escapeHtml(TYPE_LABELS[r.type] ?? r.type)}</td>
+          <td style="white-space: nowrap; font-weight: 600;">${r.external_order_id ? escapeHtml(r.external_order_id) : '<span style="color: var(--muted); font-weight: 400;">—</span>'}</td>
+          <td style="white-space: nowrap;">${r.sku_code ? `${escapeHtml(r.sku_code)}<br /><span style="font-size: 0.72rem; color: var(--muted);">${escapeHtml(r.sku_name ?? '')}</span>` : '<span style="color: var(--muted);">—</span>'}</td>
+          <td style="max-width: 260px;">${escapeHtml(r.notes ?? '—')}</td>
+          <td style="white-space: nowrap;">${escapeHtml(r.user_name ?? '—')}</td>
+          <td style="white-space: nowrap; font-size: 0.78rem; color: var(--muted);">${formatTime(r.created_at)}</td>
+          <td><button class="btn btn-ghost resolve-btn" data-id="${r.id}" data-resolved="${r.resolved}" style="width: auto; min-height: 32px; font-size: 0.78rem;">${r.resolved ? 'Reopen' : 'Resolve'}</button></td>
+        </tr>`
+        )
+        .join('');
+
+      tbody.querySelectorAll('.resolve-btn').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const el = btn as HTMLButtonElement;
+          const resolved = el.dataset.resolved === '1';
+          try {
+            await api('/api/admin/exceptions', { id: el.dataset.id, resolved: !resolved }, 'PATCH');
+            await load();
+          } catch (err) {
+            alert((err as Error).message);
+          }
+        });
+      });
+    }
+
+    async function boot() {
+      const me = await api('/api/auth/me');
+      if (!me.user) {
+        window.location.href = '/login';
+        return;
+      }
+      if (me.user.role !== 'admin') {
+        app.innerHTML = `<p>This account is a "${me.user.role}", not an admin.</p>`;
+        return;
+      }
+      warehouseId = me.user.warehouseId;
+      await load();
+    }
+
+    boot();
+  </script>
+</AdminShell>

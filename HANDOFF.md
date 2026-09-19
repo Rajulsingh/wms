@@ -969,6 +969,85 @@ buttons, not just a bare number field.
   data, marked an order packed successfully. Local test-data reset back to `pending` via the existing
   reset tool afterward.
 
+## Recently done (2026-09-20, a twenty-second pass) — a critical deploy bug, exception visibility, and follow-up fixes from a live user report
+
+The user came back with a live report bundling several things: the new Schedule Pickup admin page
+wasn't visible at all; picked orders weren't showing up in packing; and short-picks/damage/notes
+logged on the floor have never been visible anywhere on the admin side.
+
+**Root cause, and the most important thing in this pass: `wrangler deploy` does not run `astro
+build` first.** `main: src/worker.ts` bundles fresh every time, but the actual page/API routes come
+from whatever's already sitting in `dist/` — and `@astrojs/cloudflare`'s adapter generates its own
+deploy config (`dist/server/wrangler.json`) that wrangler resolves at deploy time. Several passes
+this session ran `npx astro check` (a type-check, not a build) immediately before `wrangler deploy`,
+which looks identical in output to a real deploy but silently ships stale routes — this is exactly
+why `/admin/schedule-pickup` 404'd in production despite being "deployed" twice. Confirmed via
+`curl -o /dev/null -w "%{http_code}"` against the live URL, not assumed. **Fixed two ways**: (1)
+added `"build": { "command": "npm run build" }` to `wrangler.jsonc` so a build runs automatically
+before every `wrangler deploy`/`wrangler dev`; (2) going forward, always run `npx astro build`
+explicitly immediately before `npx wrangler deploy` regardless of the hook, since the hook's
+interaction with the adapter's redirect-config file showed a rough edge under `--dry-run` with an
+empty `dist/` (fails loud in that specific case rather than silently — an acceptable trade, still
+strictly better than the silent-stale-deploy failure mode it replaces, but don't rely on it alone).
+**This means several earlier "Recently done" entries this session may have been live later than
+their own timestamp suggests** — the fix is a full fresh build+deploy, which picks up all current
+source regardless of what was stale before, so everything described in this file is confirmed live
+as of this pass's deploy (Version `44e02ecd`), not necessarily earlier.
+
+**"Orders picked not showing up in packing" was a real, separate consequence of the same
+incident, compounded by the empty-`packing_stations` gap already found and fixed in the twenty-first
+pass**: until the fresh build actually went out, production was still running the *old* tap-in-
+station code, which requires a valid `packing_stations` row to match against — and production had
+zero. So packing was blocked two ways at once (old code needing a station that didn't exist; new
+code not deployed yet to remove that requirement) until this pass's real deploy landed. Should be
+resolved now — next real pick should flow into packing normally. Verified the fix's shape (not the
+live account, since real packer PINs aren't something to guess/test with) via the local dev
+end-to-end pass in the twenty-first pass, plus confirming the deployed route now correctly redirects
+like every other admin page instead of 404ing.
+
+**New: `/admin/exceptions`** — every short pick, damage report, wrong-location/SKU scan, pack
+mismatch, duplicate AWB, etc. has been logged to `exception_events` since the very first pass
+(`logException`, `lib/db.ts`) but nothing ever read it back until now — confirmed by grepping the
+whole codebase for readers before building this (only `reset.ts`, which just nulls FKs on reset).
+New `src/pages/api/admin/exceptions.ts` resolves the order an exception belongs to via whichever of
+its three optional FKs is populated (`order_id` directly, or `pick_task_id`/`pack_session_id`
+indirectly — a historical exception can outlive the order it was about, since reset nulls those
+FKs rather than deleting the row), plus the SKU when a `pick_task_id` is available. The page
+(`src/pages/admin/exceptions.astro`, new "Orders" nav entry) defaults to unresolved-only, oldest-
+unresolved-first-ish (actually resolved-status-then-recency), with a "Resolve"/"Reopen" toggle
+(`PATCH`, never deletes — the row stays for history either way) and a "show resolved too" checkbox.
+Verified live in dev against 9 real historical exceptions already sitting in the database from
+earlier passes' testing — resolve/reopen both round-tripped correctly.
+
+**Follow-up, same pass**: the user came back immediately after with a second, worse report — "you
+have messed up big time... all orders are not showing in pick list", plus "retry blocked orders"
+falsely reporting real-stock orders as short. Investigated directly against production data (not
+guessed): found **all 35 currently-`pending` orders had already been fully picked** — their
+`order_items`/`pick_tasks` were `'picked'` and their `pick_batches` `'completed'`, but `orders.status`
+alone said `'pending'`, with no `pack_sessions` created. That single wrong field explained both
+symptoms at once: they'd vanished from Pick because they weren't actually waiting to be picked (they
+needed packing, not picking), and `retryBlockedOrders`/`reserveOrderForPicking` correctly refused to
+re-reserve their (already real-picked, no-longer-pending) items, surfacing as a confusing "No items
+to reserve" reason the admin UI unconditionally mislabeled "short on stock" even though it had
+nothing to do with stock. **Root-caused to a real race in `resetPickPackData`**: it snapshots target
+orders once, then does many sequential awaited writes across a loop — if any of those orders finish
+picking for real (genuine floor activity, and the timestamps show picking *did* happen close in time
+to two admin resets) before the function's final blind `UPDATE orders SET status = 'pending' WHERE id
+IN (...)` runs, that write stomps the order's status back to `'pending'` while its already-completed
+`pick_tasks`/`pack_sessions` — captured in an *earlier* snapshot, before they existed or changed —
+never get cleaned up, since it thinks they're plain old leftover rows. **Fixed the reset function**
+by re-guarding that final UPDATE with `AND status IN (...)` (the same status list the initial SELECT
+used), so an order that's moved on since the snapshot is simply left alone instead of mislabeled.
+**Repaired the 35 already-affected orders in production** (with the user's explicit go-ahead, since
+it's a real-order data write) — checked first that this was purely a label problem (item/task/
+inventory state was internally consistent and correct, no reservation double-counting risk) before
+setting `orders.status` back to `'picked'` for exactly those 35, touching nothing else. Confirmed
+live, immediately: a real packer's app auto-claimed all 35 into `pack_sessions` within seconds of the
+fix landing. Also softened the admin UI's "retry blocked orders" message (`admin/index.astro`) to not
+claim every failure is a stock issue, and gave `reserveOrderForPicking`'s "no pending items" case a
+clearer reason string distinguishing "already processed, not a stock problem" from a genuinely empty
+order.
+
 ## Next steps — a prioritized plan
 
 Rewritten 2026-09-20 (twenty-one passes across two days — see "Recently done" entries above for the

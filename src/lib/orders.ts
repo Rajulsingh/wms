@@ -130,7 +130,19 @@ export async function reserveOrderForPicking(db: D1Database, warehouseId: string
     .prepare(`SELECT id, sku_id, quantity_ordered FROM order_items WHERE order_id = ? AND status = 'pending'`)
     .bind(orderId)
     .all<{ id: string; sku_id: string; quantity_ordered: number }>();
-  if (!items.results.length) return { reserved: false, taskCount: 0, reason: 'No items to reserve' };
+  if (!items.results.length) {
+    // Distinguished from a real stock shortage on purpose — this is a data-
+    // state issue (the order claims to be pending but its own items say
+    // otherwise, e.g. from the reset race a real incident traced to — see
+    // reset.ts), not something "receive stock" fixes. A genuinely empty
+    // order (no line items at all) gets its own message rather than being
+    // lumped in as the same "already processed" case.
+    const totalItems = await db.prepare(`SELECT COUNT(*) as c FROM order_items WHERE order_id = ?`).bind(orderId).first<{ c: number }>();
+    const reason = totalItems?.c
+      ? `This order's items are already marked processed, not pending — not a stock issue. Check Exceptions or ask for help.`
+      : 'This order has no line items at all.';
+    return { reserved: false, taskCount: 0, reason };
+  }
 
   const orderReservations: Array<{ inventoryId: string; locationId: string; quantity: number; orderItemId: string; skuId: string }> = [];
 

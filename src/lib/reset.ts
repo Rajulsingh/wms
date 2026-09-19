@@ -107,9 +107,20 @@ export async function resetPickPackData(db: D1Database, warehouseId: string, use
     await db.prepare(`DELETE FROM pick_batches WHERE id IN (${batchPh})`).bind(...batchIds).run();
   }
 
-  // Orders/items back to a fresh, batchable state.
+  // Orders/items back to a fresh, batchable state. The final UPDATE is
+  // re-guarded by the same status list the initial SELECT used (not just
+  // `id IN (...)`) — a real incident showed why: reset takes a snapshot of
+  // target orders, then does many sequential awaited writes; if any of
+  // those orders finish picking/packing for real (concurrent floor
+  // activity) before this line runs, a blind `id IN (...)` UPDATE stomps
+  // that real progress back to 'pending' while leaving its now-orphaned
+  // pick_tasks/pack_sessions untouched (they were captured earlier, before
+  // the concurrent change) — exactly the corruption that hid 35 already-
+  // picked orders from the packer and made "retry blocked" report bogus
+  // stock shortages. Re-checking status here means an order that moved on
+  // mid-reset is simply left alone instead of getting silently mislabeled.
   await db.prepare(`UPDATE order_items SET quantity_picked = 0, quantity_packed = 0, status = 'pending' WHERE order_id IN (${orderPh})`).bind(...orderIds).run();
-  await db.prepare(`UPDATE orders SET status = 'pending' WHERE id IN (${orderPh})`).bind(...orderIds).run();
+  await db.prepare(`UPDATE orders SET status = 'pending' WHERE id IN (${orderPh}) AND status IN (${statusPh})`).bind(...orderIds, ...statuses).run();
 
   await logAudit(db, {
     userId,

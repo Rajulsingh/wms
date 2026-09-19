@@ -4,6 +4,17 @@
 	"compatibility_flags": ["global_fetch_strictly_public"],
 	"name": "wms",
 	"main": "src/worker.ts",
+	// Runs automatically before `wrangler deploy`/`wrangler dev` — added after
+	// a real incident: several passes' worth of work (schedule-pickup, the
+	// packer station-assignment change, the picker over-pick fix) were
+	// "deployed" via `wrangler deploy` alone, which bundles `main` fresh but
+	// does NOT rebuild `./dist` — so the deploy silently kept serving
+	// whatever `astro build` had last produced, missing everything newer.
+	// This makes a stale build structurally impossible instead of relying on
+	// remembering to run `astro build` first every time. See HANDOFF.md.
+	"build": {
+		"command": "npm run build"
+	},
 	"triggers": {
 		"crons": ["*/5 * * * *"]
 	},
