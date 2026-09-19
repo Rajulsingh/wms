@@ -80,38 +80,54 @@ full detail on each.
    actually granted against the live account before adding a new recurring cron job; it is
    granted, so wiring this into the existing 5-minute `sync-job.ts` cron alongside order sync is
    a reasonable low-risk follow-up if the user wants listings to stay fresh automatically).
-4. **Get the Amazon Easy Ship SP-API role granted.** This is the one thing blocking real use of
-   shipping (single-order, bulk, everything). It's on the user, not something to keep
-   investigating from this end — check Seller Central's app-authorization page for an "Easy Ship"
-   scope. Once granted, the very first thing to do is a live smoke test of `/admin/ship` on one
-   real order, watching closely for: the real `labelFileType` Amazon returns, which page of the
-   combined PDF is actually the label (currently assumes last), and whether the
-   `DocumentReportReferenceID` regex parse in `checkEasyShipFeed` actually matches Amazon's real
-   feed-processing-report format. None of that has ever been exercised against a live account.
-5. **Real box sizes.** Only one demo box exists. Needs the user to enter their actual box
+4. ~~**Pick batches were fragmenting into many single-order lists**~~ — **fixed** (2026-09-19).
+   Removed eager auto-batching-on-arrival; batching now happens at claim time (`claimNextBatch`
+   in `picker.ts`), sweeping every currently-open order into one batch the moment a picker's
+   ready for it, capped at the cart's real `slot_count`. See "What's built" → "Claim-time
+   pick-batch creation" for the full writeup, including a known low-risk race-condition
+   limitation that was inherited, not introduced.
+5. ~~**Picking was one card per order; user wanted bulk-by-SKU**~~ — **fixed** (2026-09-19).
+   Picker now sees one aggregate line per SKU per bin across every order needing it, one "Mark
+   done" tap. See "What's built" → the picking entry for the full writeup, including a real
+   pre-existing batch-completion bug this work found and fixed. **Packing was scoped out in the
+   same conversation but deliberately not built yet** — see "Open items" #14 for the three-part
+   breakdown (multi-order batch packing — unblocked, this is the agreed next build; bulk label
+   content — blocked on the Easy Ship role; direct thermal-printer printing via QZ Tray — needs
+   the printer model and current QZ licensing confirmed first). Don't start on packing without
+   re-reading that item; the physical floor workflow it documents is the actual spec.
+6. **Get the Amazon Easy Ship SP-API role granted.** This is the one thing blocking real use of
+   shipping (single-order, bulk, everything) *and* packing's bulk-label piece above. It's on the
+   user, not something to keep investigating from this end — check Seller Central's
+   app-authorization page for an "Easy Ship" scope. Once granted, the very first thing to do is a
+   live smoke test of `/admin/ship` on one real order, watching closely for: the real
+   `labelFileType` Amazon returns, which page of the combined PDF is actually the label
+   (currently assumes last), and whether the `DocumentReportReferenceID` regex parse in
+   `checkEasyShipFeed` actually matches Amazon's real feed-processing-report format. None of that
+   has ever been exercised against a live account.
+7. **Real box sizes.** Only one demo box exists. Needs the user to enter their actual box
    dimensions in the "Manage" menu → Zones/racks/stations, or wherever box sizes ended up (check
    `/admin/settings`).
-6. **Confirm the ship-from address is real**, not the placeholder used during testing — check
+8. **Confirm the ship-from address is real**, not the placeholder used during testing — check
    `/admin/settings` before the first real label purchase.
-7. **Decide the 30-day data-disposal scope** (see open item, below) — this was *committed to
+9. **Decide the 30-day data-disposal scope** (see open item, below) — this was *committed to
    Amazon in writing* with no enforcement code yet. Needs three scoping answers from the user
    before it can be built safely; the cron infrastructure already exists (`src/worker.ts`) so the
    actual job is easy to add once those answers exist — it can piggyback on the same scheduled
    handler pattern as the Amazon sync, doesn't need new plumbing.
-8. **Smaller, ask-before-building items**: individually-strengthened admin auth (currently same
-   weak PIN as floor workers), a public privacy policy URL for ecomglider.com, whether the
-   picker/packer "no mandatory scanning" philosophy needs any adjustment now that pickup-slot
-   labels exist, what should happen when an Amazon cancellation lands on an order that's already
-   been fully picked/packed (currently just flagged via an exception event for manual putback —
-   see "Automatic Amazon sync" below), and whether the Amazon catalog sync (item 3 above) should
-   become automatic (periodic cron) rather than a manual button. None of these are urgent; don't
-   build them unprompted.
-9. **Minor cleanup, low priority**: `src/pages/api/picker/scan-item.ts` (and `verifyItemScan` in
-   `picker.ts`) is dead code from before the picker dropped mandatory scanning — nothing calls
-   it. Safe to delete next time you're in that area, not worth a dedicated pass on its own.
-   `Warehouse` type in `types.ts` is missing the `ship_from_*` columns (cosmetic, nothing
-   breaks).
-10. **If the user says the UI still looks off somewhere else**, the fix pattern is already
+10. **Smaller, ask-before-building items**: individually-strengthened admin auth (currently same
+    weak PIN as floor workers), a public privacy policy URL for ecomglider.com, whether the
+    picker/packer "no mandatory scanning" philosophy needs any adjustment now that pickup-slot
+    labels exist, what should happen when an Amazon cancellation lands on an order that's already
+    been fully picked/packed (currently just flagged via an exception event for manual putback —
+    see "Automatic Amazon sync" below), and whether the Amazon catalog sync (item 3 above) should
+    become automatic (periodic cron) rather than a manual button. None of these are urgent; don't
+    build them unprompted.
+11. **Minor cleanup, low priority**: `src/pages/api/picker/scan-item.ts` (and `verifyItemScan` in
+    `picker.ts`) is dead code from before the picker dropped mandatory scanning — nothing calls
+    it. Safe to delete next time you're in that area, not worth a dedicated pass on its own.
+    `Warehouse` type in `types.ts` is missing the `ship_from_*` columns (cosmetic, nothing
+    breaks).
+12. **If the user says the UI still looks off somewhere else**, the fix pattern is already
     established (see "Design system" below) — reuse `AdminShell`/the existing component classes
     rather than inventing new ones. If it's specifically a *mobile* complaint, verify with
     `document.documentElement.scrollWidth` at 375px before guessing at a fix (see item 2 above —
@@ -377,7 +393,7 @@ shell below targets desktop admin use and doesn't follow it.
   pulls the seller's full Amazon listings catalog (Listings Items API, paginated, capped at 1000)
   and upserts every SellerSKU into local `skus` — this is what makes the search above cover
   everything the seller sells, not just SKUs an order has referenced. Manual trigger, not an
-  automatic cron yet (see "Next steps" #8). Refreshes name/image_url only; never touches the
+  automatic cron yet (see "Next steps" #10). Refreshes name/image_url only; never touches the
   admin-owned `price`/`reorder_point` fields.
 - **Inventory management** (`/admin/inventory`) — every SKU×location row with on-hand/reserved,
   editable on-hand (a direct correction, not a reservation-flow operation — for miscounts/damage
@@ -466,8 +482,8 @@ shell below targets desktop admin use and doesn't follow it.
 Roughly in the order they'll come up; "Next steps" above is the short prioritized version of
 this list.
 
-1. **Amazon Easy Ship SP-API role not yet granted** — blocks all shipping (single + bulk). See
-   "Next steps" #2.
+1. **Amazon Easy Ship SP-API role not yet granted** — blocks all shipping (single + bulk) *and*
+   packing's bulk-label piece (item 14 below). See "Next steps" #6.
 2. **Real box sizes** not yet entered (only one demo box exists).
 3. **Confirm ship-from address is the real one**, not a placeholder.
 4. **30-day data disposal — committed to Amazon in writing, not yet built.** Needs three scoping
@@ -506,11 +522,52 @@ this list.
     particular as higher-risk than the rest of the app until verified.
 14. **Packing doesn't yet get the same bulk/SKU-grouped treatment picking just got** (see "What's
     built" → the picking entry, 2026-09-19). The user asked for it on both; picking shipped,
-    packing needs a scoping conversation first since it's a structurally bigger change (one
-    order/one label per pack session today vs. sorting a batch's SKUs across several
-    simultaneously-open order boxes) that touches the same AWB/label path item 13 above already
-    flags as sensitive. Don't guess at this one — ask what "bulk" should mean for packing
-    specifically before building it.
+    packing was scoped out in conversation (2026-09-19) into three pieces — #1 is unblocked and
+    is the agreed next thing to build; #2 and #3 are real future work, not forgotten, but each has
+    a concrete blocker/unknown that has to resolve first. **Here's the actual floor workflow this
+    is meant to replace**, as described by the user, since it's the spec for all three pieces:
+    admin currently hand-writes a pick list (SKU + quantity, with multi-qty/free-item/special-
+    requirement notes called out per line); the packer picks everything for the whole batch at
+    once, then packs every order's box (not one order fully start-to-finish before starting the
+    next), physically arranging finished-but-unlabeled boxes *in SKU order* on the table as they
+    go; only once the whole list is packed does admin generate all the shipping labels for the
+    batch in that same SKU order; the packer then walks the table matching labels to boxes in
+    order (fast, because both are sorted the same way) and scans each AWB as they apply it to
+    mark that order ready-to-ship.
+    1. **Multi-order batch packing — no external blocker, this is the next build.** Change
+       `pack_sessions` from one-order-at-a-time (`startNextPackSession` pulls a single order,
+       applies its one label, moves on) to covering a whole batch: the packer works through every
+       order's items (order and/or SKU grouped, matching how picking now presents the SKU
+       breakdown), with labeling deliberately deferred to a separate step at the end rather than
+       applied per order as packing finishes. Needs a real per-order notes/special-instructions
+       field too — today there's nowhere to record "free gift included" or "multi-qty, double-
+       check count," it only exists on the admin's handwritten paper.
+    2. **Bulk label content — blocked on the Easy Ship SP-API role** (same blocker as "Next
+       steps" #2/#4). Once a batch is scheduled via `/admin/bulk-ship`, the resulting labels need
+       to: be ordered to match the SKU-sorted packed boxes (not whatever order Amazon's bulk
+       response happens to return — `createScheduledPackageBulk`'s ZIP-splitting is already
+       flagged in item 13 as unverified against a live account, and this SKU-ordering requirement
+       adds to what needs checking once real label content is finally visible); have the SKU's
+       short code (not the arbitrary free-text "Package Identifier" `stampPackageIdentifier`
+       stamps today) printed bottom-right; and have invoice pages stripped out of Amazon's
+       combined label+invoice PDF so only the actual shipping-label page reaches the printer —
+       none of this can be built with confidence until a real label PDF from this account can
+       actually be inspected.
+    3. **Direct thermal-printer printing — needs two answers from the user first, not blocked
+       otherwise.** A Cloudflare Worker can't reach a printer sitting on the warehouse's local
+       network; the realistic approaches are either the browser's own print dialog (sized to 4x6,
+       admin/packer selects the printer once) or a local print-bridge app. **QZ Tray** (a small
+       Java-based background app + a `qz-tray.js` library the web app talks to over a local
+       WebSocket) was discussed and is a reasonable fit — it's the standard tool for silent
+       browser-to-local-printer printing (raw ZPL/EPL for thermal printers, or rasterized PDF),
+       which is exactly this use case, and there's no way to get *true* silent/automatic printing
+       from a web app without some local bridge like it. Before building against it: (a) **the
+       printer's make/model** — determines whether the integration sends raw ZPL (typical for
+       Zebra-style thermal printers) or rasterized output; (b) **current QZ Tray licensing for
+       this deployment's scale** — the core software is free/open-source, commercial digital-
+       signing (avoids a security prompt on every print job) is a paid tier last this was
+       discussed, but terms shift, so confirm current pricing on QZ's own site rather than trust
+       a number here.
 
 ## Amazon Data Protection Policy questionnaire — what was submitted
 
