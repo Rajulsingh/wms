@@ -479,39 +479,102 @@ export async function getMyBatches(db: D1Database, warehouseId: string, pickerId
   return out;
 }
 
-export interface UpcomingBatchSummary {
-  batchId: string;
-  createdAt: string;
+export interface SkuDemandRow {
+  skuId: string;
+  skuCode: string;
+  skuName: string;
+  imageUrl: string | null;
   orderCount: number;
-  skuCount: number;
-  unitCount: number;
+  unitsNeeded: number;
 }
 
 /**
- * Batches admin has already pulled (created) but nobody has claimed or been
- * assigned yet — status stays 'pending' only in that narrow window, since
- * claimNextBatch's own sweep flips it to 'assigned' the instant a picker
- * claims it. Shown on the packer dashboard as "upcoming work", read-only —
- * visibility only, not a claim action.
+ * Everything currently unclaimed (pick_batches still 'pending'), grouped by
+ * SKU rather than one row per order — replaces the old per-batch "upcoming"
+ * list, which showed nothing but a timestamp per order (since one batch is
+ * always exactly one order, "order count" on it was always 1) and didn't
+ * scale past a handful of rows. This is the single source of truth for
+ * "what's waiting to be worked on": both the packer dashboard's read-only
+ * preview and the admin's bulk-assign-by-SKU screen call this same function,
+ * on purpose, so the two views can never show different numbers for the
+ * same underlying pile of work.
  */
-export async function getUpcomingBatches(db: D1Database, warehouseId: string): Promise<UpcomingBatchSummary[]> {
-  const batches = await db
-    .prepare(`SELECT id, created_at FROM pick_batches WHERE warehouse_id = ? AND status = 'pending' ORDER BY created_at ASC`)
+export async function getUnassignedSkuDemand(db: D1Database, warehouseId: string): Promise<SkuDemandRow[]> {
+  const rows = await db
+    .prepare(
+      `SELECT sk.id AS sku_id, sk.sku_code, sk.name AS sku_name, sk.image_url,
+              COUNT(DISTINCT pt.pick_batch_id) AS order_count,
+              SUM(pt.quantity_required) AS units_needed
+       FROM pick_tasks pt
+       JOIN pick_batches pb ON pb.id = pt.pick_batch_id
+       JOIN skus sk ON sk.id = pt.sku_id
+       WHERE pb.warehouse_id = ? AND pb.status = 'pending' AND pt.status = 'pending'
+       GROUP BY sk.id
+       ORDER BY sk.sku_code ASC`
+    )
     .bind(warehouseId)
-    .all<{ id: string; created_at: string }>();
+    .all<{ sku_id: string; sku_code: string; sku_name: string; image_url: string | null; order_count: number; units_needed: number }>();
 
-  const out: UpcomingBatchSummary[] = [];
+  return rows.results.map((r) => ({
+    skuId: r.sku_id,
+    skuCode: r.sku_code,
+    skuName: r.sku_name,
+    imageUrl: r.image_url,
+    orderCount: r.order_count,
+    unitsNeeded: r.units_needed
+  }));
+}
+
+export interface AssignSkusResult {
+  batchesAssigned: number;
+  ordersWithOtherSkus: number;
+  failed: number;
+}
+
+/**
+ * Bulk-assigns every currently-unclaimed order that needs at least one of
+ * the given SKUs to one packer — the "assign this SKU (or these SKUs) to a
+ * packer" action, without splitting a single order's own pick_tasks across
+ * different packers (that would mean rewriting claimNextBatch/
+ * checkBatchCompletion around per-task rather than per-batch ownership, a
+ * much bigger and riskier change than the actual ask: making bulk
+ * assignment fast and SKU-legible). The whole order (batch) still moves
+ * together — `ordersWithOtherSkus` tells the caller how many of the
+ * assigned orders also needed a SKU outside the selected set, so the UI can
+ * say so rather than the admin discovering it later on the picker's own
+ * screen. Reuses assignBatchToPacker as-is; one batch losing a race (already
+ * claimed between the SELECT and the assign) doesn't abort the rest.
+ */
+export async function assignSkusToPacker(db: D1Database, warehouseId: string, skuIds: string[], packerId: string): Promise<AssignSkusResult> {
+  if (!skuIds.length) throw new PickerFlowError('no_skus', 'Select at least one SKU');
+  const skuPh = skuIds.map(() => '?').join(',');
+
+  const batches = await db
+    .prepare(
+      `SELECT DISTINCT pb.id
+       FROM pick_batches pb JOIN pick_tasks pt ON pt.pick_batch_id = pb.id
+       WHERE pb.warehouse_id = ? AND pb.status = 'pending' AND pt.status = 'pending' AND pt.sku_id IN (${skuPh})`
+    )
+    .bind(warehouseId, ...skuIds)
+    .all<{ id: string }>();
+
+  let ordersWithOtherSkus = 0;
+  let failed = 0;
   for (const b of batches.results) {
-    const rows = await getPickListView(db, b.id);
-    out.push({
-      batchId: b.id,
-      createdAt: b.created_at,
-      orderCount: new Set(rows.map((r) => r.external_order_id)).size,
-      skuCount: new Set(rows.map((r) => r.sku_code)).size,
-      unitCount: rows.reduce((sum, r) => sum + r.quantity_required, 0)
-    });
+    const otherSku = await db
+      .prepare(`SELECT COUNT(*) as c FROM pick_tasks WHERE pick_batch_id = ? AND status = 'pending' AND sku_id NOT IN (${skuPh})`)
+      .bind(b.id, ...skuIds)
+      .first<{ c: number }>();
+    if (otherSku && otherSku.c > 0) ordersWithOtherSkus++;
+
+    try {
+      await assignBatchToPacker(db, warehouseId, b.id, packerId);
+    } catch {
+      failed++;
+    }
   }
-  return out;
+
+  return { batchesAssigned: batches.results.length - failed, ordersWithOtherSkus, failed };
 }
 
 /**

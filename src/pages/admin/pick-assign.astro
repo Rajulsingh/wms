@@ -1,0 +1,180 @@
+---
+import AdminShell from '../../components/AdminShell.astro';
+import { getDb } from '../../lib/db';
+import { requireAdminPage } from '../../lib/auth';
+
+const redirectTo = await requireAdminPage(Astro, getDb());
+if (redirectTo) return Astro.redirect(redirectTo);
+---
+
+<AdminShell title="Assign picking" current="pick-assign">
+  <div class="card stack">
+    <h2>Assign by SKU</h2>
+    <p>
+      Everything currently waiting to be picked, grouped by SKU instead of one row per order. Pick one or
+      more SKUs and a packer, then assign — every order that needs any of the selected SKUs goes to that
+      packer in one go. An order stays a single unit of work: if it also needs a SKU you didn't select,
+      that comes along with it, and you'll be told so before it's final.
+    </p>
+  </div>
+
+  <div id="app" class="stack">
+    <p>Loading…</p>
+  </div>
+
+  <script>
+    import { escapeHtml, withLoading } from '../../lib/ui';
+
+    interface SkuDemandRow {
+      skuId: string;
+      skuCode: string;
+      skuName: string;
+      imageUrl: string | null;
+      orderCount: number;
+      unitsNeeded: number;
+    }
+    interface PackerUser {
+      id: string;
+      name: string;
+      role: string;
+      active: number;
+    }
+
+    const app = document.getElementById('app')!;
+    let warehouseId = '';
+    let demand: SkuDemandRow[] = [];
+    let packers: PackerUser[] = [];
+    let selected = new Set<string>();
+    let lastResult = '';
+    let lastResultTone: 'success' | 'danger' = 'success';
+
+    async function api(path: string, body?: unknown, method?: string) {
+      const res = await fetch(path, {
+        method: method ?? (body === undefined ? 'GET' : 'POST'),
+        headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body)
+      });
+      const data: any = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error ?? `Request failed (${res.status})`);
+      return data;
+    }
+
+    async function load() {
+      demand = await api(`/api/picker/sku-demand?warehouseId=${warehouseId}`);
+      for (const id of selected) if (!demand.some((d) => d.skuId === id)) selected.delete(id);
+      render();
+    }
+
+    function render() {
+      app.innerHTML = `
+        ${lastResult ? `<div class="banner banner-${lastResultTone}">${lastResult}</div>` : ''}
+        ${
+          demand.length
+            ? `<div class="table-scroll"><table>
+                 <thead><tr><th></th><th></th><th>SKU</th><th>Orders waiting</th><th>Units needed</th></tr></thead>
+                 <tbody id="sku-rows"></tbody>
+               </table></div>
+               <div class="row" id="assign-bar" style="align-items: center; gap: 10px; flex-wrap: wrap; display: none; border-top: 1px solid var(--border); padding-top: 12px; margin-top: 4px;">
+                 <span class="pill" id="selected-count" style="flex: 0 0 auto;"></span>
+                 <select id="packer-select" style="width: auto; flex: 1; min-width: 180px;">
+                   <option value="">Choose a packer…</option>
+                   ${packers.map((p) => `<option value="${p.id}">${escapeHtml(p.name)}</option>`).join('')}
+                 </select>
+                 <button class="btn btn-primary" id="assign-btn" style="width: auto;">Assign selected</button>
+               </div>`
+            : `<div class="card"><p>Nothing waiting to be picked right now.</p></div>`
+        }`;
+
+      const rowsEl = document.getElementById('sku-rows');
+      if (rowsEl) {
+        rowsEl.innerHTML = demand
+          .map(
+            (d) => `<tr data-sku-id="${d.skuId}">
+              <td><input type="checkbox" class="sku-check" ${selected.has(d.skuId) ? 'checked' : ''} style="width: 20px; height: 20px;" /></td>
+              <td>${d.imageUrl ? `<img class="table-thumb" src="${d.imageUrl}" alt="" />` : ''}</td>
+              <td style="font-weight: 700;">${escapeHtml(d.skuCode)}<br /><span style="font-weight: 400; font-size: 0.78rem; color: var(--muted);">${escapeHtml(d.skuName)}</span></td>
+              <td>${d.orderCount}</td>
+              <td>${d.unitsNeeded}</td>
+            </tr>`
+          )
+          .join('');
+
+        rowsEl.querySelectorAll('.sku-check').forEach((cb) => {
+          cb.addEventListener('change', (e) => {
+            const tr = (e.target as HTMLElement).closest('tr') as HTMLElement;
+            const skuId = tr.dataset.skuId!;
+            if ((e.target as HTMLInputElement).checked) selected.add(skuId);
+            else selected.delete(skuId);
+            updateAssignBar();
+          });
+        });
+      }
+
+      updateAssignBar();
+
+      document.getElementById('assign-btn')?.addEventListener('click', async (e) => {
+        const packerSelect = document.getElementById('packer-select') as unknown as HTMLSelectElement;
+        const packerId = packerSelect.value;
+        if (!packerId) {
+          lastResult = 'Choose a packer first.';
+          lastResultTone = 'danger';
+          render();
+          return;
+        }
+        const skuIds = [...selected];
+        const btn = e.currentTarget as HTMLButtonElement;
+        try {
+          const result = await withLoading(btn, 'Assigning…', () =>
+            api('/api/admin/assign-sku', { warehouseId, skuIds, packerId }, 'POST')
+          );
+          const packerName = packers.find((p) => p.id === packerId)?.name ?? 'that packer';
+          lastResult = `${result.batchesAssigned} order${result.batchesAssigned === 1 ? '' : 's'} assigned to ${escapeHtml(packerName)}.`;
+          if (result.ordersWithOtherSkus > 0) {
+            lastResult += ` ${result.ordersWithOtherSkus} of those also needed a SKU you didn't select — it went along with the order.`;
+          }
+          if (result.failed > 0) {
+            lastResult += ` ${result.failed} order${result.failed === 1 ? '' : 's'} couldn't be assigned (already claimed elsewhere) — refreshed the list below.`;
+          }
+          lastResultTone = 'success';
+          selected.clear();
+          await load();
+        } catch (err) {
+          lastResult = (err as Error).message;
+          lastResultTone = 'danger';
+          render();
+        }
+      });
+    }
+
+    function updateAssignBar() {
+      const bar = document.getElementById('assign-bar');
+      const countEl = document.getElementById('selected-count');
+      if (!bar || !countEl) return;
+      bar.style.display = selected.size > 0 ? 'flex' : 'none';
+      countEl.textContent = `${selected.size} SKU${selected.size === 1 ? '' : 's'} selected`;
+    }
+
+    async function boot() {
+      const me = await api('/api/auth/me');
+      if (!me.user) {
+        window.location.href = '/login';
+        return;
+      }
+      if (me.user.role !== 'admin') {
+        app.innerHTML = `<p>This account is a "${me.user.role}", not an admin.</p>`;
+        return;
+      }
+      warehouseId = me.user.warehouseId;
+
+      const users: PackerUser[] = await api(`/api/admin/users?warehouseId=${warehouseId}`);
+      packers = users.filter((u) => u.role === 'packer' && u.active);
+
+      await load();
+      setInterval(() => {
+        if (!document.hidden) load();
+      }, 15000);
+    }
+
+    boot();
+  </script>
+</AdminShell>

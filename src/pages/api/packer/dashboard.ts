@@ -1,15 +1,16 @@
 import type { APIRoute } from 'astro';
 import { getDb } from '../../../lib/db';
 import { requireUser, AuthError } from '../../../lib/auth';
-import { getMyActiveBatches, getUpcomingBatches, getPickListView } from '../../../lib/picker';
+import { getMyActiveBatches, getPickListView } from '../../../lib/picker';
 import { getUnbatchedOrderSummary } from '../../../lib/orders';
 import { getPackerDailySummary } from '../../../lib/packer';
 
 // Read-only — unlike /api/picker/claim-batch, this never auto-claims a new
 // batch. It's the packer's own dashboard: what's already assigned to them,
-// visibility into work admin has pulled but nobody has claimed yet (both
-// already-batched and freshly-imported-but-not-yet-batched), and what this
-// packer has actually finished today.
+// and what this packer has actually finished today. "What's waiting but not
+// yet claimed" moved to the shared /api/picker/sku-demand (see picker.ts's
+// getUnassignedSkuDemand) — the same endpoint the admin bulk-assign screen
+// uses, so the two views can never disagree.
 export const GET: APIRoute = async (context) => {
   const db = getDb();
   try {
@@ -29,11 +30,10 @@ export const GET: APIRoute = async (context) => {
       });
     }
 
-    const upcoming = await getUpcomingBatches(db, warehouseId);
     const unbatched = await getUnbatchedOrderSummary(db, warehouseId);
     const today = await getPackerDailySummary(db, warehouseId, user.id);
 
-    return new Response(JSON.stringify({ myBatches, upcoming, unbatched, today }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({ myBatches, unbatched, today }), { status: 200, headers: { 'Content-Type': 'application/json' } });
   } catch (err) {
     if (err instanceof AuthError) return new Response(JSON.stringify({ error: err.message }), { status: err.status });
     return new Response(JSON.stringify({ error: (err as Error).message }), { status: 500 });

@@ -1131,6 +1131,47 @@ current-day state at a glance — pending/picking/packed/shipped etc., "and othe
 - Verified live in dev (both roles) and on a mobile viewport (375px, two-column stat grid, no
   overflow) before deploying.
 
+## Recently done (2026-09-20, a twenty-sixth pass) — assign picking by SKU, not one order at a time
+
+The user's complaint: assigning pick work to packers meant opening `/admin/pick-list.astro`'s batch
+dropdown and assigning one order at a time — with dozens of small orders that's dozens of clicks,
+and the dropdown itself showed nothing but a timestamp per order, no idea what was actually in it.
+Separately, the packer dashboard's "Upcoming" section had the same problem from the other side: one
+row per order (always "1 order" per row, since one batch is always exactly one order), which doesn't
+scale and tells a packer nothing about what they're about to pick.
+
+Considered a full switch to SKU-based batches (replacing "1 batch = 1 order" as the core unit) but
+that would ripple into inventory reservation, order-completion detection, and packing handoff — real
+risk for a workflow-UI problem. Built the lighter version instead: **keep every order's own
+`pick_batch` exactly as it is** (reservation, `checkBatchCompletion`, packing, all untouched), and add
+a SKU-grouped *view + bulk-assign action* on top of it.
+
+- **`getUnassignedSkuDemand`** (`lib/picker.ts`) — every SKU with at least one still-`'pending'`
+  pick_task in a still-`'pending'` (unclaimed) batch, grouped by SKU with image, order count, and
+  units needed. Replaces `getUpcomingBatches`/`UpcomingBatchSummary` (deleted — one row per order,
+  always "1 order", exactly the useless case the user flagged).
+- **One shared endpoint, `GET /api/picker/sku-demand`** (no role restriction), used by *both* the new
+  admin screen and the packer dashboard — "things should not contradict each other" was the user's
+  own words, so there's exactly one query computing this number, not two that could drift apart.
+- **`assignSkusToPacker`** (`lib/picker.ts`) — admin selects one or more SKUs and a packer; finds
+  every still-unclaimed order needing any of them and assigns that whole order to that packer
+  (reuses `assignBatchToPacker` unchanged, looped, one failure doesn't abort the rest). An order
+  keeps moving as one unit — no attempt to split a single order's own SKUs across two packers, since
+  that's exactly the riskier path that was avoided. If an assigned order also needed a SKU outside
+  the selected set, the result says so explicitly (`ordersWithOtherSkus`) rather than the admin
+  discovering it later.
+- **New `/admin/pick-assign.astro`** ("Assign picking" in the sidebar, above "Pick lists") — the SKU
+  table with checkboxes, photos, order/unit counts, a packer picker, and one "Assign selected"
+  action instead of dozens of individual ones.
+- **`packer/home.astro`'s "Upcoming" section** now renders the same SKU-grouped rows (photo, SKU
+  code/name, units needed, order count) instead of the old one-row-per-order list.
+- Verified live in dev: reset+retried local test data to get real unclaimed batches, selected 2 SKUs
+  on the new admin screen, assigned to a packer — confirmed the exact expected order count, correctly
+  flagged the one order that also carried an unselected SKU, and confirmed the packer dashboard's own
+  "Upcoming" list reads from the identical live query (watched it correctly go to zero once the only
+  active test packer's own polling swept up everything else too — expected with a single packer, not
+  a bug).
+
 ## Next steps — a prioritized plan
 
 Rewritten 2026-09-20 (twenty-one passes across two days — see "Recently done" entries above for the
