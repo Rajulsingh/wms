@@ -30,6 +30,7 @@ interface AmazonEnv {
   AMAZON_REFRESH_TOKEN: string;
   AMAZON_MARKETPLACE_ID: string;
   AMAZON_SPAPI_SANDBOX?: string;
+  AMAZON_MERCHANT_ID?: string;
 }
 
 function getEnv(): AmazonEnv {
@@ -40,7 +41,9 @@ function getEnv(): AmazonEnv {
     'AMAZON_MARKETPLACE_ID'
   ];
   for (const key of required) {
-    if (!workerEnv[key]) throw new Error(`Missing ${key} — set it in .dev.vars locally or via "wrangler secret put" in production.`);
+    if (!(workerEnv as unknown as Record<string, string | undefined>)[key]) {
+      throw new Error(`Missing ${key} — set it in .dev.vars locally or via "wrangler secret put" in production.`);
+    }
   }
   return workerEnv as unknown as AmazonEnv;
 }
@@ -254,6 +257,82 @@ export async function fetchCatalogItemDetails(asin: string): Promise<CatalogItem
   const mainImage = imageSet?.images?.find((i) => i.variant === 'MAIN') ?? imageSet?.images?.[0];
 
   return { title: summary?.itemName ?? null, imageUrl: mainImage?.link ?? null };
+}
+
+export interface ListingSummary {
+  sku: string;
+  asin: string | null;
+  title: string | null;
+  imageUrl: string | null;
+}
+
+/**
+ * Pulls every active listing for this seller from the Listings Items API
+ * (2021-08-01, `GET /listings/2021-08-01/items/{sellerId}`), confirmed
+ * against Amazon's published request/response schema
+ * (selling-partner-api-models/models/listings-items-api-model). Used to
+ * sync the full Amazon catalog into local SKUs so Receiving's product
+ * search covers everything the seller sells, not just SKUs that happened
+ * to arrive via an order (see catalog-sync.ts). Unlike Catalog Items'
+ * `keywords` search — which searches the *entire* Amazon catalog, not this
+ * seller's own inventory, and has no fuzzy-name mode — this endpoint is
+ * genuinely scoped to the seller (`sellerId`/`AMAZON_MERCHANT_ID` is a path
+ * parameter here, not an optional filter), which is what makes it the
+ * right tool for this. Capped at 1000 items / 50 pages of 20, matching
+ * Amazon's own stated ceiling for this endpoint's pagination.
+ */
+export async function fetchAllListings(): Promise<ListingSummary[]> {
+  const env = getEnv();
+  const sellerId = env.AMAZON_MERCHANT_ID;
+  if (!sellerId) {
+    throw new Error('AMAZON_MERCHANT_ID is not set — required as the sellerId path parameter for the Listings Items API.');
+  }
+  const accessToken = await getAccessToken(env);
+
+  const results: ListingSummary[] = [];
+  let pageToken: string | undefined;
+  let pages = 0;
+  do {
+    const url = new URL(`${baseUrl(env)}/listings/2021-08-01/items/${sellerId}`);
+    url.searchParams.set('marketplaceIds', env.AMAZON_MARKETPLACE_ID);
+    url.searchParams.set('includedData', 'summaries');
+    url.searchParams.set('pageSize', '20');
+    if (pageToken) url.searchParams.set('pageToken', pageToken);
+
+    const res = await fetch(url, { headers: { 'x-amz-access-token': accessToken } });
+    if (!res.ok) {
+      // A 403 here most likely means the SP-API app doesn't have the Listings
+      // Items role granted in Seller Central yet — the same situation Easy
+      // Ship was in before its role was granted (see HANDOFF.md). Surface the
+      // real status/body rather than a generic failure so that's diagnosable.
+      throw new Error(`Amazon Listings Items fetch failed: ${res.status} ${await res.text()}`);
+    }
+    const data = (await res.json()) as {
+      items?: Array<{
+        sku: string;
+        summaries?: Array<{ marketplaceId?: string; asin?: string; itemName?: string; mainImage?: { link?: string } }>;
+      }>;
+      pagination?: { nextToken?: string };
+    };
+
+    for (const item of data.items ?? []) {
+      // mainImage lives nested inside each per-marketplace summary entry, not
+      // as a top-level field on the item — confirmed against a real response
+      // (the published JSON schema doesn't make this placement obvious).
+      const summary = item.summaries?.find((s) => s.marketplaceId === env.AMAZON_MARKETPLACE_ID) ?? item.summaries?.[0];
+      results.push({
+        sku: item.sku,
+        asin: summary?.asin ?? null,
+        title: summary?.itemName ?? null,
+        imageUrl: summary?.mainImage?.link ?? null
+      });
+    }
+
+    pageToken = data.pagination?.nextToken;
+    pages++;
+  } while (pageToken && pages < 50);
+
+  return results;
 }
 
 /**

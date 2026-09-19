@@ -5,6 +5,13 @@ import AdminShell from '../../components/AdminShell.astro';
 <AdminShell title="Receiving" current="inbound">
   <div style="max-width: 640px; display: flex; flex-direction: column; gap: 18px;">
     <div class="card stack">
+      <h2>Product catalog</h2>
+      <p>The product search below only knows about SKUs that already exist locally — normally that's every SKU an Amazon order has referenced, plus anything entered manually. If a product you sell on Amazon isn't showing up yet, sync your full Amazon listings catalog in.</p>
+      <button class="btn" id="sync-catalog-btn" style="width: auto;">Sync Amazon catalog</button>
+      <div id="sync-result" class="banner" style="display:none;"></div>
+    </div>
+
+    <div class="card stack">
       <h2>Receive stock</h2>
       <p>Record what came in and where it was put away. Existing SKUs get more stock; a new SKU code creates it.</p>
 
@@ -201,6 +208,27 @@ import AdminShell from '../../components/AdminShell.astro';
             .join('')
         : '<p>No receipts yet.</p>';
     }
+
+    document.getElementById('sync-catalog-btn')?.addEventListener('click', async () => {
+      const btn = document.getElementById('sync-catalog-btn') as HTMLButtonElement;
+      const resultEl = document.getElementById('sync-result')!;
+      btn.disabled = true;
+      btn.textContent = 'Syncing…';
+      try {
+        const result = await api('/api/admin/sync-amazon-catalog', {});
+        resultEl.className = 'banner banner-success';
+        resultEl.textContent = `Synced ${result.total} listings from Amazon (${result.created} new, ${result.updated} updated).`;
+        resultEl.style.display = 'block';
+        await loadReceipts(); // refreshes the local `skus` array the product search below reads from
+      } catch (err) {
+        resultEl.className = 'banner banner-danger';
+        resultEl.textContent = (err as Error).message;
+        resultEl.style.display = 'block';
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Sync Amazon catalog';
+      }
+    });
 
     document.getElementById('add-line')?.addEventListener('click', addLine);
 

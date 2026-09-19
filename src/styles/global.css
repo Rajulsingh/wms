@@ -299,7 +299,8 @@ p {
 .item-row {
   display: flex;
   align-items: center;
-  gap: 12px;
+  flex-wrap: wrap;
+  gap: 8px 12px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--surface);
@@ -942,9 +943,13 @@ tbody tr:hover {
 }
 
 .stepper-step-line {
+  /* Spans from the previous step's center to this step's own center — not
+     forward past this step's right edge, which used to overshoot the last
+     step by 50% of its own width (harmless on a wide desktop card, but the
+     actual cause of horizontal page overflow on narrow phones). */
   position: absolute;
   top: 15px;
-  left: 50%;
+  left: -50%;
   width: 100%;
   height: 2px;
   background: var(--border-strong);
@@ -1041,4 +1046,37 @@ tbody tr:hover {
   letter-spacing: 0.02em;
   color: var(--muted);
   font-variant-numeric: tabular-nums;
+}
+
+/* Narrow phones: .stepper-step's desktop min-width (140px × 3 steps = 420px)
+   overflows a ~375px viewport — this is the concrete bug behind "not mobile
+   optimized" (confirmed via document.documentElement.scrollWidth). Let the
+   three steps share the available width instead of forcing a fixed minimum,
+   and trim padding/sizes generally so admin pages fit without horizontal
+   scroll. Desktop keeps the compact, centered look (untouched above). */
+@media (max-width: 600px) {
+  .admin-main {
+    padding: 18px 16px 32px;
+  }
+
+  .admin-topbar {
+    padding: 14px 54px 14px 16px;
+  }
+
+  .stepper-step {
+    min-width: 0;
+    flex: 1 1 0;
+  }
+
+  .stepper-step-label {
+    font-size: 0.78rem;
+  }
+
+  .stepper-step-meta {
+    font-size: 0.66rem;
+  }
+
+  .barcode-wrap svg {
+    max-width: 150px;
+  }
 }

@@ -12,10 +12,10 @@ seller. Astro (frontend + API routes) on Cloudflare Workers, D1 (SQLite) for dat
 live, actively used against real orders.
 
 **Live app:** https://wms.mailrajulsingh-in.workers.dev
-**Repo:** this directory (`wms/`) is **not a git repository** — `git status` fails with "not a
-git repository." There is no version control on this project. Worth offering the user a
-`git init` + first commit before making further changes; right now every edit is only as safe as
-the filesystem.
+**Repo:** `wms/` is now a git repository (`git init` done 2026-09-19, first commit `6cda9d0` on
+`main`) — before that date there was no version control at all, so if you're looking at history
+from before this commit, it never existed as tracked history; everything before it is only as
+safe as the filesystem was.
 **Cloudflare account:** Mailrajulsingh.in@gmail.com's Account (`4b311214e2fe3391a39f9f315aa10382`)
 **D1 database:** `wms-db` (`d71d4717-e454-4fb6-ad12-34811583b577`)
 **Demo logins:** admin / `1234`, packer / `1111` (seeded in `scripts/seed.sql`, local dev only)
@@ -41,10 +41,46 @@ full detail on each.
    new component names. **Not done, follow-up if asked**: reusing the new `.stepper-bar` on the
    `ship`/`bulk-ship` wizard flows (they still use their original sequential-render pattern,
    just re-shelled into the new sidebar layout) — flagged as a nice-to-have in the original plan,
-   not required to hit the requested look. Also: **this project still has no git repo** — now
-   that a large multi-file change has landed with no version control under it, `git init` +
-   first commit is worth doing before any further edits.
-2. **Get the Amazon Easy Ship SP-API role granted.** This is the one thing blocking real use of
+   not required to hit the requested look.
+2. ~~**Admin mobile layout was actually overflowing horizontally**~~ — **fixed** (2026-09-19,
+   same day as the redesign above). The user reported "it's not mobile optimized"; verified via
+   `document.documentElement.scrollWidth` at 375px on every admin page, not by eyeballing
+   screenshots. Two real bugs, not vibes: (a) `.stepper-step-line` was positioned `left:50%;
+   width:100%`, which overshoots the *last* step by 50% of its own width — harmless on a wide
+   desktop card (absorbed by whitespace) but the actual cause of page-level horizontal overflow
+   on a phone; fixed by flipping to `left:-50%` so the line correctly spans from the *previous*
+   step's center instead of overshooting past its own. (b) `.item-row` (used by
+   users/warehouse/settings/bulk-ship/inbound) had no `flex-wrap`, so a name + 2 status pills +
+   an action button would push content off-screen instead of wrapping — added `flex-wrap: wrap`.
+   Also added a `@media (max-width: 600px)` block tightening `.admin-main`/`.admin-topbar`
+   padding. All 10 admin pages now confirmed `scrollWidth === clientWidth` at 375px. If a future
+   mobile complaint comes in, **verify with `document.documentElement.scrollWidth` first** —
+   don't just eyeball a screenshot, the overflow direction bug here wasn't visually obvious on
+   desktop at all.
+3. ~~**Receiving's product search only knew about SKUs that had already been received**~~ —
+   **fixed** (2026-09-19). The user pointed out it should "match Amazon inventory," searchable by
+   ASIN/SKU/name. Investigated Amazon's actual capabilities before building anything (verified
+   against Amazon's own published JSON schemas, not guessed — see the comments in `amazon.ts`):
+   the Catalog Items API's `keywords` search covers the *entire* Amazon catalog, not this
+   seller's own inventory, and its `identifiers`/`identifiersType` mode only does exact lookups,
+   not fuzzy search — neither fits a live type-ahead box scoped to "what this seller sells."
+   Built instead as a **sync**, not a live search: `fetchAllListings()` in `amazon.ts` pulls the
+   seller's full catalog from the Listings Items API (`GET /listings/2021-08-01/items/{sellerId}`,
+   paginated, capped at 1000 items), `syncAmazonCatalog()` in `catalog-sync.ts` upserts it into
+   the local `skus` table (refreshes name/image_url only — never touches admin-owned `price`/
+   `reorder_point`), exposed via `POST /api/admin/sync-amazon-catalog` and a "Sync Amazon
+   catalog" button on `/admin/inbound`. The *existing* instant local product search then covers
+   everything synced — no new search UI needed. **Confirmed working live against the real
+   account**: synced 227 real listings on the first run, images and titles render correctly in
+   Receiving's search. One real gotcha hit and fixed along the way: the Listings API's
+   `mainImage` field is nested inside each `summaries[]` entry, not a top-level field on the item
+   — the published schema doesn't make this obvious; confirmed by logging one raw response
+   before trusting it. **Not done yet**: this is a manual "Sync Amazon catalog" button, not an
+   automatic periodic sync (deliberately — wanted to confirm the Listings Items SP-API role was
+   actually granted against the live account before adding a new recurring cron job; it is
+   granted, so wiring this into the existing 5-minute `sync-job.ts` cron alongside order sync is
+   a reasonable low-risk follow-up if the user wants listings to stay fresh automatically).
+4. **Get the Amazon Easy Ship SP-API role granted.** This is the one thing blocking real use of
    shipping (single-order, bulk, everything). It's on the user, not something to keep
    investigating from this end — check Seller Central's app-authorization page for an "Easy Ship"
    scope. Once granted, the very first thing to do is a live smoke test of `/admin/ship` on one
@@ -52,33 +88,34 @@ full detail on each.
    combined PDF is actually the label (currently assumes last), and whether the
    `DocumentReportReferenceID` regex parse in `checkEasyShipFeed` actually matches Amazon's real
    feed-processing-report format. None of that has ever been exercised against a live account.
-3. **Real box sizes.** Only one demo box exists. Needs the user to enter their actual box
+5. **Real box sizes.** Only one demo box exists. Needs the user to enter their actual box
    dimensions in the "Manage" menu → Zones/racks/stations, or wherever box sizes ended up (check
    `/admin/settings`).
-4. **Confirm the ship-from address is real**, not the placeholder used during testing — check
+6. **Confirm the ship-from address is real**, not the placeholder used during testing — check
    `/admin/settings` before the first real label purchase.
-5. **Decide the 30-day data-disposal scope** (see open item, below) — this was *committed to
+7. **Decide the 30-day data-disposal scope** (see open item, below) — this was *committed to
    Amazon in writing* with no enforcement code yet. Needs three scoping answers from the user
    before it can be built safely; the cron infrastructure already exists (`src/worker.ts`) so the
    actual job is easy to add once those answers exist — it can piggyback on the same scheduled
    handler pattern as the Amazon sync, doesn't need new plumbing.
-6. **Smaller, ask-before-building items**: individually-strengthened admin auth (currently same
+8. **Smaller, ask-before-building items**: individually-strengthened admin auth (currently same
    weak PIN as floor workers), a public privacy policy URL for ecomglider.com, whether the
    picker/packer "no mandatory scanning" philosophy needs any adjustment now that pickup-slot
-   labels exist, and what should happen when an Amazon cancellation lands on an order that's
-   already been fully picked/packed (currently just flagged via an exception event for manual
-   putback — see "Automatic Amazon sync" below). None of these are urgent; don't build them
-   unprompted.
-7. **Minor cleanup, low priority**: `src/pages/api/picker/scan-item.ts` (and `verifyItemScan` in
+   labels exist, what should happen when an Amazon cancellation lands on an order that's already
+   been fully picked/packed (currently just flagged via an exception event for manual putback —
+   see "Automatic Amazon sync" below), and whether the Amazon catalog sync (item 3 above) should
+   become automatic (periodic cron) rather than a manual button. None of these are urgent; don't
+   build them unprompted.
+9. **Minor cleanup, low priority**: `src/pages/api/picker/scan-item.ts` (and `verifyItemScan` in
    `picker.ts`) is dead code from before the picker dropped mandatory scanning — nothing calls
    it. Safe to delete next time you're in that area, not worth a dedicated pass on its own.
    `Warehouse` type in `types.ts` is missing the `ship_from_*` columns (cosmetic, nothing
    breaks).
-8. **If the user says the UI still looks off somewhere else**, the fix pattern is already
-   established (see "Design system" below) — the admin orders table was converted from a
-   wrapping `<table>` to `.order-card` rows; `/admin/inventory` and `/admin/ship`'s own tables
-   use the same old wrapping-table pattern and would benefit from the identical treatment if
-   flagged.
+10. **If the user says the UI still looks off somewhere else**, the fix pattern is already
+    established (see "Design system" below) — reuse `AdminShell`/the existing component classes
+    rather than inventing new ones. If it's specifically a *mobile* complaint, verify with
+    `document.documentElement.scrollWidth` at 375px before guessing at a fix (see item 2 above —
+    the real bug there wasn't visually obvious on desktop at all).
 
 Already done this session, not repeated here — see "What's built" for detail: the Cloudflare
 Cron Trigger (confirmed firing in production, real orders synced to `shipped`), automatic order
@@ -275,7 +312,13 @@ shell below targets desktop admin use and doesn't follow it.
 - **Inbound receiving** (`/admin/inbound`, `inbound.ts`) — type-ahead product search (title or
   SKU code, results show photo + name + code + price) with a "can't find it, create new SKU"
   fallback. Puts stock directly into a bin, creating the SKU×location `inventory` row if it
-  doesn't exist yet (`INSERT ... ON CONFLICT DO UPDATE`).
+  doesn't exist yet (`INSERT ... ON CONFLICT DO UPDATE`). A "Sync Amazon catalog" button
+  (`POST /api/admin/sync-amazon-catalog`, `catalog-sync.ts`, `fetchAllListings` in `amazon.ts`)
+  pulls the seller's full Amazon listings catalog (Listings Items API, paginated, capped at 1000)
+  and upserts every SellerSKU into local `skus` — this is what makes the search above cover
+  everything the seller sells, not just SKUs an order has referenced. Manual trigger, not an
+  automatic cron yet (see "Next steps" #8). Refreshes name/image_url only; never touches the
+  admin-owned `price`/`reorder_point` fields.
 - **Inventory management** (`/admin/inventory`) — every SKU×location row with on-hand/reserved,
   editable on-hand (a direct correction, not a reservation-flow operation — for miscounts/damage
   write-offs, every edit audit-logged with before/after) and editable price.
@@ -437,7 +480,8 @@ echo "value" | npx wrangler secret put SECRET_NAME
 ## Secrets (values live in `.dev.vars`, gitignored — never in this file, never in chat)
 
 `AMAZON_LWA_CLIENT_ID`, `AMAZON_LWA_CLIENT_SECRET`, `AMAZON_REFRESH_TOKEN`,
-`AMAZON_MARKETPLACE_ID`, `AMAZON_SPAPI_SANDBOX`, `AMAZON_MERCHANT_ID` (not yet consumed by any
-code path), `SESSION_SECRET`. All mirrored as Worker secrets in production via
+`AMAZON_MARKETPLACE_ID`, `AMAZON_SPAPI_SANDBOX`, `AMAZON_MERCHANT_ID` (used as the `sellerId`
+path parameter for the Listings Items API catalog sync, added 2026-09-19 — see `fetchAllListings`
+in `amazon.ts`), `SESSION_SECRET`. All mirrored as Worker secrets in production via
 `wrangler secret put` — if you rotate one locally, push it to production too, they don't sync
 automatically.
