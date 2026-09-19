@@ -20,124 +20,72 @@ safe as the filesystem was.
 **D1 database:** `wms-db` (`d71d4717-e454-4fb6-ad12-34811583b577`)
 **Demo logins:** admin / `1234`, packer / `1111` (seeded in `scripts/seed.sql`, local dev only)
 
+## Recently done (2026-09-19) — full detail lives elsewhere, not repeated here
+
+One long session. Each line is a pointer, not the story — see "What's built", "Design system",
+or "Known bugs fixed / lessons" for the actual detail, including the real bugs found along the
+way (a batch-completion check missing from `reportDamaged`; a blank order id on packing's
+apply-labels screen). Don't re-litigate or redo any of these without a reason.
+
+- **Admin UI rebuilt around Seller Flex screenshots** — sidebar shell (`AdminShell`/
+  `AdminSidebar`), KPI stat cards, a real order-table with thumbnails, a pick-list stepper +
+  scannable barcode. `/admin/*` only; `/picker`/`/packer`/`/login` untouched. See "Design system".
+- **Admin was overflowing horizontally on phones** — two real CSS bugs, fixed (a stepper-line
+  math error, missing `flex-wrap` on `.item-row`). See "Next steps" #7 for how to verify a future
+  mobile complaint the same way (`scrollWidth`, not eyeballing).
+- **Receiving's search now covers everything sold on Amazon**, not just SKUs an order has
+  referenced — built as a manual "Sync Amazon catalog" sync (Listings Items API), not a live
+  search (Amazon's catalog search isn't seller-scoped). See "What's built" → Inbound receiving.
+- **Pick batches no longer fragment into single-order lists** — batching moved from eager
+  (on every order arrival) to claim-time (`claimNextBatch`). See "What's built" → Claim-time
+  pick-batch creation.
+- **Picking is bulk/SKU-grouped**, not one card per order. See "What's built" → the picking entry.
+- **Packing is bulk/multi-order per batch** (part 1 of a 3-part ask — parts 2/3 still open, see
+  "Open items" #14). See "What's built" → the packing entry.
+
 ## Next steps — a prioritized plan
 
-Ordered by what's actually blocking vs. what's just not-yet-built. See "Open items" below for
+What's actually not done yet, ordered by what's blocking vs. not. See "Open items" below for
 full detail on each.
 
-1. ~~**UI simplification**~~ — **done** (2026-09-19). The user shared Amazon Seller Flex
-   screenshots (dashboard, pick-list detail with a stepper, product-thumbnail table) and the
-   entire `/admin/*` section was rebuilt around them: a persistent dark sidebar
-   (`AdminSidebar.astro`) + content top bar (`AdminShell.astro`) replaced the old hamburger-
-   dropdown/`.screen` shell; the dashboard order list became a real table with thumbnails and a
-   KPI stat-card row; the Pick List page got a batch-lifecycle stepper (Create → Picking →
-   Picked — deliberately *not* a literal Create/Pack/Ship, since packing/shipping happen per
-   order/shipment in this schema, not per batch), a real scannable Code128 barcode
-   (`jsbarcode`, client-side only) encoding the batch ID, and a scan-to-open control reusing
-   `scanOnce()` from `scanner-client.ts`. `AdminNav.astro` was deleted (fully superseded).
-   **Scope was `/admin/*` only** — `/picker`, `/packer`, `/login` and `TopBar.astro` were
-   deliberately left untouched (verified in-browser); that mobile tap-first floor UI is a
-   separate, already-settled decision, not part of this pass. See "Design system" below for the
-   new component names. **Not done, follow-up if asked**: reusing the new `.stepper-bar` on the
-   `ship`/`bulk-ship` wizard flows (they still use their original sequential-render pattern,
-   just re-shelled into the new sidebar layout) — flagged as a nice-to-have in the original plan,
-   not required to hit the requested look.
-2. ~~**Admin mobile layout was actually overflowing horizontally**~~ — **fixed** (2026-09-19,
-   same day as the redesign above). The user reported "it's not mobile optimized"; verified via
-   `document.documentElement.scrollWidth` at 375px on every admin page, not by eyeballing
-   screenshots. Two real bugs, not vibes: (a) `.stepper-step-line` was positioned `left:50%;
-   width:100%`, which overshoots the *last* step by 50% of its own width — harmless on a wide
-   desktop card (absorbed by whitespace) but the actual cause of page-level horizontal overflow
-   on a phone; fixed by flipping to `left:-50%` so the line correctly spans from the *previous*
-   step's center instead of overshooting past its own. (b) `.item-row` (used by
-   users/warehouse/settings/bulk-ship/inbound) had no `flex-wrap`, so a name + 2 status pills +
-   an action button would push content off-screen instead of wrapping — added `flex-wrap: wrap`.
-   Also added a `@media (max-width: 600px)` block tightening `.admin-main`/`.admin-topbar`
-   padding. All 10 admin pages now confirmed `scrollWidth === clientWidth` at 375px. If a future
-   mobile complaint comes in, **verify with `document.documentElement.scrollWidth` first** —
-   don't just eyeball a screenshot, the overflow direction bug here wasn't visually obvious on
-   desktop at all.
-3. ~~**Receiving's product search only knew about SKUs that had already been received**~~ —
-   **fixed** (2026-09-19). The user pointed out it should "match Amazon inventory," searchable by
-   ASIN/SKU/name. Investigated Amazon's actual capabilities before building anything (verified
-   against Amazon's own published JSON schemas, not guessed — see the comments in `amazon.ts`):
-   the Catalog Items API's `keywords` search covers the *entire* Amazon catalog, not this
-   seller's own inventory, and its `identifiers`/`identifiersType` mode only does exact lookups,
-   not fuzzy search — neither fits a live type-ahead box scoped to "what this seller sells."
-   Built instead as a **sync**, not a live search: `fetchAllListings()` in `amazon.ts` pulls the
-   seller's full catalog from the Listings Items API (`GET /listings/2021-08-01/items/{sellerId}`,
-   paginated, capped at 1000 items), `syncAmazonCatalog()` in `catalog-sync.ts` upserts it into
-   the local `skus` table (refreshes name/image_url only — never touches admin-owned `price`/
-   `reorder_point`), exposed via `POST /api/admin/sync-amazon-catalog` and a "Sync Amazon
-   catalog" button on `/admin/inbound`. The *existing* instant local product search then covers
-   everything synced — no new search UI needed. **Confirmed working live against the real
-   account**: synced 227 real listings on the first run, images and titles render correctly in
-   Receiving's search. One real gotcha hit and fixed along the way: the Listings API's
-   `mainImage` field is nested inside each `summaries[]` entry, not a top-level field on the item
-   — the published schema doesn't make this obvious; confirmed by logging one raw response
-   before trusting it. **Not done yet**: this is a manual "Sync Amazon catalog" button, not an
-   automatic periodic sync (deliberately — wanted to confirm the Listings Items SP-API role was
-   actually granted against the live account before adding a new recurring cron job; it is
-   granted, so wiring this into the existing 5-minute `sync-job.ts` cron alongside order sync is
-   a reasonable low-risk follow-up if the user wants listings to stay fresh automatically).
-4. ~~**Pick batches were fragmenting into many single-order lists**~~ — **fixed** (2026-09-19).
-   Removed eager auto-batching-on-arrival; batching now happens at claim time (`claimNextBatch`
-   in `picker.ts`), sweeping every currently-open order into one batch the moment a picker's
-   ready for it, capped at the cart's real `slot_count`. See "What's built" → "Claim-time
-   pick-batch creation" for the full writeup, including a known low-risk race-condition
-   limitation that was inherited, not introduced.
-5. ~~**Picking was one card per order; user wanted bulk-by-SKU**~~ — **fixed** (2026-09-19).
-   Picker now sees one aggregate line per SKU per bin across every order needing it, one "Mark
-   done" tap. See "What's built" → the picking entry for the full writeup, including a real
-   pre-existing batch-completion bug this work found and fixed. **Packing got the same treatment,
-   part 1 of 3** (2026-09-19, same conversation) — multi-order batch packing is done (see "What's
-   built" → the packing entry), including a second real bug found/fixed there too (an order whose
-   items were all short/damaged showed a blank order id on the apply-labels screen). **Parts 2 and
-   3 are still open** — see "Open items" #14 (bulk label content — blocked on the Easy Ship role;
-   direct thermal-printer printing via QZ Tray — needs the printer model and current QZ licensing
-   confirmed first). Don't start on either without re-reading that item; the physical floor
-   workflow it documents is the actual spec.
-6. **Get the Amazon Easy Ship SP-API role granted.** This is the one thing blocking real use of
-   shipping (single-order, bulk, everything) *and* packing's bulk-label piece above. It's on the
-   user, not something to keep investigating from this end — check Seller Central's
-   app-authorization page for an "Easy Ship" scope. Once granted, the very first thing to do is a
-   live smoke test of `/admin/ship` on one real order, watching closely for: the real
-   `labelFileType` Amazon returns, which page of the combined PDF is actually the label
+1. **Get the Amazon Easy Ship SP-API role granted.** This is the one thing blocking real use of
+   shipping (single-order, bulk, everything) *and* packing's bulk-label piece (part 2 of 3, see
+   "Open items" #14). It's on the user, not something to keep investigating from this end — check
+   Seller Central's app-authorization page for an "Easy Ship" scope. Once granted, the very first
+   thing to do is a live smoke test of `/admin/ship` on one real order, watching closely for: the
+   real `labelFileType` Amazon returns, which page of the combined PDF is actually the label
    (currently assumes last), and whether the `DocumentReportReferenceID` regex parse in
    `checkEasyShipFeed` actually matches Amazon's real feed-processing-report format. None of that
    has ever been exercised against a live account.
-7. **Real box sizes.** Only one demo box exists. Needs the user to enter their actual box
+2. **Real box sizes.** Only one demo box exists. Needs the user to enter their actual box
    dimensions in the "Manage" menu → Zones/racks/stations, or wherever box sizes ended up (check
    `/admin/settings`).
-8. **Confirm the ship-from address is real**, not the placeholder used during testing — check
+3. **Confirm the ship-from address is real**, not the placeholder used during testing — check
    `/admin/settings` before the first real label purchase.
-9. **Decide the 30-day data-disposal scope** (see open item, below) — this was *committed to
+4. **Decide the 30-day data-disposal scope** (see open item, below) — this was *committed to
    Amazon in writing* with no enforcement code yet. Needs three scoping answers from the user
    before it can be built safely; the cron infrastructure already exists (`src/worker.ts`) so the
    actual job is easy to add once those answers exist — it can piggyback on the same scheduled
    handler pattern as the Amazon sync, doesn't need new plumbing.
-10. **Smaller, ask-before-building items**: individually-strengthened admin auth (currently same
-    weak PIN as floor workers), a public privacy policy URL for ecomglider.com, whether the
-    picker/packer "no mandatory scanning" philosophy needs any adjustment now that pickup-slot
-    labels exist, what should happen when an Amazon cancellation lands on an order that's already
-    been fully picked/packed (currently just flagged via an exception event for manual putback —
-    see "Automatic Amazon sync" below), and whether the Amazon catalog sync (item 3 above) should
-    become automatic (periodic cron) rather than a manual button. None of these are urgent; don't
-    build them unprompted.
-11. **Minor cleanup, low priority**: `src/pages/api/picker/scan-item.ts` (and `verifyItemScan` in
-    `picker.ts`) is dead code from before the picker dropped mandatory scanning — nothing calls
-    it. Safe to delete next time you're in that area, not worth a dedicated pass on its own.
-    `Warehouse` type in `types.ts` is missing the `ship_from_*` columns (cosmetic, nothing
-    breaks).
-12. **If the user says the UI still looks off somewhere else**, the fix pattern is already
-    established (see "Design system" below) — reuse `AdminShell`/the existing component classes
-    rather than inventing new ones. If it's specifically a *mobile* complaint, verify with
-    `document.documentElement.scrollWidth` at 375px before guessing at a fix (see item 2 above —
-    the real bug there wasn't visually obvious on desktop at all).
-
-Already done this session, not repeated here — see "What's built" for detail: the Cloudflare
-Cron Trigger (confirmed firing in production, real orders synced to `shipped`), automatic order
-fetching, and the order-status filter tabs on `/admin`.
+5. **Smaller, ask-before-building items**: individually-strengthened admin auth (currently same
+   weak PIN as floor workers), a public privacy policy URL for ecomglider.com, whether the
+   picker/packer "no mandatory scanning" philosophy needs any adjustment now that pickup-slot
+   labels exist, what should happen when an Amazon cancellation lands on an order that's already
+   been fully picked/packed (currently just flagged via an exception event for manual putback —
+   see "Automatic Amazon sync" below), whether the Amazon catalog sync should become automatic
+   (periodic cron) rather than a manual button, and a per-order notes/special-instructions field
+   for packing (see "Open items" #14, part 1's "not included"). None of these are urgent; don't
+   build them unprompted.
+6. **Minor cleanup, low priority**: `src/pages/api/picker/scan-item.ts` (and `verifyItemScan` in
+   `picker.ts`) is dead code from before the picker dropped mandatory scanning — nothing calls
+   it. Safe to delete next time you're in that area, not worth a dedicated pass on its own.
+   `Warehouse` type in `types.ts` is missing the `ship_from_*` columns (cosmetic, nothing
+   breaks).
+7. **If the user says the UI still looks off somewhere else**, the fix pattern is already
+   established (see "Design system" below) — reuse `AdminShell`/the existing component classes
+   rather than inventing new ones. If it's specifically a *mobile* complaint, verify with
+   `document.documentElement.scrollWidth` at 375px before guessing at a fix — a past bug here
+   wasn't visually obvious on desktop at all, don't just eyeball a screenshot.
 
 ## Read this before touching anything
 
@@ -183,7 +131,7 @@ fetching, and the order-status filter tabs on `/admin`.
   seeing both `fetch` and the custom `scheduled` handler correctly bundled together. If a future
   Astro/adapter major version changes this integration, re-verify by checking that same built
   file rather than assuming the pattern still holds.
-- **D1** for all relational data (`migrations/0001`–`0009`, applied in order — `--local` and
+- **D1** for all relational data (`migrations/0001`–`0010`, applied in order — `--local` and
   `--remote` are separate databases, apply both whenever you add one; local dev DB lives under
   `.wrangler/state`).
 - **PIN-based session auth**, stateless signed cookies (HMAC), `src/lib/auth.ts`. No password
@@ -222,6 +170,8 @@ Notable ones:
   `handover_slot_id/start/end/method`, `scheduled_package_id`, `label_status`, `label_feed_id`,
   `label_report_id`) plus `skus.price` (admin-set list/MRP price).
 - `0009` — `skus.reorder_point` for low-stock alerts.
+- `0010` — `pack_sessions.pick_batch_id`, so a pack session can cover a whole batch of orders
+  instead of exactly one (see "What's built" → the packing entry).
 
 ## Design system
 
@@ -261,17 +211,16 @@ shell below targets desktop admin use and doesn't follow it.
   < `--radius` (12px, cards) < `--radius-lg` (16px, the auth card).
 - **Status pills**: `.status-pill` + `.status-neutral/-progress/-success/-warning`, small colored
   dot + text, used for order/pick-task status everywhere.
-- **Navigation**: `src/components/AdminNav.astro` — a hamburger icon (`<details>/<summary>`,
-  no JS needed) opening a dropdown with every admin page, current page highlighted. Used on all
-  admin pages via `<AdminNav current="..." />` in `TopBar`'s slot. This replaced an earlier
-  pattern of hand-written `<a class="pill">` links that multiplied per page and wrapped onto a
-  second line once there were enough admin pages — if you're adding a new admin page, add it to
-  `AdminNav`'s link list, don't hand-roll a nav pill.
-- **Tables vs. cards**: data tables (`<table>` + `.table-scroll` for horizontal overflow) are
-  fine for admin screens meant to be scanned/scrolled (inventory, pick-list). The admin orders
-  list specifically uses `.order-card` rows instead — a table there forced horizontal scroll and
-  mid-word wrapping on real (long) Amazon product titles. If another screen gets flagged as
-  "looks cheap" for the same reason, reuse `.order-card`, don't invent a new pattern.
+- **Tables vs. cards**: data tables (`<table>` + `.table-scroll` for horizontal overflow, plus
+  `.table-thumb` for a product photo in a cell) are the default for admin screens (inventory,
+  pick-list, and — since the sidebar redesign gave the content area real width — the dashboard
+  order list too). The old `.order-card` pattern (avoiding tables because they wrapped/scrolled
+  on long Amazon titles in the pre-sidebar ~720px column) is gone; the fix that actually solved
+  that, now that there's room, is `.truncate-cell` (ellipsis + a `title` attribute for the full
+  text on hover) on the product column, not avoiding `<table>` altogether. `.order-card-ship`
+  (just the ship-action link's color) is the one surviving class from that pattern — still used,
+  not dead code. If another screen wraps awkwardly, reach for `.truncate-cell` in a real table
+  first, not a card-based workaround.
 - `src/components/TopBar.astro` — brand mark + "ecomglider" wordmark + page section label, used
   on every screen including login (`.auth-shell`/`.auth-card`).
 
@@ -366,14 +315,6 @@ shell below targets desktop admin use and doesn't follow it.
   `checkBatchCompletion` helper and calling it from both `confirmQuantity` and `reportDamaged`.
   Verified live: reproduced the stuck-batch symptom with a real order, confirmed the fix resolves
   it (`pick_batches.status` → `completed`, `orders.status` → `picked`).
-  **Packing was deliberately left unchanged in this pass** — the user asked for the same
-  "sorted by SKU, bulk" treatment there too, but packing is structurally one-order-per-session
-  today (`startNextPackSession` pulls one order, one AWB/label per session) since each order needs
-  its own box and its own label regardless of how picking is grouped. Doing the equivalent there
-  for real (sorting a picked batch's SKUs across several simultaneously-open order boxes, only
-  seal/label each one once its own box is complete) is a materially bigger, higher-risk change —
-  it touches the AWB/label-application path, which HANDOFF already flags as sensitive/undertested
-  against a live account. Needs a scoping conversation before touching it, not a guess.
 - **Packing — bulk, multi-order per batch** (`/packer`, `packer.ts`; redesigned 2026-09-19, "Open
   items" #14 part 1 of 3). Station tap-in is unchanged. What changed: a pack "session" now covers
   a whole `pick_batch` instead of one order — `startPackingBatch` opens one `pack_sessions` row
@@ -423,7 +364,7 @@ shell below targets desktop admin use and doesn't follow it.
   pulls the seller's full Amazon listings catalog (Listings Items API, paginated, capped at 1000)
   and upserts every SellerSKU into local `skus` — this is what makes the search above cover
   everything the seller sells, not just SKUs an order has referenced. Manual trigger, not an
-  automatic cron yet (see "Next steps" #10). Refreshes name/image_url only; never touches the
+  automatic cron yet (see "Next steps" #5). Refreshes name/image_url only; never touches the
   admin-owned `price`/`reorder_point` fields.
 - **Inventory management** (`/admin/inventory`) — every SKU×location row with on-hand/reserved,
   editable on-hand (a direct correction, not a reservation-flow operation — for miscounts/damage
@@ -446,7 +387,7 @@ shell below targets desktop admin use and doesn't follow it.
 - **Shipping — Easy Ship** (`amazon.ts`, `shipping.ts`, `/admin/ship`, `/admin/bulk-ship`) —
   schemas confirmed against Amazon's published SP-API reference and (for the bulk endpoint) an
   actual Go SDK's generated types, not guessed. **Blocked on SP-API role grant, never exercised
-  live** — see "Next steps" above.
+  live** — see "Next steps" #1.
   - Single order: `listHandoverSlots` → admin picks a slot → `scheduleEasyShipPackage` (no label
     in the response) → separate async Feeds/Reports pipeline to actually retrieve the label PDF
     (`requestEasyShipDocuments`/`checkEasyShipFeed`/`checkEasyShipReport`, polled from the UI,
@@ -513,7 +454,7 @@ Roughly in the order they'll come up; "Next steps" above is the short prioritize
 this list.
 
 1. **Amazon Easy Ship SP-API role not yet granted** — blocks all shipping (single + bulk) *and*
-   packing's bulk-label piece (item 14 below). See "Next steps" #6.
+   packing's bulk-label piece (item 14 below). See "Next steps" #1.
 2. **Real box sizes** not yet entered (only one demo box exists).
 3. **Confirm ship-from address is the real one**, not a placeholder.
 4. **30-day data disposal — committed to Amazon in writing, not yet built.** Needs three scoping
