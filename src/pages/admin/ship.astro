@@ -13,6 +13,8 @@ if (redirectTo) return Astro.redirect(redirectTo);
   </div>
 
   <script>
+    import { confirmDangerousAction } from '../../lib/ui';
+
     interface BoxSize {
       id: string;
       name: string;
@@ -124,6 +126,11 @@ if (redirectTo) return Astro.redirect(redirectTo);
         document.getElementById('app')!.appendChild(btn);
       }
       btn.onclick = async () => {
+        const ok = await confirmDangerousAction({
+          title: 'Generate invoice & ship label',
+          message: 'Once the shipping label is generated, Amazon schedules a real pickup for this order and this cannot be cancelled from here.'
+        });
+        if (!ok) return;
         try {
           const result = await api('/api/admin/shipping/schedule', {
             orderId,

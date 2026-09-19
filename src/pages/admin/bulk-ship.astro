@@ -8,11 +8,13 @@ if (redirectTo) return Astro.redirect(redirectTo);
 ---
 
 <AdminShell title="Bulk ship" current="bulk-ship">
-  <div id="app" class="stack" style="max-width: 700px;">
+  <div id="app" class="stack" style="max-width: 760px;">
     <p>Loading…</p>
   </div>
 
   <script>
+    import { escapeHtml, confirmDangerousAction } from '../../lib/ui';
+
     interface OrderRow {
       id: string;
       external_order_id: string;
@@ -34,11 +36,22 @@ if (redirectTo) return Astro.redirect(redirectTo);
       endTime: string;
       handoverMethod: 'PICKUP' | 'DROPOFF';
     }
+    // Per-order line settings — mirrors Amazon's own Seller Flex pack screen,
+    // where box selection is a property of each order row (with a bulk
+    // "Update Box" action to set it across a selection), not one size forced
+    // onto everything in the batch. See HANDOFF.md.
+    interface LineState {
+      selected: boolean;
+      boxSizeId: string;
+      weightGrams: string;
+      packageIdentifier: string;
+    }
 
     const app = document.getElementById('app')!;
     let warehouseId = '';
     let boxSizes: BoxSize[] = [];
     let shippableOrders: OrderRow[] = [];
+    let lines = new Map<string, LineState>();
     let selectedSlot: HandoverSlot | null = null;
 
     async function api(path: string, body?: unknown) {
@@ -60,64 +73,114 @@ if (redirectTo) return Astro.redirect(redirectTo);
       return { day, time };
     }
 
+    function selectedOrderIds(): string[] {
+      return shippableOrders.filter((o) => lines.get(o.id)?.selected).map((o) => o.id);
+    }
+
+    function boxOptionsHtml(currentId: string): string {
+      return boxSizes.map((b) => `<option value="${b.id}" ${b.id === currentId ? 'selected' : ''}>${escapeHtml(b.name)} (${b.length}×${b.width}×${b.height} ${b.dimension_unit})</option>`).join('');
+    }
+
     function renderPicker(error?: string) {
       app.innerHTML = `
-        ${error ? `<div class="banner banner-danger">${error}</div>` : ''}
+        ${error ? `<div class="banner banner-danger">${escapeHtml(error)}</div>` : ''}
         <div class="card stack">
           <h2>Orders to ship</h2>
-          <p>Amazon orders not yet shipped. Pick the ones going out together — same box/weight, one pickup slot for all.</p>
-          <div id="order-checks" class="stack">
-            ${shippableOrders.length ? '' : '<p>No unshipped Amazon orders right now.</p>'}
+          <p>Amazon orders not yet shipped. Check the ones going out together, set each one's box, weight and package identifier — same pattern as Seller Flex's own pack screen — then get a shared pickup slot for all.</p>
+          <div class="table-scroll"><table>
+            <thead><tr><th></th><th>Order</th><th>Box</th><th>Weight (g)</th><th>Package identifier</th></tr></thead>
+            <tbody id="order-rows"></tbody>
+          </table></div>
+          <div class="row" id="bulk-bar" style="align-items: center; gap: 10px; flex-wrap: wrap; display: none; border-top: 1px solid var(--border); padding-top: 12px; margin-top: 4px;">
+            <span class="pill" id="bulk-count" style="flex: 0 0 auto;"></span>
+            <select id="bulk-box" style="width: auto; flex: 1; min-width: 180px;">${boxOptionsHtml('')}</select>
+            <input type="number" id="bulk-weight" placeholder="Weight (g)" style="width: auto; flex: 0 0 110px; min-height: 44px; padding: 8px 10px;" />
+            <button class="btn" id="bulk-apply" style="width: auto;">Update box</button>
           </div>
-        </div>
-        <div class="card stack">
-          <label for="box">Box size (applies to every selected order)</label>
-          <select id="box">${boxSizes.map((b) => `<option value="${b.id}">${b.name} (${b.length}×${b.width}×${b.height} ${b.dimension_unit})</option>`).join('')}</select>
-          <label for="weight">Weight per package (grams)</label>
-          <input type="number" id="weight" placeholder="e.g. 450" required />
-          <button class="btn btn-primary" id="get-slots">Get pickup slots</button>
+          <button class="btn btn-primary" id="get-slots" style="margin-top: 12px;">Get pickup slots</button>
         </div>
         <div id="slots"></div>`;
 
-      const list = document.getElementById('order-checks')!;
-      for (const o of shippableOrders) {
-        const row = document.createElement('div');
-        row.className = 'item-row';
-        row.innerHTML = `
-          <input type="checkbox" class="order-check" data-order-id="${o.id}" style="width: 20px; height: 20px; flex-shrink: 0;" />
-          <span class="name">${o.external_order_id}<br /><span style="font-size: 0.75rem; color: var(--muted);">${o.first_item_name ?? ''}</span></span>
-          <input type="text" class="pkg-id-input" data-order-id="${o.id}" placeholder="Package identifier" value="${o.external_order_id}" style="width: 160px; min-height: 40px; padding: 6px 10px; display: none;" />`;
-        list.appendChild(row);
+      const rowsEl = document.getElementById('order-rows')!;
+      rowsEl.innerHTML = shippableOrders
+        .map((o) => {
+          const line = lines.get(o.id)!;
+          return `<tr data-order-id="${o.id}">
+            <td><input type="checkbox" class="order-check" ${line.selected ? 'checked' : ''} style="width: 20px; height: 20px;" /></td>
+            <td style="font-weight: 700; white-space: nowrap;">${escapeHtml(o.external_order_id)}<br /><span style="font-weight: 400; font-size: 0.75rem; color: var(--muted);">${escapeHtml(o.first_item_name ?? '')}</span></td>
+            <td><select class="box-select" style="min-height: 40px;">${boxOptionsHtml(line.boxSizeId)}</select></td>
+            <td><input type="number" class="weight-input" value="${line.weightGrams}" placeholder="e.g. 450" style="min-height: 40px; width: 90px;" /></td>
+            <td><input type="text" class="pkg-input" value="${escapeHtml(line.packageIdentifier)}" style="min-height: 40px;" /></td>
+          </tr>`;
+        })
+        .join('');
 
-        const checkbox = row.querySelector('.order-check') as HTMLInputElement;
-        const pkgInput = row.querySelector('.pkg-id-input') as HTMLInputElement;
-        checkbox.addEventListener('change', () => {
-          pkgInput.style.display = checkbox.checked ? 'block' : 'none';
+      rowsEl.querySelectorAll('tr').forEach((tr) => {
+        const orderId = (tr as HTMLElement).dataset.orderId!;
+        const line = lines.get(orderId)!;
+        tr.querySelector('.order-check')?.addEventListener('change', (e) => {
+          line.selected = (e.target as HTMLInputElement).checked;
+          updateBulkBar();
         });
-      }
+        tr.querySelector('.box-select')?.addEventListener('change', (e) => {
+          line.boxSizeId = (e.target as HTMLSelectElement).value;
+        });
+        tr.querySelector('.weight-input')?.addEventListener('input', (e) => {
+          line.weightGrams = (e.target as HTMLInputElement).value;
+        });
+        tr.querySelector('.pkg-input')?.addEventListener('input', (e) => {
+          line.packageIdentifier = (e.target as HTMLInputElement).value;
+        });
+      });
+
+      document.getElementById('bulk-apply')?.addEventListener('click', () => {
+        const boxSizeId = (document.getElementById('bulk-box') as unknown as HTMLSelectElement).value;
+        const weightGrams = (document.getElementById('bulk-weight') as HTMLInputElement).value;
+        for (const orderId of selectedOrderIds()) {
+          const line = lines.get(orderId)!;
+          if (boxSizeId) line.boxSizeId = boxSizeId;
+          if (weightGrams) line.weightGrams = weightGrams;
+        }
+        renderPicker();
+      });
+
+      updateBulkBar();
 
       document.getElementById('get-slots')?.addEventListener('click', async () => {
-        const selectedIds = Array.from(document.querySelectorAll('.order-check:checked')).map((el) => (el as HTMLInputElement).dataset.orderId!);
+        const selectedIds = selectedOrderIds();
         if (!selectedIds.length) {
           renderPicker('Select at least one order.');
           return;
         }
-        const boxSizeId = (document.getElementById('box') as unknown as HTMLSelectElement).value;
-        const weightGrams = Number((document.getElementById('weight') as HTMLInputElement).value);
-        if (!boxSizeId || !weightGrams) return;
+        const missingBox = selectedIds.find((id) => !lines.get(id)!.boxSizeId);
+        const missingWeight = selectedIds.find((id) => !Number(lines.get(id)!.weightGrams));
+        if (missingBox || missingWeight) {
+          renderPicker('Every selected order needs a box size and a weight.');
+          return;
+        }
 
         try {
           // Slots are queried against one representative order — pickup windows are a
           // warehouse-level schedule in practice, not meaningfully different per order.
-          const slots: HandoverSlot[] = await api('/api/admin/shipping/slots', { orderId: selectedIds[0], boxSizeId, weightGrams });
-          renderSlots(slots, selectedIds, boxSizeId, weightGrams);
+          const rep = lines.get(selectedIds[0])!;
+          const slots: HandoverSlot[] = await api('/api/admin/shipping/slots', { orderId: selectedIds[0], boxSizeId: rep.boxSizeId, weightGrams: Number(rep.weightGrams) });
+          renderSlots(slots, selectedIds);
         } catch (err) {
           renderPicker((err as Error).message);
         }
       });
     }
 
-    function renderSlots(slots: HandoverSlot[], selectedIds: string[], boxSizeId: string, weightGrams: number) {
+    function updateBulkBar() {
+      const bar = document.getElementById('bulk-bar');
+      const countEl = document.getElementById('bulk-count');
+      if (!bar || !countEl) return;
+      const n = selectedOrderIds().length;
+      bar.style.display = n > 0 ? 'flex' : 'none';
+      countEl.textContent = `${n} selected`;
+    }
+
+    function renderSlots(slots: HandoverSlot[], selectedIds: string[]) {
       const slotsEl = document.getElementById('slots')!;
       if (!slots.length) {
         slotsEl.innerHTML = '<div class="banner banner-warning">No pickup slots available for this box/weight right now.</div>';
@@ -144,12 +207,12 @@ if (redirectTo) return Astro.redirect(redirectTo);
           btn.classList.add('btn-primary');
           const idx = Number((btn as HTMLButtonElement).dataset.idx);
           selectedSlot = slots[idx];
-          renderScheduleButton(selectedIds, boxSizeId, weightGrams);
+          renderScheduleButton(selectedIds);
         });
       });
     }
 
-    function renderScheduleButton(selectedIds: string[], boxSizeId: string, weightGrams: number) {
+    function renderScheduleButton(selectedIds: string[]) {
       let btn = document.getElementById('schedule-all-btn') as HTMLButtonElement | null;
       if (!btn) {
         btn = document.createElement('button');
@@ -158,42 +221,80 @@ if (redirectTo) return Astro.redirect(redirectTo);
         btn.style.marginTop = '16px';
         document.getElementById('app')!.appendChild(btn);
       }
-      btn.textContent = `Schedule ${selectedIds.length} order${selectedIds.length > 1 ? 's' : ''}`;
+      btn.textContent = `Generate invoice & ship label — ${selectedIds.length} order${selectedIds.length > 1 ? 's' : ''}`;
+      // Matches Seller Flex's own "Bulk Pack Confirmation" step — real money
+      // and a real pickup commitment happen on confirm, so this asks for it
+      // explicitly rather than firing straight off the slot selection. See
+      // HANDOFF.md: "never purchase a real Amazon shipping label without the
+      // user's explicit go-ahead."
       btn.onclick = async () => {
-        const orders = selectedIds.map((orderId) => ({
-          orderId,
-          boxSizeId,
-          weightValue: weightGrams,
-          packageIdentifier: (document.querySelector(`.pkg-id-input[data-order-id="${orderId}"]`) as HTMLInputElement).value.trim()
-        }));
-        try {
-          const result = await api('/api/admin/shipping/bulk-schedule', { orders, slot: selectedSlot });
-          renderResult(result);
-        } catch (err) {
-          renderPicker((err as Error).message);
-        }
+        const ok = await confirmDangerousAction({
+          title: 'Generate invoice & ship label',
+          message: `Once the shipping label is generated, Amazon schedules a real pickup for these ${selectedIds.length} order${selectedIds.length > 1 ? 's' : ''} and this cannot be cancelled from here.`
+        });
+        if (ok) await scheduleAll(selectedIds);
       };
     }
 
-    function renderResult(result: { outcomes: Array<{ externalOrderId: string; ok: boolean; trackingId?: string; error?: string }>; labelSplitOk: boolean }) {
+    async function scheduleAll(selectedIds: string[]) {
+      const orders = selectedIds.map((orderId) => {
+        const line = lines.get(orderId)!;
+        return { orderId, boxSizeId: line.boxSizeId, weightValue: Number(line.weightGrams), packageIdentifier: line.packageIdentifier.trim() };
+      });
+      try {
+        const result = await api('/api/admin/shipping/bulk-schedule', { orders, slot: selectedSlot });
+        await renderResult(result);
+      } catch (err) {
+        renderPicker((err as Error).message);
+      }
+    }
+
+    async function renderResult(result: { outcomes: Array<{ orderId: string; externalOrderId: string; ok: boolean; shipmentId?: string; trackingId?: string; error?: string }>; labelSplitOk: boolean }) {
       app.innerHTML = `
         <div class="card stack">
           <h2>Bulk schedule result</h2>
           ${
             result.labelSplitOk
               ? '<div class="banner banner-success">Labels retrieved and stamped individually.</div>'
-              : '<div class="banner banner-warning">Labels retrieved as one shared file (couldn\'t split per order automatically) — open each order\'s shipment to download it.</div>'
+              : '<div class="banner banner-warning">Labels retrieved as one shared file (couldn\'t split per order automatically) — download it below for each order.</div>'
           }
-          <div class="stack">
-            ${result.outcomes
-              .map(
-                (o) =>
-                  `<div class="item-row"><span class="name">${o.externalOrderId}</span><span class="status-pill ${o.ok ? 'status-success' : 'status-warning'}">${o.ok ? 'scheduled' + (o.trackingId ? ' · ' + o.trackingId : '') : o.error}</span></div>`
-              )
-              .join('')}
-          </div>
+          <div class="stack" id="result-rows"></div>
           <a href="/admin" class="btn">Back to admin</a>
         </div>`;
+
+      const rowsEl = document.getElementById('result-rows')!;
+      for (const o of result.outcomes) {
+        const row = document.createElement('div');
+        row.className = 'item-row';
+        row.innerHTML = `
+          <span class="name">${escapeHtml(o.externalOrderId)}</span>
+          <span class="status-pill ${o.ok ? 'status-success' : 'status-warning'}">${o.ok ? 'scheduled' + (o.trackingId ? ' · ' + escapeHtml(o.trackingId) : '') : escapeHtml(o.error ?? 'failed')}</span>
+          ${o.ok && o.shipmentId ? `<span class="row" style="width:auto; gap:6px;" id="label-actions-${o.shipmentId}"><span style="font-size:0.8rem; color:var(--muted);">Fetching label…</span></span>` : ''}`;
+        rowsEl.appendChild(row);
+        if (o.ok && o.shipmentId) fetchAndShowLabelActions(o.shipmentId);
+      }
+    }
+
+    // Bulk scheduling stores the label synchronously (no Feeds/Reports async
+    // wait like the single-order flow) — this call resolves immediately.
+    async function fetchAndShowLabelActions(shipmentId: string) {
+      const slot = document.getElementById(`label-actions-${shipmentId}`);
+      if (!slot) return;
+      try {
+        const result = await api(`/api/admin/shipping/label-status?shipmentId=${shipmentId}`);
+        if (result.labelStatus !== 'document_ready' || !result.labelBase64) {
+          slot.innerHTML = `<span style="font-size:0.8rem; color:var(--muted);">Label not ready yet — check the order.</span>`;
+          return;
+        }
+        const dataUrl = `data:${result.labelFileType};base64,${result.labelBase64}`;
+        const isZip = /zip/i.test(result.labelFileType);
+        slot.innerHTML = `
+          ${isZip ? '' : `<button type="button" class="btn btn-ghost print-btn" style="width:auto; min-height:36px;">Print</button>`}
+          <a class="btn btn-ghost" style="width:auto; min-height:36px; text-decoration:none;" href="${dataUrl}" download="label-${shipmentId}.${isZip ? 'zip' : 'pdf'}">Download</a>`;
+        slot.querySelector('.print-btn')?.addEventListener('click', () => window.open(dataUrl, '_blank'));
+      } catch (err) {
+        slot.innerHTML = `<span style="font-size:0.8rem; color:var(--danger);">${escapeHtml((err as Error).message)}</span>`;
+      }
     }
 
     async function boot() {
@@ -214,6 +315,14 @@ if (redirectTo) return Astro.redirect(redirectTo);
 
       if (!boxSizes.length) {
         app.innerHTML = `<p>No box sizes configured yet. <a href="/admin/settings">Add one in Settings</a> first.</p>`;
+        return;
+      }
+
+      const defaultBoxId = boxSizes[0].id;
+      lines = new Map(shippableOrders.map((o) => [o.id, { selected: false, boxSizeId: defaultBoxId, weightGrams: '', packageIdentifier: o.external_order_id }]));
+
+      if (!shippableOrders.length) {
+        app.innerHTML = '<div class="card"><p>No unshipped Amazon orders right now.</p></div>';
         return;
       }
       renderPicker();
