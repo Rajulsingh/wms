@@ -1,0 +1,138 @@
+---
+import Base from '../layouts/Base.astro';
+import TopBar from '../components/TopBar.astro';
+---
+
+<Base title="Today">
+  <div class="screen">
+    <TopBar section="Today">
+      <a href="/picker" class="pill tab-pill" style="text-decoration: none;">Pick</a>
+      <a href="/packer" class="pill tab-pill" style="text-decoration: none;">Pack</a>
+      <a href="/packer/scan" class="pill tab-pill" style="text-decoration: none;">Scan</a>
+      <a href="/dashboard" class="pill tab-pill active" style="text-decoration: none;">Today</a>
+    </TopBar>
+    <div id="app" class="stack" style="flex: 1;">
+      <p>Loading…</p>
+    </div>
+  </div>
+
+  <script>
+    interface TodaySummary {
+      statusCounts: Record<string, number>;
+      shippedToday: number;
+      cancelledToday: number;
+      ordersPickedToday: number;
+      unitsPickedToday: number;
+      ordersPackedToday: number;
+      unitsPackedToday: number;
+      blockedOrders: number;
+      blockedUnits: number;
+      openExceptions: number;
+      generatedAt: string;
+    }
+
+    const STAGES: Array<{ key: string; label: string }> = [
+      { key: 'pending', label: 'Pending' },
+      { key: 'batched', label: 'Batched' },
+      { key: 'picking', label: 'Picking' },
+      { key: 'picked', label: 'Picked' },
+      { key: 'packing', label: 'Packing' },
+      { key: 'packed', label: 'Packed' },
+      { key: 'ready_to_ship', label: 'Ready to ship' }
+    ];
+
+    const app = document.getElementById('app')!;
+    let warehouseId = '';
+    let isAdmin = false;
+
+    async function api(path: string) {
+      const res = await fetch(path);
+      const data: any = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error ?? `Request failed (${res.status})`);
+      return data;
+    }
+
+    function formatTime(iso: string): string {
+      return new Date(iso).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit', second: '2-digit' });
+    }
+
+    function tile(value: number, label: string, accent?: string): string {
+      return `<div class="stat-card ${accent ? `stat-card-accent-${accent}` : ''}">
+        <span class="stat-card-value">${value}</span>
+        <span class="stat-card-label">${label}</span>
+      </div>`;
+    }
+
+    async function load() {
+      try {
+        const summary: TodaySummary = await api(`/api/dashboard/today?warehouseId=${warehouseId}`);
+        render(summary);
+      } catch (err) {
+        app.innerHTML = `<div class="banner banner-danger">${(err as Error).message}</div>`;
+      }
+    }
+
+    function render(s: TodaySummary) {
+      const pipelineInProgress = STAGES.reduce((sum, st) => sum + (s.statusCounts[st.key] ?? 0), 0);
+
+      app.innerHTML = `
+        <div class="row" style="justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
+          <span class="eyebrow">Live warehouse snapshot</span>
+          <span style="font-size: 0.75rem; color: var(--muted);">Updated ${formatTime(s.generatedAt)} · refreshes automatically</span>
+        </div>
+
+        ${
+          s.blockedOrders > 0 || s.openExceptions > 0
+            ? `<div class="stack" style="gap: 8px;">
+                ${
+                  s.blockedOrders > 0
+                    ? `<div class="banner banner-warning">${s.blockedOrders} order${s.blockedOrders > 1 ? 's' : ''} waiting to be assigned (${s.blockedUnits} unit${s.blockedUnits > 1 ? 's' : ''}) — rechecks automatically every few minutes.${isAdmin ? ` <a href="/admin/inbound">Receive stock</a> if it's genuinely short.` : ''}</div>`
+                    : ''
+                }
+                ${
+                  s.openExceptions > 0
+                    ? `<div class="banner banner-warning">${s.openExceptions} unresolved issue${s.openExceptions > 1 ? 's' : ''} logged from the floor (short picks, damage, etc.)${isAdmin ? ` — <a href="/admin/exceptions">review in Exceptions</a>.` : ' — ask an admin to review.'}</div>`
+                    : ''
+                }
+              </div>`
+            : `<div class="banner banner-success">Nothing blocked, no open issues.</div>`
+        }
+
+        <div class="stack" style="gap: 8px;">
+          <span class="eyebrow">Order pipeline right now</span>
+          <div class="stat-grid">
+            ${STAGES.map((st) => tile(s.statusCounts[st.key] ?? 0, st.label)).join('')}
+          </div>
+          <p style="font-size: 0.78rem; color: var(--muted); margin: 0;">${pipelineInProgress} order${pipelineInProgress === 1 ? '' : 's'} currently in progress, somewhere between pending and ready to ship.</p>
+        </div>
+
+        <div class="stack" style="gap: 8px; margin-top: 4px;">
+          <span class="eyebrow">Today's activity</span>
+          <div class="stat-grid">
+            ${tile(s.ordersPickedToday, 'Orders picked today', 'neutral')}
+            ${tile(s.unitsPickedToday, 'Units picked today', 'neutral')}
+            ${tile(s.ordersPackedToday, 'Orders packed today', 'neutral')}
+            ${tile(s.unitsPackedToday, 'Units packed today', 'neutral')}
+            ${tile(s.shippedToday, 'Shipped today', 'success')}
+            ${tile(s.cancelledToday, 'Cancelled today', s.cancelledToday > 0 ? 'warning' : 'neutral')}
+          </div>
+        </div>`;
+    }
+
+    async function boot() {
+      const me = await api('/api/auth/me');
+      if (!me.user) {
+        window.location.href = '/login';
+        return;
+      }
+      warehouseId = me.user.warehouseId;
+      isAdmin = me.user.role === 'admin';
+      await load();
+      setInterval(() => {
+        if (!document.hidden) load();
+      }, 15000);
+    }
+
+    boot();
+  </script>
+</Base>

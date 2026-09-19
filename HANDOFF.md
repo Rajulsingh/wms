@@ -1106,6 +1106,31 @@ latter is now often unnecessary), instead explains it rechecks automatically and
 receiving stock if it's *still* there after a while. Confirmed live: the 36 orders this report was
 about all reached `'packing'` shortly after.
 
+## Recently done (2026-09-20, a twenty-fifth pass) — a shared "Today" overview, every role
+
+The user wanted a "meta dashboard" any user (not just admin) can open to see the whole warehouse's
+current-day state at a glance — pending/picking/packed/shipped etc., "and other things."
+
+- **New `/dashboard`** ("Today" pill, added to every packer-flow TopBar — `picker/index.astro`,
+  `packer/index.astro`, `packer/scan.astro`, `packer/home.astro` — plus a new "Today's overview" link
+  at the top of `AdminSidebar.astro`) and **`GET /api/dashboard/today`** (`lib/dashboard.ts`,
+  `getTodaySummary`) — deliberately **no role restriction** (`requireUser` with no `allowedRoles`),
+  unlike everything under `/admin`, since the whole point is a packer and an admin seeing the same
+  picture.
+- Two different kinds of number, on purpose: a **live snapshot** of `orders.status` counts (pending
+  through ready-to-ship) — which *is* today's picture in a same-day pick/pack/ship operation, not a
+  separate "today" query — plus real **calendar-day activity counts** (shipped today via
+  `audit_log`'s `order.shipped_sync`, cancelled today via `order.cancelled_sync`, units/orders picked
+  today via `pick_tasks.picked_at`, units/orders packed today via `pack_sessions.completed_at`,
+  mirroring `getPackerDailySummary`'s pattern but warehouse-wide instead of per-packer). Reuses
+  `getUnbatchedOrderSummary` (blocked count) and the same exception-resolution query
+  `api/admin/exceptions.ts` uses (open count) rather than duplicating either.
+- Admin-only follow-up links (`Receive stock`, `review in Exceptions`) only render for `role ===
+  'admin'` — a packer sees the same counts and banners but without a dead link to a page
+  `requireAdminPage` would just bounce them out of.
+- Verified live in dev (both roles) and on a mobile viewport (375px, two-column stat grid, no
+  overflow) before deploying.
+
 ## Next steps — a prioritized plan
 
 Rewritten 2026-09-20 (twenty-one passes across two days — see "Recently done" entries above for the
