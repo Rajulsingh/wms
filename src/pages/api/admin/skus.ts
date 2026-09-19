@@ -6,7 +6,7 @@ export const GET: APIRoute = async (context) => {
   const db = getDb();
   try {
     await requireUser(context, db, ['admin']);
-    const rows = await db.prepare(`SELECT id, sku_code, name, price, image_url FROM skus ORDER BY sku_code`).all();
+    const rows = await db.prepare(`SELECT id, sku_code, name, price, image_url FROM skus WHERE merged_into_id IS NULL ORDER BY sku_code`).all();
     return new Response(JSON.stringify(rows.results), { status: 200, headers: { 'Content-Type': 'application/json' } });
   } catch (err) {
     if (err instanceof AuthError) return new Response(JSON.stringify({ error: err.message }), { status: err.status });

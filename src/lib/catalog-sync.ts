@@ -1,5 +1,6 @@
 import { newId } from './db';
 import { fetchAllListings } from './amazon';
+import { resolveSkuIdByCode } from './skus';
 
 export interface CatalogSyncResult {
   created: number;
@@ -22,9 +23,12 @@ export async function syncAmazonCatalog(db: D1Database): Promise<CatalogSyncResu
   for (const listing of listings) {
     if (!listing.title) continue; // nothing useful to store yet
 
-    const existing = await db.prepare(`SELECT id FROM skus WHERE sku_code = ?`).bind(listing.sku).first<{ id: string }>();
-    if (existing) {
-      await db.prepare(`UPDATE skus SET name = ?, image_url = ? WHERE id = ?`).bind(listing.title, listing.imageUrl, existing.id).run();
+    // Follows a merge redirect — if this SellerSKU is a duplicate that's
+    // since been merged into another SKU, the catalog's name/image update
+    // applies to the surviving SKU, not the dead one. See lib/skus.ts.
+    const resolvedId = await resolveSkuIdByCode(db, listing.sku);
+    if (resolvedId) {
+      await db.prepare(`UPDATE skus SET name = ?, image_url = ? WHERE id = ?`).bind(listing.title, listing.imageUrl, resolvedId).run();
       updated++;
     } else {
       await db

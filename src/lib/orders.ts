@@ -1,6 +1,7 @@
 import { newId } from './db';
 import { reserveInventory, InsufficientStockError } from './inventory';
 import { fetchCatalogItemDetails, type AmazonOrder } from './amazon';
+import { resolveSkuIdByCode } from './skus';
 
 export interface ImportSummary {
   imported: number;
@@ -41,20 +42,23 @@ export async function importAmazonOrders(db: D1Database, warehouseId: string, or
       .run();
 
     for (const item of order.items) {
-      let sku = await db.prepare(`SELECT id FROM skus WHERE sku_code = ?`).bind(item.sellerSku).first<{ id: string }>();
-      if (!sku) {
+      // Follows a merge redirect if this SellerSKU used to be a duplicate
+      // that's since been merged into another SKU — otherwise the same
+      // SellerSKU showing up again would spawn a second empty duplicate
+      // every time, right back where the merge started. See lib/skus.ts.
+      let skuId = await resolveSkuIdByCode(db, item.sellerSku);
+      if (!skuId) {
         const catalog = item.asin ? await fetchCatalogItemDetails(item.asin) : { title: null, imageUrl: null };
-        const skuId = newId();
+        skuId = newId();
         await db
           .prepare(`INSERT INTO skus (id, sku_code, name, image_url) VALUES (?, ?, ?, ?)`)
           .bind(skuId, item.sellerSku, catalog.title ?? item.title ?? item.sellerSku, catalog.imageUrl)
           .run();
-        sku = { id: skuId };
         summary.newSkusCreated.push(item.sellerSku);
       }
       await db
         .prepare(`INSERT INTO order_items (id, order_id, sku_id, quantity_ordered, amazon_order_item_id) VALUES (?, ?, ?, ?, ?)`)
-        .bind(newId(), orderId, sku.id, item.quantityOrdered, item.orderItemId)
+        .bind(newId(), orderId, skuId, item.quantityOrdered, item.orderItemId)
         .run();
     }
 

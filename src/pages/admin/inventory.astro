@@ -9,6 +9,29 @@ if (redirectTo) return Astro.redirect(redirectTo);
 
 <AdminShell title="Inventory" current="inventory">
   <div class="card stack">
+    <h2>Merge duplicate SKUs</h2>
+    <p>
+      When the same physical product ends up under two SKU codes — typically because Amazon sent a SellerSKU that
+      doesn't match the code you already stock it under — merge the duplicate into the one you actually use.
+      Inventory, pending order lines, and future orders under the old code all redirect to the surviving SKU.
+      Nothing is deleted.
+    </p>
+    <div class="row" style="flex-wrap: wrap; gap: 10px;">
+      <input type="text" id="merge-source" placeholder="Duplicate SKU code to retire" style="flex: 1; min-width: 180px;" />
+      <input type="text" id="merge-target" placeholder="SKU code to keep" style="flex: 1; min-width: 180px;" />
+      <button class="btn" id="merge-preview-btn" style="width: auto;">Preview merge</button>
+    </div>
+    <div id="merge-result"></div>
+  </div>
+
+  <div class="card stack">
+    <h2>Possible duplicate SKUs</h2>
+    <p>Finds SKUs with an exactly matching product name — almost always the same physical item Amazon sent under more than one SellerSKU. Only exact name matches are flagged; a small title difference won't show up here, so this isn't exhaustive.</p>
+    <button class="btn" id="scan-duplicates-btn" style="width: auto;">Scan for duplicates</button>
+    <div id="duplicates-result"></div>
+  </div>
+
+  <div class="card stack">
     <h2>Stock by location</h2>
     <p>On-hand and reserved units per SKU per bin. Edit on-hand directly to correct a miscount or write off damage — this doesn't go through the reservation flow.</p>
     <div class="table-scroll">
@@ -24,6 +47,8 @@ if (redirectTo) return Astro.redirect(redirectTo);
   </div>
 
   <script>
+    import { withLoading, escapeHtml } from '../../lib/ui';
+
     interface Row {
       id: string;
       sku_id: string;
@@ -88,6 +113,137 @@ if (redirectTo) return Astro.redirect(redirectTo);
         });
       });
     }
+
+    const mergeResult = document.getElementById('merge-result')!;
+    const mergeSourceInput = document.getElementById('merge-source') as HTMLInputElement;
+    const mergeTargetInput = document.getElementById('merge-target') as HTMLInputElement;
+
+    interface MergePreview {
+      source: { id: string; code: string; name: string };
+      target: { id: string; code: string; name: string };
+      inventoryLines: number;
+      inventoryUnits: number;
+      orderItemCount: number;
+      pickTaskCount: number;
+    }
+
+    document.getElementById('merge-preview-btn')?.addEventListener('click', async (e) => {
+      const sourceCode = mergeSourceInput.value.trim();
+      const targetCode = mergeTargetInput.value.trim();
+      mergeResult.innerHTML = '';
+      if (!sourceCode || !targetCode) {
+        mergeResult.innerHTML = `<p style="color: var(--danger);">Enter both SKU codes.</p>`;
+        return;
+      }
+      const btn = e.currentTarget as HTMLButtonElement;
+      try {
+        const preview: MergePreview = await withLoading(btn, 'Checking…', () =>
+          api(`/api/admin/sku-merge?sourceCode=${encodeURIComponent(sourceCode)}&targetCode=${encodeURIComponent(targetCode)}`)
+        );
+        mergeResult.innerHTML = `
+          <div class="banner banner-warning" style="margin-top: 10px;">
+            <p style="margin: 0 0 8px;">
+              Merging <strong>${escapeHtml(preview.source.code)}</strong> (${escapeHtml(preview.source.name)}) into
+              <strong>${escapeHtml(preview.target.code)}</strong> (${escapeHtml(preview.target.name)}) will move:
+            </p>
+            <ul style="margin: 0 0 10px; padding-left: 20px;">
+              <li>${preview.inventoryLines} inventory location${preview.inventoryLines === 1 ? '' : 's'} (${preview.inventoryUnits} unit${preview.inventoryUnits === 1 ? '' : 's'})</li>
+              <li>${preview.orderItemCount} order line${preview.orderItemCount === 1 ? '' : 's'}</li>
+              <li>${preview.pickTaskCount} pick task${preview.pickTaskCount === 1 ? '' : 's'}</li>
+            </ul>
+            <p style="margin: 0 0 10px; font-size: 0.85rem;">
+              "${escapeHtml(preview.source.code)}" isn't deleted — it stays as a redirect, so a future order under that
+              code lands on "${escapeHtml(preview.target.code)}" automatically instead of creating a new duplicate.
+            </p>
+            <button class="btn btn-primary" id="merge-confirm-btn" style="width: auto;">Confirm merge</button>
+          </div>`;
+        document.getElementById('merge-confirm-btn')?.addEventListener('click', async (ce) => {
+          const confirmBtn = ce.currentTarget as HTMLButtonElement;
+          try {
+            await withLoading(confirmBtn, 'Merging…', () => api('/api/admin/sku-merge', { sourceCode, targetCode }, 'POST'));
+            mergeResult.innerHTML = `<div class="banner banner-success" style="margin-top: 10px;">Merged. Reloading inventory…</div>`;
+            mergeSourceInput.value = '';
+            mergeTargetInput.value = '';
+            await loadInventory();
+          } catch (err) {
+            mergeResult.innerHTML = `<p style="color: var(--danger); margin-top: 10px;">${escapeHtml((err as Error).message)}</p>`;
+          }
+        });
+      } catch (err) {
+        mergeResult.innerHTML = `<p style="color: var(--danger); margin-top: 10px;">${escapeHtml((err as Error).message)}</p>`;
+      }
+    });
+
+    interface DuplicateCandidate {
+      id: string;
+      code: string;
+      inventoryUnits: number;
+      orderItemCount: number;
+      createdAt: string;
+    }
+    interface DuplicateGroup {
+      name: string;
+      candidates: DuplicateCandidate[];
+      suggestedKeepId: string;
+    }
+
+    const duplicatesResult = document.getElementById('duplicates-result')!;
+
+    // Reuses the exact same preview-then-confirm merge flow above instead
+    // of a separate one-click merge path — every single merge, whether
+    // typed manually or picked from this scan, goes through the same
+    // human-reviewed preview step. No exceptions, even for a bulk cleanup.
+    function fillAndPreviewMerge(sourceCode: string, targetCode: string) {
+      mergeSourceInput.value = sourceCode;
+      mergeTargetInput.value = targetCode;
+      document.getElementById('merge-preview-btn')?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      mergeSourceInput.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+
+    document.getElementById('scan-duplicates-btn')?.addEventListener('click', async (e) => {
+      const btn = e.currentTarget as HTMLButtonElement;
+      duplicatesResult.innerHTML = '';
+      try {
+        const groups: DuplicateGroup[] = await withLoading(btn, 'Scanning…', () => api('/api/admin/sku-duplicates'));
+        if (!groups.length) {
+          duplicatesResult.innerHTML = `<p>No exact-name duplicates found.</p>`;
+          return;
+        }
+        duplicatesResult.innerHTML = `
+          <p style="margin-top: 10px;">${groups.length} possible duplicate group${groups.length === 1 ? '' : 's'} found.</p>
+          <div class="stack" id="duplicate-groups" style="gap: 10px;"></div>`;
+        const list = document.getElementById('duplicate-groups')!;
+        for (const g of groups) {
+          const keep = g.candidates.find((c) => c.id === g.suggestedKeepId)!;
+          const others = g.candidates.filter((c) => c.id !== g.suggestedKeepId);
+          const row = document.createElement('div');
+          row.className = 'item-row';
+          row.style.flexWrap = 'wrap';
+          row.innerHTML = `
+            <div class="stack" style="gap: 2px; flex: 1; min-width: 240px;">
+              <span class="truncate-cell" style="max-width: 100%;" title="${escapeHtml(g.name)}">${escapeHtml(g.name)}</span>
+              <span style="font-size: 0.78rem; color: var(--muted);">
+                Keep <strong>${escapeHtml(keep.code)}</strong> (${keep.inventoryUnits} units, ${keep.orderItemCount} order line${keep.orderItemCount === 1 ? '' : 's'})
+                — vs ${others.map((c) => `${escapeHtml(c.code)} (${c.inventoryUnits} units)`).join(', ')}
+              </span>
+            </div>
+            <div class="row" style="width: auto; flex-wrap: wrap; gap: 6px;">
+              ${others
+                .map(
+                  (c) =>
+                    `<button type="button" class="btn btn-ghost dup-merge-btn" data-source="${escapeHtml(c.code)}" data-target="${escapeHtml(keep.code)}" style="width: auto; min-height: 36px;">Merge ${escapeHtml(c.code)} → ${escapeHtml(keep.code)}</button>`
+                )
+                .join('')}
+            </div>`;
+          list.appendChild(row);
+        }
+        list.querySelectorAll<HTMLButtonElement>('.dup-merge-btn').forEach((b) => {
+          b.addEventListener('click', () => fillAndPreviewMerge(b.dataset.source!, b.dataset.target!));
+        });
+      } catch (err) {
+        duplicatesResult.innerHTML = `<p style="color: var(--danger); margin-top: 10px;">${escapeHtml((err as Error).message)}</p>`;
+      }
+    });
 
     async function boot() {
       const me = await api('/api/auth/me');

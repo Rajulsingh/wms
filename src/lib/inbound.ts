@@ -1,4 +1,5 @@
 import { newId, logAudit } from './db';
+import { resolveSkuIdByCode } from './skus';
 
 export class InboundError extends Error {
   constructor(public code: string, message: string) {
@@ -59,10 +60,13 @@ export async function receiveStock(
       if (!line.newSku?.skuCode?.trim() || !line.newSku?.name?.trim()) {
         throw new InboundError('sku_required', 'Pick an existing SKU or provide a code and name for a new one');
       }
+      // Follows a merge redirect — receiving against an old/duplicate code
+      // that's since been merged puts the stock on the surviving SKU
+      // instead of the dead one. See lib/skus.ts.
       const code = line.newSku.skuCode.trim();
-      const existing = await db.prepare(`SELECT id FROM skus WHERE sku_code = ?`).bind(code).first<{ id: string }>();
-      if (existing) {
-        skuId = existing.id;
+      const resolvedId = await resolveSkuIdByCode(db, code);
+      if (resolvedId) {
+        skuId = resolvedId;
       } else {
         skuId = newId();
         await db.prepare(`INSERT INTO skus (id, sku_code, name) VALUES (?, ?, ?)`).bind(skuId, code, line.newSku.name.trim()).run();

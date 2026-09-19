@@ -27,6 +27,7 @@ export const GET: APIRoute = async (context) => {
          FROM skus s
          LEFT JOIN inventory inv ON inv.sku_id = s.id
          LEFT JOIN locations loc ON loc.id = inv.location_id AND loc.warehouse_id = ?
+         WHERE s.merged_into_id IS NULL
          GROUP BY s.id
          ORDER BY s.sku_code`
       )

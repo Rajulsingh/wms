@@ -12,7 +12,7 @@ export const GET: APIRoute = async (context) => {
 
     const [skus, locations, receipts] = await Promise.all([
       db
-        .prepare(`SELECT id, sku_code, name, image_url, price FROM skus ORDER BY sku_code`)
+        .prepare(`SELECT id, sku_code, name, image_url, price FROM skus WHERE merged_into_id IS NULL ORDER BY sku_code`)
         .all<{ id: string; sku_code: string; name: string; image_url: string | null; price: number | null }>(),
       db
         .prepare(
