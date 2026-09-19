@@ -1,7 +1,7 @@
 import type { APIRoute } from 'astro';
 import { getDb } from '../../../lib/db';
 import { requireUser, AuthError } from '../../../lib/auth';
-import { startNextPackSession, PackerFlowError } from '../../../lib/packer';
+import { startPackingBatch, PackerFlowError } from '../../../lib/packer';
 
 export const POST: APIRoute = async (context) => {
   const db = getDb();
@@ -9,7 +9,7 @@ export const POST: APIRoute = async (context) => {
     const user = await requireUser(context, db, ['packer']);
     const body = await context.request.json<{ warehouseId: string; stationQrToken: string }>();
 
-    const state = await startNextPackSession(db, user.id, body.stationQrToken, body.warehouseId);
+    const state = await startPackingBatch(db, user.id, body.stationQrToken, body.warehouseId);
     return new Response(JSON.stringify(state), { status: 200, headers: { 'Content-Type': 'application/json' } });
   } catch (err) {
     if (err instanceof AuthError) return new Response(JSON.stringify({ error: err.message }), { status: err.status });

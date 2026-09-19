@@ -18,32 +18,47 @@ import TopBar from '../../components/TopBar.astro';
   <script>
     import { scanOnce, stopScanning } from '../../lib/scanner-client';
 
-    interface PackItem {
+    interface PackBatchItem {
       order_item_id: string;
+      order_id: string;
+      external_order_id: string;
       sku_code: string;
       sku_name: string;
       image_url: string | null;
       quantity_required: number;
       quantity_packed: number;
     }
-    interface PackState {
-      packSessionId: string;
+    interface PackBatchOrder {
       orderId: string;
-      status: string;
-      items: PackItem[];
+      externalOrderId: string;
+      packSessionId: string;
       allPacked: boolean;
+    }
+    interface PackBatchState {
+      pickBatchId: string;
+      items: PackBatchItem[];
+      orders: PackBatchOrder[];
+      allPacked: boolean;
+    }
+    interface SkuGroup {
+      sku_code: string;
+      sku_name: string;
+      image_url: string | null;
+      rows: PackBatchItem[];
     }
 
     const app = document.getElementById('app')!;
     const userPill = document.getElementById('user-pill')!;
     let warehouseId = '';
-    let state: PackState | null = null;
+    let currentStationToken = '';
+    let state: PackBatchState | null = null;
+    let awbQueue: PackBatchOrder[] = [];
     let lastError = '';
     let pollTimer: ReturnType<typeof setInterval> | null = null;
 
     // Orders keep arriving and get picked continuously — a packer already
     // tapped into a station with nothing waiting should see the next picked
-    // order show up on its own, not have to keep tapping "check again".
+    // batch show up on its own, not have to keep tapping "check again".
     function stopPolling() {
       if (pollTimer !== null) {
         clearInterval(pollTimer);
@@ -136,9 +151,10 @@ import TopBar from '../../components/TopBar.astro';
 
     async function startSession(stationQrToken: string) {
       stopScanning();
+      currentStationToken = stationQrToken;
       try {
         const result = await api('/api/packer/start-session', { warehouseId, stationQrToken });
-        if (!result || !result.packSessionId) {
+        if (!result || !result.pickBatchId) {
           app.innerHTML = `
             <div class="stack" style="flex:1; justify-content:center; text-align:center;">
               <p>No orders waiting to pack — this checks automatically, or tap to check now.</p>
@@ -159,85 +175,138 @@ import TopBar from '../../components/TopBar.astro';
         }
         stopPolling();
         state = result;
-        renderPackList();
+        renderPackBatch();
       } catch (err) {
         showError((err as Error).message);
         renderStationPrompt();
       }
     }
 
-    // No barcode scan here — the warehouse's internal SKU doesn't match Amazon's
-    // SellerSKU and products aren't individually barcoded, same reason the
-    // picker flow (see /picker) dropped scanning. Packer visually matches the
-    // item against its photo/name and taps to confirm, mirroring the picker.
-    function renderPackList() {
+    // Bulk pack by SKU, not by order: every order in the batch needing the
+    // same SKU collapses into one aggregate line, same pattern /picker uses
+    // — pick the number up once (or edit it down if something's missing),
+    // one "Mark done" tap. No barcode scan here — the warehouse's internal
+    // SKU doesn't match Amazon's SellerSKU and products aren't individually
+    // barcoded, same reason picking dropped scanning. Labels are applied in
+    // a separate pass once every order in the batch is fully packed, not
+    // one at a time as each order finishes — see HANDOFF.md.
+    function renderPackBatch() {
       if (!state) return;
-      const remaining = state.items.filter((i) => i.quantity_packed < i.quantity_required);
-      app.innerHTML = `
-        <div class="stack">
-          <span class="eyebrow">Pack order</span>
-          ${errorBanner()}
-          <div class="stack" id="item-list"></div>
-          ${remaining.length ? '' : `<button class="btn btn-primary" id="finish-pack">Mark packed</button>`}
-        </div>`;
+      lastError = '';
 
-      const list = document.getElementById('item-list')!;
-      for (const item of state.items) {
-        list.appendChild(renderPackRow(item));
+      const skuGroups: SkuGroup[] = [];
+      for (const r of state.items) {
+        let sg = skuGroups.find((sg) => sg.sku_code === r.sku_code);
+        if (!sg) {
+          sg = { sku_code: r.sku_code, sku_name: r.sku_name, image_url: r.image_url, rows: [] };
+          skuGroups.push(sg);
+        }
+        sg.rows.push(r);
       }
-      document.getElementById('finish-pack')?.addEventListener('click', finishPack);
+
+      const remainingCount = state.items.filter((r) => r.quantity_packed < r.quantity_required).length;
+      // An order can legitimately have nothing here at all — every one of
+      // its items came back short/damaged during picking, so there's
+      // nothing physically left to pack for it (it still needs a label).
+      const nothingToPack = skuGroups.length === 0;
+      app.innerHTML = `
+        ${errorBanner()}
+        <div class="stack" id="summary" style="flex-direction: row; gap: 16px; flex-wrap: wrap;">
+          <span class="pill">${state.orders.length} orders</span>
+          <span class="pill">${skuGroups.length} SKU lines</span>
+          <span class="pill">${remainingCount} left</span>
+        </div>
+        ${nothingToPack ? '<p>Nothing to pack — every item on these orders came back short or damaged while picking. Apply their labels below.</p>' : ''}
+        <div class="stack" id="groups"></div>
+        ${state.allPacked ? `<button class="btn btn-primary" id="finish-pack">Finish packing — apply labels</button>` : ''}`;
+
+      const groupsEl = document.getElementById('groups')!;
+      for (const sg of skuGroups) groupsEl.appendChild(renderSkuGroup(sg));
+      document.getElementById('finish-pack')?.addEventListener('click', finishPacking);
     }
 
-    function renderPackRow(item: PackItem): HTMLElement {
+    function renderSkuGroup(sg: SkuGroup): HTMLElement {
+      const required = sg.rows.reduce((sum, r) => sum + r.quantity_required, 0);
+      const packed = sg.rows.reduce((sum, r) => sum + r.quantity_packed, 0);
+      const done = packed >= required;
+      const remainingNeeded = required - packed;
+      const orderCount = new Set(sg.rows.map((r) => r.external_order_id)).size;
+      const orderBreakdown = sg.rows.map((r) => `${r.external_order_id} ×${r.quantity_required}`).join(' · ');
+
       const el = document.createElement('div');
       el.className = 'card';
-      const done = item.quantity_packed >= item.quantity_required;
       el.innerHTML = `
         <div class="row" style="align-items: center; gap: 12px;">
-          ${item.image_url ? `<img class="thumb" src="${item.image_url}" alt="" />` : '<div class="thumb"></div>'}
+          ${sg.image_url ? `<img class="thumb" src="${sg.image_url}" alt="" />` : '<div class="thumb"></div>'}
           <div class="stack" style="gap: 2px; flex: 1;">
-            <span style="font-weight: 600;">${item.sku_name}</span>
-            <span style="font-size: 0.8rem; color: var(--muted);">${item.sku_code}</span>
+            <span style="font-weight: 600;">${sg.sku_name}</span>
+            <span style="font-size: 0.8rem; color: var(--muted);">${sg.sku_code} · ${orderCount} order${orderCount > 1 ? 's' : ''}</span>
           </div>
-          <span class="qty">${item.quantity_packed}/${item.quantity_required}</span>
+          <span class="qty">${packed}/${required}</span>
         </div>
+        <div style="font-size: 0.72rem; color: var(--muted); margin-top: 6px;">${orderBreakdown}</div>
         ${
           done
             ? `<div class="banner banner-success" style="margin-top: 10px; padding: 8px 12px;">Packed</div>`
-            : `<button class="btn btn-primary" data-action="pack" style="margin-top: 10px;">Packed</button>`
+            : `<div class="row" style="margin-top: 10px; gap: 8px; align-items: center;">
+                 <input type="number" class="qty-input" min="0" max="${remainingNeeded}" value="${remainingNeeded}" style="width: 90px; flex: 0 0 auto; min-height: 52px; text-align: center;" />
+                 <button class="btn btn-primary" data-action="pack" style="flex: 1;">Mark done</button>
+               </div>`
         }`;
 
+      const orderItemIds = sg.rows.map((r) => r.order_item_id);
       el.querySelector('[data-action="pack"]')?.addEventListener('click', async () => {
-        await handleMarkPacked(item.order_item_id, item.quantity_required);
+        const input = el.querySelector('.qty-input') as HTMLInputElement;
+        const qty = Number(input.value);
+        await handleMarkPacked(orderItemIds, qty);
       });
       return el;
     }
 
-    async function handleMarkPacked(orderItemId: string, quantity: number) {
+    async function handleMarkPacked(orderItemIds: string[], quantity: number) {
       try {
-        state = await api('/api/packer/mark-item', { packSessionId: state!.packSessionId, orderItemId, quantity });
-        renderPackList();
+        state = await api('/api/packer/mark-item', { pickBatchId: state!.pickBatchId, orderItemIds, quantity });
+        renderPackBatch();
       } catch (err) {
-        showError((err as Error).message);
-        renderPackList();
+        lastError = (err as Error).message;
+        renderPackBatch();
       }
     }
 
-    async function finishPack() {
+    async function finishPacking() {
       try {
-        await api('/api/packer/complete', { packSessionId: state!.packSessionId });
-        renderAwbScreen();
+        const { results } = await api('/api/packer/complete', { pickBatchId: state!.pickBatchId });
+        awbQueue = (results as Array<{ orderId: string; packSessionId: string; outcome: string }>).map((r) => {
+          const order = state!.orders.find((o) => o.orderId === r.orderId)!;
+          return order;
+        });
+        renderApplyLabelsQueue();
       } catch (err) {
-        showError((err as Error).message);
-        renderPackList();
+        lastError = (err as Error).message;
+        renderPackBatch();
       }
     }
 
-    function renderAwbScreen() {
+    function renderApplyLabelsQueue() {
+      if (!awbQueue.length) {
+        app.innerHTML = `
+          <div class="stack" style="flex:1; justify-content:center; text-align:center;">
+            <div class="banner banner-success">Batch complete</div>
+            <div class="big-label">All labels applied</div>
+            <button class="btn btn-primary" id="next-batch">Get next batch</button>
+          </div>`;
+        document.getElementById('next-batch')?.addEventListener('click', () => startSession(currentStationToken));
+        return;
+      }
+      renderAwbScreen(awbQueue[0]);
+    }
+
+    function renderAwbScreen(order: PackBatchOrder) {
       app.innerHTML = `
         <div class="stack" style="flex:1; justify-content:center; text-align:center;">
-          <span class="eyebrow">Apply label</span>
-          <div class="big-label">Scan AWB</div>
+          <span class="eyebrow">Apply label · ${awbQueue.length} left</span>
+          <div class="big-label">${order.externalOrderId}</div>
+          <p>Scan AWB</p>
           ${errorBanner()}
           <video class="scanner" id="video" style="display:none;"></video>
           <button class="btn btn-primary" id="scan-awb">Scan AWB barcode</button>
@@ -248,28 +317,25 @@ import TopBar from '../../components/TopBar.astro';
         video.style.display = 'block';
         try {
           const text = await scanOnce(video);
-          await handleAwb(text);
+          await handleAwb(order, text);
         } catch {
           showError('Could not open camera — use manual entry.');
-          renderAwbScreen();
+          renderAwbScreen(order);
         }
       });
       document.getElementById('manual-awb')?.addEventListener('click', () => {
         // No "correct" AWB to suggest (it's arbitrary carrier text) — offer a fresh unique one instead of making you invent a string each time.
-        renderManualEntry('AWB code', (code) => handleAwb(code), renderAwbScreen, `TEST-AWB-${Math.random().toString(36).slice(2, 8).toUpperCase()}`);
+        renderManualEntry('AWB code', (code) => handleAwb(order, code), () => renderAwbScreen(order), `TEST-AWB-${Math.random().toString(36).slice(2, 8).toUpperCase()}`);
       });
     }
 
-    async function handleAwb(awbCode: string) {
+    async function handleAwb(order: PackBatchOrder, awbCode: string) {
       stopScanning();
       try {
-        await api('/api/packer/apply-awb', { packSessionId: state!.packSessionId, awbCode });
-        app.innerHTML = `
-          <div class="stack" style="flex:1; justify-content:center; text-align:center;">
-            <div class="banner banner-success" style="font-size:1.3rem;">READY TO SHIP</div>
-            <button class="btn btn-primary" id="next-order">Next order</button>
-          </div>`;
-        document.getElementById('next-order')?.addEventListener('click', renderStationPrompt);
+        await api('/api/packer/apply-awb', { packSessionId: order.packSessionId, awbCode });
+        awbQueue = awbQueue.filter((o) => o.orderId !== order.orderId);
+        lastError = '';
+        renderApplyLabelsQueue();
       } catch (err) {
         // Hard block — AWB mismatch/duplicate. Deliberately does not fall through to ready-to-ship.
         app.innerHTML = `
@@ -277,7 +343,7 @@ import TopBar from '../../components/TopBar.astro';
             <div class="banner banner-danger" style="font-size:1.2rem;">${(err as Error).message}</div>
             <button class="btn" id="retry-awb">Try again</button>
           </div>`;
-        document.getElementById('retry-awb')?.addEventListener('click', renderAwbScreen);
+        document.getElementById('retry-awb')?.addEventListener('click', () => renderAwbScreen(order));
       }
     }
 

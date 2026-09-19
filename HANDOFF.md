@@ -89,12 +89,14 @@ full detail on each.
 5. ~~**Picking was one card per order; user wanted bulk-by-SKU**~~ — **fixed** (2026-09-19).
    Picker now sees one aggregate line per SKU per bin across every order needing it, one "Mark
    done" tap. See "What's built" → the picking entry for the full writeup, including a real
-   pre-existing batch-completion bug this work found and fixed. **Packing was scoped out in the
-   same conversation but deliberately not built yet** — see "Open items" #14 for the three-part
-   breakdown (multi-order batch packing — unblocked, this is the agreed next build; bulk label
-   content — blocked on the Easy Ship role; direct thermal-printer printing via QZ Tray — needs
-   the printer model and current QZ licensing confirmed first). Don't start on packing without
-   re-reading that item; the physical floor workflow it documents is the actual spec.
+   pre-existing batch-completion bug this work found and fixed. **Packing got the same treatment,
+   part 1 of 3** (2026-09-19, same conversation) — multi-order batch packing is done (see "What's
+   built" → the packing entry), including a second real bug found/fixed there too (an order whose
+   items were all short/damaged showed a blank order id on the apply-labels screen). **Parts 2 and
+   3 are still open** — see "Open items" #14 (bulk label content — blocked on the Easy Ship role;
+   direct thermal-printer printing via QZ Tray — needs the printer model and current QZ licensing
+   confirmed first). Don't start on either without re-reading that item; the physical floor
+   workflow it documents is the actual spec.
 6. **Get the Amazon Easy Ship SP-API role granted.** This is the one thing blocking real use of
    shipping (single-order, bulk, everything) *and* packing's bulk-label piece above. It's on the
    user, not something to keep investigating from this end — check Seller Central's
@@ -372,10 +374,38 @@ shell below targets desktop admin use and doesn't follow it.
   seal/label each one once its own box is complete) is a materially bigger, higher-risk change —
   it touches the AWB/label-application path, which HANDOFF already flags as sensitive/undertested
   against a live account. Needs a scoping conversation before touching it, not a guess.
-- **Packing** (`/packer`, `packer.ts`) — station tap-in, tap-to-confirm per item (same pattern as
-  picking, no scanning — `markPackItem`/`POST /api/packer/mark-item`), then AWB scan/manual-entry
-  to apply the shipping label with a hard block on mismatch/duplicate. Still one order per pack
-  session — see the picking entry above for why this wasn't changed to match.
+- **Packing — bulk, multi-order per batch** (`/packer`, `packer.ts`; redesigned 2026-09-19, "Open
+  items" #14 part 1 of 3). Station tap-in is unchanged. What changed: a pack "session" now covers
+  a whole `pick_batch` instead of one order — `startPackingBatch` opens one `pack_sessions` row
+  per order in the batch (migration 0010 added `pack_sessions.pick_batch_id`; `packages`/
+  `shipments`/`awbs` all stay order-scoped, unchanged, since each order still needs its own box
+  and its own label), and the packer sees the same SKU-grouped bulk view picking uses — one
+  aggregate line per SKU across every order in the batch needing it, one "Mark done" tap
+  (`markPackGroup`, mirrors `confirmGroupQuantity` in picker.ts: allocates the confirmed total
+  across the underlying `order_items` in priority/created-at order, no reservation/short-pick
+  concept here since that already happened at picking — packing just records what physically went
+  in each box, capped at what picking actually delivered). Labels are deliberately **not** applied
+  per order as packing finishes — only once every order in the batch is fully packed
+  (`completePackingBatch`, which reuses the exact same per-order `completePackSession` the old
+  flow always used, just looped across the batch) does the packer move to a separate "apply
+  labels" phase: a queue of the batch's orders, one AWB scan/manual-entry per order (`applyAwb`
+  itself is completely unchanged — AWB application is inherently per-order, that was never going
+  to change). This matches the floor workflow the user described: pack everything first
+  (physically arranging finished boxes SKU-sorted on the table), then label everything at once
+  matching that same order.
+  **Edge case, worth knowing**: an order whose items all came back short/damaged during *picking*
+  has nothing left with status `picked`/`packed`, so it legitimately shows zero SKU lines to pack
+  — `getPackBatchState` treats it as vacuously "already packed" (nothing to do) and it goes
+  straight into the apply-labels queue. The UI says so explicitly ("Nothing to pack — every item
+  on these orders came back short or damaged while picking") rather than showing a bare "0 SKU
+  lines" with no explanation, which is what it did before this was noticed and fixed during
+  testing. Also fixed during testing: `getPackBatchState` used to derive an order's
+  `external_order_id` from its (possibly nonexistent, in that same edge case) items instead of
+  reading it directly from `orders` — showed up as a blank order id on the apply-labels screen for
+  exactly the all-short/damaged case above.
+  **Not built yet** — parts 2 and 3 of the same redesign (bulk label content: SKU-sorted, short
+  SKU code stamped, invoice pages stripped; and direct thermal-printer printing, likely via QZ
+  Tray). See "Open items" #14 for the full three-part breakdown and what's blocking each.
 - **Pick/Pack tabs + notifications** — `/picker` and `/packer` are separate routes but present as
   tabs (`.tab-pill` in `TopBar`), each with a red badge dot when work is waiting on the *other*
   tab. `GET /api/packer/work-summary` (packer role) returns `{ pickable, packable }` counts,
@@ -520,28 +550,22 @@ this list.
     without live Amazon access has been checked (forms, order selection, package-identifier
     fields, polling); the actual Amazon calls have not. Treat the bulk ZIP-splitting logic in
     particular as higher-risk than the rest of the app until verified.
-14. **Packing doesn't yet get the same bulk/SKU-grouped treatment picking just got** (see "What's
-    built" → the picking entry, 2026-09-19). The user asked for it on both; picking shipped,
-    packing was scoped out in conversation (2026-09-19) into three pieces — #1 is unblocked and
-    is the agreed next thing to build; #2 and #3 are real future work, not forgotten, but each has
-    a concrete blocker/unknown that has to resolve first. **Here's the actual floor workflow this
-    is meant to replace**, as described by the user, since it's the spec for all three pieces:
-    admin currently hand-writes a pick list (SKU + quantity, with multi-qty/free-item/special-
-    requirement notes called out per line); the packer picks everything for the whole batch at
-    once, then packs every order's box (not one order fully start-to-finish before starting the
-    next), physically arranging finished-but-unlabeled boxes *in SKU order* on the table as they
-    go; only once the whole list is packed does admin generate all the shipping labels for the
-    batch in that same SKU order; the packer then walks the table matching labels to boxes in
-    order (fast, because both are sorted the same way) and scans each AWB as they apply it to
-    mark that order ready-to-ship.
-    1. **Multi-order batch packing — no external blocker, this is the next build.** Change
-       `pack_sessions` from one-order-at-a-time (`startNextPackSession` pulls a single order,
-       applies its one label, moves on) to covering a whole batch: the packer works through every
-       order's items (order and/or SKU grouped, matching how picking now presents the SKU
-       breakdown), with labeling deliberately deferred to a separate step at the end rather than
-       applied per order as packing finishes. Needs a real per-order notes/special-instructions
-       field too — today there's nowhere to record "free gift included" or "multi-qty, double-
-       check count," it only exists on the admin's handwritten paper.
+14. **Packing bulk/SKU-grouped treatment — part 1 of 3 done, 2 and 3 still open.** The user asked
+    for the same bulk treatment picking got on packing too; scoped in conversation (2026-09-19)
+    into three pieces. **Here's the actual floor workflow this is meant to replace**, as described
+    by the user, since it's the spec for all three pieces: admin currently hand-writes a pick list
+    (SKU + quantity, with multi-qty/free-item/special-requirement notes called out per line); the
+    packer picks everything for the whole batch at once, then packs every order's box (not one
+    order fully start-to-finish before starting the next), physically arranging finished-but-
+    unlabeled boxes *in SKU order* on the table as they go; only once the whole list is packed does
+    admin generate all the shipping labels for the batch in that same SKU order; the packer then
+    walks the table matching labels to boxes in order (fast, because both are sorted the same way)
+    and scans each AWB as they apply it to mark that order ready-to-ship.
+    1. ~~**Multi-order batch packing**~~ — **done** (2026-09-19). See "What's built" → the packing
+       entry for the full writeup. **Not included**: a real per-order notes/special-instructions
+       field — today there's still nowhere to record "free gift included" or "multi-qty, double-
+       check count," it only exists on the admin's handwritten paper. Small, additive, worth doing
+       as a fast-follow if the user wants the paper list fully retired.
     2. **Bulk label content — blocked on the Easy Ship SP-API role** (same blocker as "Next
        steps" #2/#4). Once a batch is scheduled via `/admin/bulk-ship`, the resulting labels need
        to: be ordered to match the SKU-sorted packed boxes (not whatever order Amazon's bulk
