@@ -16,8 +16,7 @@ import TopBar from '../../components/TopBar.astro';
   </div>
 
   <script>
-    import { scanOnce, stopScanning } from '../../lib/scanner-client';
-    import { withLoading, escapeHtml } from '../../lib/ui';
+    import { withLoading, escapeHtml, qtyStepperHtml, wireQtySteppers } from '../../lib/ui';
 
     interface PackBatchItem {
       order_item_id: string;
@@ -63,7 +62,6 @@ import TopBar from '../../components/TopBar.astro';
 
     const app = document.getElementById('app')!;
     let warehouseId = '';
-    let currentStationToken = '';
     let batchList: BatchEntry[] = [];
     let sortMode: SortMode = 'sku';
     let selectedOrderIds = new Set<string>();
@@ -115,82 +113,48 @@ import TopBar from '../../components/TopBar.astro';
       }
       warehouseId = me.user.warehouseId;
       pollWorkBadge();
-      renderStationPrompt();
-    }
 
-    async function renderStationPrompt() {
-      stopPolling();
-      app.innerHTML = `
-        <div class="stack" style="flex:1; justify-content:center; text-align:center;">
-          <span class="eyebrow">Packing station</span>
-          <div class="big-label">Tap in</div>
-          ${errorBanner()}
-          <video class="scanner" id="video" style="display:none;"></video>
-          <button class="btn btn-primary" id="scan-station">Scan station label</button>
-          <div class="stack" id="station-list"></div>
-          <button class="btn btn-ghost" id="manual-station">Enter station code</button>
-        </div>`;
-      document.getElementById('scan-station')?.addEventListener('click', async () => {
-        const video = document.getElementById('video') as HTMLVideoElement;
-        video.style.display = 'block';
-        try {
-          const text = await scanOnce(video);
-          await startSession(text);
-        } catch {
-          showError('Could not open camera — use manual entry.');
-          renderStationPrompt();
-        }
-      });
-      document.getElementById('manual-station')?.addEventListener('click', () => {
-        renderManualEntry('Station code', (code) => startSession(code), renderStationPrompt);
-      });
-
-      // Real fallback, not just a test shortcut — pick from the warehouse's own short list of stations instead of typing a code.
-      try {
-        const stations: Array<{ id: string; code: string; qr_token: string }> = await api(`/api/packer/stations?warehouseId=${warehouseId}`);
-        const list = document.getElementById('station-list');
-        if (list && stations.length) {
-          list.innerHTML = stations.map((s) => `<button class="btn" data-token="${s.qr_token}">${s.code}</button>`).join('');
-          list.querySelectorAll('button').forEach((btn) => {
-            const button = btn as HTMLButtonElement;
-            button.addEventListener('click', () => startSession(button.dataset.token!, button));
-          });
-        }
-      } catch {
-        // Station list is a convenience, not a requirement — scan/manual entry still work if this fails.
+      if (!me.user.stationId) {
+        app.innerHTML = `
+          <div class="stack" style="flex:1; justify-content:center; text-align:center;">
+            <p>No packing station is assigned to your account yet — ask an admin to assign one in
+            <a href="/admin/users">Users</a>.</p>
+          </div>`;
+        return;
       }
+      await startSession();
     }
 
     function toEntry(pack: PackBatchState): BatchEntry {
       return { pack };
     }
 
-    async function startSession(stationQrToken: string, btn?: HTMLButtonElement) {
-      stopScanning();
-      currentStationToken = stationQrToken;
+    // Station is a fixed property of the logged-in packer's account now
+    // (users.station_id, assigned once by admin) — nothing to tap/scan into
+    // here, so this just loads whatever's open for them and starts polling.
+    async function startSession(btn?: HTMLButtonElement) {
       try {
         const result = btn
-          ? await withLoading(btn, 'Connecting…', () => api('/api/packer/start-session', { warehouseId, stationQrToken }))
-          : await api('/api/packer/start-session', { warehouseId, stationQrToken });
+          ? await withLoading(btn, 'Checking…', () => api('/api/packer/start-session', { warehouseId }))
+          : await api('/api/packer/start-session', { warehouseId });
         const batches: PackBatchState[] = result?.batches ?? [];
         stopPolling();
         batchList = batches.map(toEntry);
         render();
-        // Always polling from here on, not just while empty — a station stays
-        // tapped in and new batches keep getting picked; freshly ready ones
-        // just append rather than needing a "get next batch" click. See
-        // HANDOFF.md.
+        // Always polling from here on, not just while empty — new batches
+        // keep getting picked; freshly ready ones just append rather than
+        // needing a "get next batch" click. See HANDOFF.md.
         pollTimer = setInterval(pollForMore, 8000);
       } catch (err) {
         showError((err as Error).message);
-        renderStationPrompt();
+        render();
       }
     }
 
     async function pollForMore() {
       if (document.hidden) return;
       try {
-        const result = await api('/api/packer/start-session', { warehouseId, stationQrToken: currentStationToken });
+        const result = await api('/api/packer/start-session', { warehouseId });
         const incoming: PackBatchState[] = result?.batches ?? [];
         const newOnes = incoming.filter((b) => !batchList.some((e) => e.pack.pickBatchId === b.pickBatchId));
         if (newOnes.length) {
@@ -245,13 +209,8 @@ import TopBar from '../../components/TopBar.astro';
             <p>No orders waiting to pack — this checks automatically, or tap to check now.</p>
             <button class="btn" id="retry">Check again</button>
             <a class="btn btn-ghost" href="/packer/scan" style="text-decoration: none;">Go to Scan</a>
-            <button class="btn btn-ghost" id="change-station">Switch station</button>
           </div>`;
-        document.getElementById('retry')?.addEventListener('click', (e) => startSession(currentStationToken, e.currentTarget as HTMLButtonElement));
-        document.getElementById('change-station')?.addEventListener('click', () => {
-          stopPolling();
-          renderStationPrompt();
-        });
+        document.getElementById('retry')?.addEventListener('click', (e) => startSession(e.currentTarget as HTMLButtonElement));
         return;
       }
 
@@ -345,6 +304,7 @@ import TopBar from '../../components/TopBar.astro';
 
       const linesEl = el.querySelector(`#lines-${order.packSessionId}`)!;
       for (const item of items) linesEl.appendChild(renderOrderLine(item, order.allPacked));
+      wireQtySteppers(el);
 
       el.querySelector('.order-select')?.addEventListener('change', () => {
         if (selectedOrderIds.has(order.orderId)) selectedOrderIds.delete(order.orderId);
@@ -374,15 +334,17 @@ import TopBar from '../../components/TopBar.astro';
       el.style.alignItems = 'center';
       el.style.gap = '12px';
       el.innerHTML = `
-        ${item.image_url ? `<img class="thumb" src="${item.image_url}" alt="" />` : '<div class="thumb"></div>'}
+        ${item.image_url ? `<img class="thumb thumb-lg" src="${item.image_url}" alt="" />` : '<div class="thumb thumb-lg"></div>'}
         <div class="stack" style="gap: 2px; flex: 1; min-width: 0;">
-          <span style="font-weight: 600;">${item.sku_name} <span style="color: var(--muted); font-weight: 400;">×${item.quantity_required}</span></span>
-          <span style="font-size: 0.8rem; color: var(--muted);">${item.sku_code}</span>
+          <span class="qty" style="font-size: 1.05rem;">${escapeHtml(item.sku_code)} <span style="color: var(--muted); font-weight: 400; font-size: 0.9rem;">×${item.quantity_required}</span></span>
+          <span style="font-size: 0.78rem; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${escapeHtml(item.sku_name)}</span>
         </div>
         ${
           orderDone
             ? `<span class="status-pill status-success">${item.quantity_packed}</span>`
-            : `<input type="number" class="qty-input" data-item="${item.order_item_id}" min="0" max="${item.quantity_required}" value="${item.quantity_required}" style="width: 70px; flex: 0 0 auto; min-height: 44px; text-align: center;" />`
+            : qtyStepperHtml(
+                `<input type="number" class="qty-input" data-item="${item.order_item_id}" min="0" max="${item.quantity_required}" value="${item.quantity_required}" style="width: 56px; flex: 0 0 auto; min-height: 44px; text-align: center;" />`
+              )
         }`;
       return el;
     }
@@ -477,35 +439,6 @@ import TopBar from '../../components/TopBar.astro';
     }
     function showError(msg: string) {
       lastError = msg;
-    }
-
-    // window.prompt() is unreliable in PWA/standalone contexts on mobile —
-    // this inline form is the real manual-entry fallback (§8). `suggested`,
-    // when the app already knows the expected code, gives a one-tap fill
-    // instead of retyping a long code.
-    function renderManualEntry(label: string, onSubmit: (value: string) => void, onCancel: () => void, suggested?: string) {
-      app.innerHTML = `
-        <div class="stack" style="flex:1; justify-content:center;">
-          <span class="eyebrow">${label}</span>
-          ${suggested ? `<button class="btn btn-primary" id="manual-suggested">Use ${suggested}</button>` : ''}
-          <input type="text" id="manual-input" autocomplete="off" autocapitalize="off" value="${suggested ?? ''}" />
-          <button class="btn${suggested ? ' btn-ghost' : ' btn-primary'}" id="manual-submit">Submit</button>
-          <button class="btn btn-ghost" id="manual-cancel">Cancel</button>
-        </div>`;
-      const input = document.getElementById('manual-input') as HTMLInputElement;
-      input.focus();
-      const submit = () => {
-        if (input.value.trim()) onSubmit(input.value.trim());
-      };
-      document.getElementById('manual-suggested')?.addEventListener('click', () => onSubmit(suggested!));
-      document.getElementById('manual-submit')?.addEventListener('click', submit);
-      document.getElementById('manual-cancel')?.addEventListener('click', onCancel);
-      input.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') {
-          e.preventDefault();
-          submit();
-        }
-      });
     }
 
     boot();

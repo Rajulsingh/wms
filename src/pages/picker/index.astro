@@ -17,7 +17,7 @@ import TopBar from '../../components/TopBar.astro';
   </div>
 
   <script>
-    import { escapeHtml } from '../../lib/ui';
+    import { escapeHtml, qtyStepperHtml, wireQtySteppers } from '../../lib/ui';
 
     interface Row {
       pick_task_id: string;
@@ -289,7 +289,7 @@ import TopBar from '../../components/TopBar.astro';
       } else {
         actionHtml = `
           <div class="row" style="margin-top: 10px; gap: 8px; align-items: center;">
-            <input type="number" class="qty-input" min="0" max="${remainingNeeded}" value="${remainingNeeded}" style="width: 90px; flex: 0 0 auto; min-height: 52px; text-align: center;" />
+            ${qtyStepperHtml(`<input type="number" class="qty-input" min="0" max="${remainingNeeded}" value="${remainingNeeded}" style="width: 64px; flex: 0 0 auto; min-height: 44px; text-align: center;" />`)}
             <button class="btn btn-primary" data-action="pick" style="flex: 1;">Picked</button>
           </div>
           <p style="font-size: 0.72rem; margin: 4px 0 0;">If you didn't get the full amount, lower the number before marking done — you'll be asked why.</p>
@@ -322,6 +322,8 @@ import TopBar from '../../components/TopBar.astro';
         ${actionHtml}`;
 
       const pendingIds = pendingRows.map((r) => r.pick_task_id);
+
+      wireQtySteppers(el);
 
       if (!done && !reasonState) {
         el.querySelector('[data-action="pick"]')?.addEventListener('click', () => {

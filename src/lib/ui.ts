@@ -13,6 +13,44 @@ export function escapeHtml(s: string): string {
 }
 
 /**
+ * Wraps a quantity `<input type="number">`'s own HTML with +/- buttons on
+ * either side — every "quantity picked"/"quantity packed" input in the app
+ * (picker's pick-quantity, packer's per-line pack-quantity) gets this same
+ * treatment rather than each page rolling its own. `inputHtml` must be the
+ * exact `<input .../>` markup, min/max/value attributes included — the
+ * buttons read those from the input itself at click time, not from a
+ * separate copy, so they can never drift out of sync with it.
+ */
+export function qtyStepperHtml(inputHtml: string): string {
+  return `<div class="row qty-stepper" style="width: auto; gap: 6px; align-items: center; flex: 0 0 auto;">
+    <button type="button" class="btn btn-ghost qty-step" data-qty-step="-1" style="width: 40px; min-height: 44px; padding: 0; flex: 0 0 auto;" aria-label="Decrease">−</button>
+    ${inputHtml}
+    <button type="button" class="btn btn-ghost qty-step" data-qty-step="1" style="width: 40px; min-height: 44px; padding: 0; flex: 0 0 auto;" aria-label="Increase">+</button>
+  </div>`;
+}
+
+/**
+ * Wires up every `.qty-step` button under `root` (call once after inserting
+ * HTML built with `qtyStepperHtml` into the DOM) — clamps to the sibling
+ * input's own min/max and fires a real `input` event so anything already
+ * listening for changes on that field sees a stepper tap the same as typing.
+ */
+export function wireQtySteppers(root: HTMLElement): void {
+  root.querySelectorAll<HTMLButtonElement>('.qty-step').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const input = btn.parentElement?.querySelector<HTMLInputElement>('input[type="number"]');
+      if (!input) return;
+      const step = Number(btn.dataset.qtyStep);
+      const min = input.min !== '' ? Number(input.min) : -Infinity;
+      const max = input.max !== '' ? Number(input.max) : Infinity;
+      const next = Math.min(max, Math.max(min, (Number(input.value) || 0) + step));
+      input.value = String(next);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+  });
+}
+
+/**
  * For actions that can't be predicted optimistically (their result depends
  * on a real network/DB call — importing orders, creating a batch, applying
  * an AWB) but still shouldn't leave a button looking inert after a tap.

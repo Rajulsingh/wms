@@ -29,6 +29,11 @@ if (redirectTo) return Astro.redirect(redirectTo);
 
     <div class="card stack">
       <h2>Logins</h2>
+      <p style="font-size: 0.85rem; color: var(--muted);">
+        Each packer's station is assigned here, once — they don't tap/scan into one on the floor
+        anymore. It's used for reports/reference on what they pack, not shown to them day to day.
+        A packer with no station set can't start packing until one's assigned.
+      </p>
       <div id="user-list" class="stack">Loading…</div>
     </div>
   </div>
@@ -39,11 +44,17 @@ if (redirectTo) return Astro.redirect(redirectTo);
       name: string;
       role: string;
       active: number;
+      station_id: string | null;
       created_at: string;
+    }
+    interface Station {
+      id: string;
+      code: string;
     }
 
     let warehouseId = '';
     let currentUserId = '';
+    let stations: Station[] = [];
 
     async function api(path: string, body?: unknown, method?: string) {
       const res = await fetch(path, {
@@ -60,16 +71,28 @@ if (redirectTo) return Astro.redirect(redirectTo);
       return (document.getElementById(id) as HTMLInputElement).value.trim();
     }
 
+    function stationOptionsHtml(currentId: string | null): string {
+      return (
+        `<option value="">No station</option>` +
+        stations.map((s) => `<option value="${s.id}" ${s.id === currentId ? 'selected' : ''}>${s.code}</option>`).join('')
+      );
+    }
+
     async function loadUsers() {
       const users: UserRow[] = await api(`/api/admin/users?warehouseId=${warehouseId}`);
       const list = document.getElementById('user-list')!;
       list.innerHTML = users
         .map(
           (u) => `
-        <div class="item-row">
+        <div class="item-row" data-user-id="${u.id}">
           <span class="name">${u.name}</span>
           <span class="status-pill ${u.role === 'admin' ? 'status-warning' : 'status-progress'}">${u.role}</span>
           <span class="status-pill ${u.active ? 'status-success' : 'status-neutral'}">${u.active ? 'active' : 'inactive'}</span>
+          ${
+            u.role === 'packer'
+              ? `<select class="station-select" style="width: auto; min-height: 36px;">${stationOptionsHtml(u.station_id)}</select>`
+              : ''
+          }
           ${u.id === currentUserId ? '' : `<button class="btn btn-ghost" style="width:auto; min-height:36px;" data-id="${u.id}" data-active="${u.active}">${u.active ? 'Deactivate' : 'Reactivate'}</button>`}
         </div>`
         )
@@ -84,6 +107,22 @@ if (redirectTo) return Astro.redirect(redirectTo);
             await loadUsers();
           } catch (err) {
             alert((err as Error).message);
+          }
+        });
+      });
+
+      // Each packer's station is a fixed property of their account now, set
+      // here rather than something they tap/scan into on the floor — see
+      // HANDOFF.md.
+      list.querySelectorAll('.station-select').forEach((select) => {
+        select.addEventListener('change', async () => {
+          const row = (select as HTMLElement).closest('[data-user-id]') as HTMLElement;
+          const value = (select as unknown as HTMLSelectElement).value;
+          try {
+            await api('/api/admin/users', { userId: row.dataset.userId, stationId: value || null }, 'PATCH');
+          } catch (err) {
+            alert((err as Error).message);
+            await loadUsers();
           }
         });
       });
@@ -123,6 +162,11 @@ if (redirectTo) return Astro.redirect(redirectTo);
       }
       warehouseId = me.user.warehouseId;
       currentUserId = me.user.id;
+      try {
+        stations = await api(`/api/admin/stations?warehouseId=${warehouseId}`);
+      } catch {
+        stations = [];
+      }
       await loadUsers();
     }
 

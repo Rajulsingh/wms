@@ -926,9 +926,52 @@ this as a better near-term path than waiting on the still-ungranted SP-API role 
   to be, but this is still unverified against a genuine Seller Central export — check this first
   the next time a real pickup goes through this path.
 
+## Recently done (2026-09-20, a twenty-first pass) — station is now a fixed account property, pack list matches pick list, +/- steppers everywhere
+
+Three requests: (1) packers were tapping/scanning into a packing station every time they moved
+from Pick to Pack — "each packer id is assigned a station and it does not need to show everywhere
+its just for reports data and references." (2) the pack list's item rows showed product name first,
+SKU code second, small thumbnail — inconsistent with the pick list's SKU-code-led, big-thumbnail
+convention from an earlier pass. (3) every quantity-picked/quantity-packed input should have +/-
+buttons, not just a bare number field.
+
+- **Station is now `users.station_id`** (migration `0015`), assigned once by admin in `/admin/users`
+  (a new dropdown next to each packer row, `packing_stations`-backed, PATCHable independently of
+  active/inactive) rather than a `stationQrToken` the packer scans/types into every session.
+  `getMyPackBatches` (`lib/packer.ts`) and `/api/packer/start-session` now take the station straight
+  off the authenticated user record — no more "unknown station" verification, since it's no longer
+  client-supplied. `/packer` (Pack tab) dropped its entire "Tap in" screen (`renderStationPrompt`,
+  the scan/manual-entry/pick-a-station-from-a-list flow, `renderManualEntry` with it — all dead code
+  once nothing calls it) — landing on Pack now goes straight to the packing list, or a plain message
+  if the account has no station assigned yet. The now-unused `/api/packer/stations.ts` (packer-facing
+  station list) was deleted; `/api/admin/stations.ts` (admin-facing) is unaffected.
+- **Pack list item rows now match the pick list's card style**: `thumb` → `thumb-lg`, SKU code as the
+  bold primary line (was the product name), product name as the muted secondary line underneath (was
+  the SKU code) — same layout `picker/index.astro`'s `renderSkuGroup` already established. Also fixed
+  an incidental gap while touching this code: `sku_name`/`sku_code` were being interpolated into
+  `innerHTML` unescaped (a real stored-XSS surface for catalog data pulled from Amazon) — now routed
+  through `escapeHtml` like every other user/catalog-derived string in this app.
+- **+/- steppers on every pick/packed quantity input** — the only two: picker's per-SKU-group pick
+  quantity, packer's per-line pack quantity. New shared `qtyStepperHtml`/`wireQtySteppers` in
+  `lib/ui.ts` (wraps the exact same `<input>` markup with two buttons, clamps to that input's own
+  min/max, fires a real `input` event) rather than each page rolling its own — reused as-is in both
+  `picker/index.astro` and `packer/index.astro`, wired once per re-rendered card.
+- **Real production issue caught before it became a silent outage**: migration `0015` alone would
+  have locked out every real packer the moment it deployed — production had **zero packing stations**
+  and both active packer accounts (`packer`, `Anshul`) had no station to inherit. Caught by checking
+  prod state before calling this done, not by a bug report. Fixed with the user's explicit go-ahead:
+  created one default `Station 1` and assigned both to it (station/assignment is trivially editable
+  going forward from `/admin/users` and `/admin/warehouse` — this was just an unblock, not a design
+  decision about how many stations they actually have).
+- **Verified live in dev** end-to-end: picked a full real batch of 13 orders (steppers used and
+  confirmed functioning, no over-pick regressions), confirmed Pack loaded straight to the list with
+  no station prompt, confirmed the new card style and steppers render and work on real order/SKU
+  data, marked an order packed successfully. Local test-data reset back to `pending` via the existing
+  reset tool afterward.
+
 ## Next steps — a prioritized plan
 
-Rewritten 2026-09-20 (twenty passes across two days — see "Recently done" entries above for the
+Rewritten 2026-09-20 (twenty-one passes across two days — see "Recently done" entries above for the
 full story behind each). What's actually not done yet, ordered by what's blocking vs. not. See
 "Open items" below for full detail on each.
 

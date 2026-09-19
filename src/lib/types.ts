@@ -12,6 +12,7 @@ export interface User {
   role: UserRole;
   pin_hash: string;
   active: number;
+  station_id: string | null;
   created_at: string;
 }
 

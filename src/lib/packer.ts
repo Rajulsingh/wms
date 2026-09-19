@@ -125,10 +125,13 @@ export interface MyPackBatches {
 }
 
 /**
- * Verifies the station QR/barcode (packing-station equivalent of the rack
- * check, §4/§8), then returns every batch this packer currently has open at
- * this station, plus a sweep for anything freshly ready. The packer page
- * renders all of them on one continuous page (no "get next batch" click
+ * Returns every batch this packer currently has open at their assigned
+ * station, plus a sweep for anything freshly ready. `stationId` comes from
+ * the packer's own account (`users.station_id`, assigned once by admin in
+ * Users) rather than a scanned QR code every session — station is now
+ * purely a fixed property of who's logged in, kept for reports/reference on
+ * `pack_sessions`, not a step a packer walks through. The packer page
+ * renders all batches on one continuous page (no "get next batch" click
  * gate) and reuses this same call for its 8s poll — so the sweep below runs
  * on every poll, not just when the packer has zero batches, otherwise a
  * batch that finishes picking mid-walk would sit invisible until everything
@@ -137,20 +140,17 @@ export interface MyPackBatches {
  * here is safe to call every tick — it naturally stops once nothing new is
  * ready. See HANDOFF.md.
  */
-export async function getMyPackBatches(db: D1Database, userId: string, stationQrToken: string, warehouseId: string): Promise<MyPackBatches> {
-  const station = await db.prepare(`SELECT id FROM packing_stations WHERE qr_token = ? AND warehouse_id = ?`).bind(stationQrToken, warehouseId).first<{ id: string }>();
-  if (!station) throw new PackerFlowError('unknown_station', 'This station QR code is not recognized');
-
-  const batchIds = await getMyActivePackBatchIds(db, station.id, userId);
+export async function getMyPackBatches(db: D1Database, userId: string, stationId: string, warehouseId: string): Promise<MyPackBatches> {
+  const batchIds = await getMyActivePackBatchIds(db, stationId, userId);
   for (;;) {
-    const claimed = await claimNextPackBatch(db, userId, station.id, warehouseId);
+    const claimed = await claimNextPackBatch(db, userId, stationId, warehouseId);
     if (!claimed) break;
     batchIds.push(claimed);
   }
 
   const batches: PackBatchState[] = [];
   for (const id of batchIds) batches.push(await getPackBatchState(db, id));
-  return { stationId: station.id, batches };
+  return { stationId, batches };
 }
 
 export async function getPackBatchState(db: D1Database, pickBatchId: string): Promise<PackBatchState> {
