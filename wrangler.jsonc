@@ -1,0 +1,24 @@
+{
+	"$schema": "./node_modules/wrangler/config-schema.json",
+	"compatibility_date": "2026-09-18",
+	"compatibility_flags": ["global_fetch_strictly_public"],
+	"name": "wms",
+	"main": "src/worker.ts",
+	"triggers": {
+		"crons": ["*/5 * * * *"]
+	},
+	"assets": {
+		"directory": "./dist",
+		"binding": "ASSETS"
+	},
+	"observability": {
+		"enabled": true
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "wms-db",
+			"database_id": "d71d4717-e454-4fb6-ad12-34811583b577"
+		}
+	]
+}

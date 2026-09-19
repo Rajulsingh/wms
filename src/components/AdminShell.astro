@@ -1,0 +1,40 @@
+---
+import Base from '../layouts/Base.astro';
+import AdminSidebar from './AdminSidebar.astro';
+
+interface Props {
+  title: string;
+  current: string;
+}
+const { title, current } = Astro.props;
+---
+
+<Base title={title}>
+  <div class="admin-shell">
+    <AdminSidebar current={current} />
+    <div class="admin-content">
+      <header class="admin-topbar">
+        <div class="row" style="align-items: center; gap: 10px;">
+          <button type="button" class="admin-sidebar-toggle" id="admin-sidebar-toggle-btn" aria-label="Open menu">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+              <path d="M4 7h16M4 12h16M4 17h16"></path>
+            </svg>
+          </button>
+          <h1 class="admin-topbar-title">{title}</h1>
+        </div>
+        <div class="admin-topbar-actions">
+          <slot name="actions" />
+        </div>
+      </header>
+      <main class="admin-main">
+        <slot />
+      </main>
+    </div>
+  </div>
+</Base>
+
+<script>
+  document.getElementById('admin-sidebar-toggle-btn')?.addEventListener('click', () => {
+    (window as unknown as { __toggleAdminSidebar?: () => void }).__toggleAdminSidebar?.();
+  });
+</script>

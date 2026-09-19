@@ -1,0 +1,443 @@
+# WMS — Project Handoff
+
+Last updated: 2026-09-19. Read this first in any new session on this project. This doc was
+consolidated on this date from a much longer session-by-session log — if you're looking for the
+blow-by-blow of *how* something was built rather than what's true now, that detail still exists
+in this file's edit history, but the goal here is "what's actually true right now," not a diary.
+
+## What this is
+
+A custom warehouse management system for **ecomglider** (www.ecomglider.com), an Amazon.in
+seller. Astro (frontend + API routes) on Cloudflare Workers, D1 (SQLite) for data. Deployed and
+live, actively used against real orders.
+
+**Live app:** https://wms.mailrajulsingh-in.workers.dev
+**Repo:** this directory (`wms/`) is **not a git repository** — `git status` fails with "not a
+git repository." There is no version control on this project. Worth offering the user a
+`git init` + first commit before making further changes; right now every edit is only as safe as
+the filesystem.
+**Cloudflare account:** Mailrajulsingh.in@gmail.com's Account (`4b311214e2fe3391a39f9f315aa10382`)
+**D1 database:** `wms-db` (`d71d4717-e454-4fb6-ad12-34811583b577`)
+**Demo logins:** admin / `1234`, packer / `1111` (seeded in `scripts/seed.sql`, local dev only)
+
+## Next steps — a prioritized plan
+
+Ordered by what's actually blocking vs. what's just not-yet-built. See "Open items" below for
+full detail on each.
+
+1. ~~**UI simplification**~~ — **done** (2026-09-19). The user shared Amazon Seller Flex
+   screenshots (dashboard, pick-list detail with a stepper, product-thumbnail table) and the
+   entire `/admin/*` section was rebuilt around them: a persistent dark sidebar
+   (`AdminSidebar.astro`) + content top bar (`AdminShell.astro`) replaced the old hamburger-
+   dropdown/`.screen` shell; the dashboard order list became a real table with thumbnails and a
+   KPI stat-card row; the Pick List page got a batch-lifecycle stepper (Create → Picking →
+   Picked — deliberately *not* a literal Create/Pack/Ship, since packing/shipping happen per
+   order/shipment in this schema, not per batch), a real scannable Code128 barcode
+   (`jsbarcode`, client-side only) encoding the batch ID, and a scan-to-open control reusing
+   `scanOnce()` from `scanner-client.ts`. `AdminNav.astro` was deleted (fully superseded).
+   **Scope was `/admin/*` only** — `/picker`, `/packer`, `/login` and `TopBar.astro` were
+   deliberately left untouched (verified in-browser); that mobile tap-first floor UI is a
+   separate, already-settled decision, not part of this pass. See "Design system" below for the
+   new component names. **Not done, follow-up if asked**: reusing the new `.stepper-bar` on the
+   `ship`/`bulk-ship` wizard flows (they still use their original sequential-render pattern,
+   just re-shelled into the new sidebar layout) — flagged as a nice-to-have in the original plan,
+   not required to hit the requested look. Also: **this project still has no git repo** — now
+   that a large multi-file change has landed with no version control under it, `git init` +
+   first commit is worth doing before any further edits.
+2. **Get the Amazon Easy Ship SP-API role granted.** This is the one thing blocking real use of
+   shipping (single-order, bulk, everything). It's on the user, not something to keep
+   investigating from this end — check Seller Central's app-authorization page for an "Easy Ship"
+   scope. Once granted, the very first thing to do is a live smoke test of `/admin/ship` on one
+   real order, watching closely for: the real `labelFileType` Amazon returns, which page of the
+   combined PDF is actually the label (currently assumes last), and whether the
+   `DocumentReportReferenceID` regex parse in `checkEasyShipFeed` actually matches Amazon's real
+   feed-processing-report format. None of that has ever been exercised against a live account.
+3. **Real box sizes.** Only one demo box exists. Needs the user to enter their actual box
+   dimensions in the "Manage" menu → Zones/racks/stations, or wherever box sizes ended up (check
+   `/admin/settings`).
+4. **Confirm the ship-from address is real**, not the placeholder used during testing — check
+   `/admin/settings` before the first real label purchase.
+5. **Decide the 30-day data-disposal scope** (see open item, below) — this was *committed to
+   Amazon in writing* with no enforcement code yet. Needs three scoping answers from the user
+   before it can be built safely; the cron infrastructure already exists (`src/worker.ts`) so the
+   actual job is easy to add once those answers exist — it can piggyback on the same scheduled
+   handler pattern as the Amazon sync, doesn't need new plumbing.
+6. **Smaller, ask-before-building items**: individually-strengthened admin auth (currently same
+   weak PIN as floor workers), a public privacy policy URL for ecomglider.com, whether the
+   picker/packer "no mandatory scanning" philosophy needs any adjustment now that pickup-slot
+   labels exist, and what should happen when an Amazon cancellation lands on an order that's
+   already been fully picked/packed (currently just flagged via an exception event for manual
+   putback — see "Automatic Amazon sync" below). None of these are urgent; don't build them
+   unprompted.
+7. **Minor cleanup, low priority**: `src/pages/api/picker/scan-item.ts` (and `verifyItemScan` in
+   `picker.ts`) is dead code from before the picker dropped mandatory scanning — nothing calls
+   it. Safe to delete next time you're in that area, not worth a dedicated pass on its own.
+   `Warehouse` type in `types.ts` is missing the `ship_from_*` columns (cosmetic, nothing
+   breaks).
+8. **If the user says the UI still looks off somewhere else**, the fix pattern is already
+   established (see "Design system" below) — the admin orders table was converted from a
+   wrapping `<table>` to `.order-card` rows; `/admin/inventory` and `/admin/ship`'s own tables
+   use the same old wrapping-table pattern and would benefit from the identical treatment if
+   flagged.
+
+Already done this session, not repeated here — see "What's built" for detail: the Cloudflare
+Cron Trigger (confirmed firing in production, real orders synced to `shipped`), automatic order
+fetching, and the order-status filter tabs on `/admin`.
+
+## Read this before touching anything
+
+- The original spec (heavy NFC + per-unit barcode scanning) was **explicitly rejected by the
+  user** as too complex for real volume ("i cant barcode every single product unit"). Both
+  picking and packing now use tap-to-confirm against a photo/name, not scanning. **Do not
+  reintroduce mandatory per-item scanning** without the user asking for it again. The one
+  exception is the AWB/shipping-label scan at the end of packing — that's a real system-generated
+  barcode, not a product barcode, and the safeguard reasoning for it still holds.
+- Two roles only: `admin` and `packer` (the `role` column is a CHECK constraint enforcing this).
+  `packer` covers both picking and packing. Don't reintroduce `supervisor`/`picker`/`dispatcher`.
+  Named per-person logins exist (`/admin/users`) alongside the two original shared logins —
+  both work, neither was removed.
+- **Never purchase a real Amazon shipping label (single or bulk) without the user's explicit
+  go-ahead in that session.** It spends real money / makes a real pickup commitment. Getting
+  pickup slots is free and safe to test; scheduling is not.
+- Amazon SP-API credentials in `.dev.vars` are **production**, not sandbox
+  (`AMAZON_SPAPI_SANDBOX=false`). Calls hit the user's real seller account and real order data.
+- The shipping integration targets Amazon's **Easy Ship** program (Amazon arranges pickup), not
+  the classic Merchant Fulfillment Network (MFN) API. This was a real, hard-won discovery — the
+  original build targeted MFN and 403'd for reasons that looked like a permissions problem but
+  were actually "wrong API entirely." The MFN code (`getEligibleShippingServices`,
+  `purchaseShipment` in `amazon.ts`; `getRatesForOrder`, `purchaseLabelForOrder` in
+  `shipping.ts`; `/api/admin/shipping/rates.ts` and `purchase.ts`) is left in place, fully
+  working, but **nothing in the UI calls it anymore**. Don't be confused into "fixing" its 403
+  again — that's not the bug.
+- If you paste secrets into chat, the user will (rightly) push back — write them straight to
+  `.dev.vars` / `wrangler secret put` instead, never echo values back.
+
+## Architecture
+
+- **Astro** (SSR, `output: 'server'`) + **@astrojs/cloudflare** adapter, deployed as a
+  Cloudflare Worker via `wrangler deploy`.
+- **Custom Worker entrypoint** (`src/worker.ts`, replacing the adapter's default
+  `@astrojs/cloudflare/entrypoints/server`) — needed to add a `scheduled()` handler alongside
+  `fetch` for the Cloudflare Cron Trigger (see "Automatic Amazon sync" below). Wires in the
+  adapter's own `fetch` handler via the public `@astrojs/cloudflare/handler` subpath export
+  (`{ handle }`), so the HTTP side is untouched. `wrangler.jsonc`'s `main` points here instead of
+  the adapter's package path. **This works because `@astrojs/cloudflare` v14+ wraps
+  `@cloudflare/vite-plugin`**, which reads `wrangler.jsonc`'s `main` at Astro-build time and
+  bundles whatever's there through the real Vite pipeline (resolving the adapter's internal
+  virtual modules correctly) — confirmed by inspecting `dist/server/entry.mjs` after a build and
+  seeing both `fetch` and the custom `scheduled` handler correctly bundled together. If a future
+  Astro/adapter major version changes this integration, re-verify by checking that same built
+  file rather than assuming the pattern still holds.
+- **D1** for all relational data (`migrations/0001`–`0009`, applied in order — `--local` and
+  `--remote` are separate databases, apply both whenever you add one; local dev DB lives under
+  `.wrangler/state`).
+- **PIN-based session auth**, stateless signed cookies (HMAC), `src/lib/auth.ts`. No password
+  manager, no OAuth — intentionally minimal for a small warehouse team.
+- **No Durable Objects** (free Workers plan). Inventory locking is optimistic concurrency on
+  `inventory.version` (compare-and-swap), `src/lib/inventory.ts`. Documented upgrade path if
+  write contention on a hot SKU ever becomes real — not needed yet.
+- **Scanning**: `src/lib/scanner-client.ts` wraps `@zxing/browser` (pure-JS, works on Safari/iOS
+  where the native `BarcodeDetector` doesn't exist). Only used now for packing-station tap-in and
+  the AWB scan at the end of packing — not for item-level picking or packing anymore.
+- **PDF handling**: `pdf-lib` (label stamping, `src/lib/label-stamp.ts`) and `fflate` (unzipping
+  the bulk-schedule label ZIP, `src/lib/shipping.ts`) — both pure-JS, Workers-compatible, no
+  `nodejs_compat` flag needed.
+- Bindings: `env.DB` (D1), `env.ASSETS`. Reached via `import { env } from 'cloudflare:workers'` —
+  **not** `Astro.locals.runtime.env`, which doesn't exist in this Astro version and will throw.
+
+## Data model
+
+Core chain: `warehouses → zones → locations (racks/bins) → inventory (SKU×location, many-to-
+many) → skus`. Orders: `orders → order_items → pick_batches → pick_tasks → cart_slots`.
+Packing: `pack_sessions → packages → shipments → awbs`. Inbound: `inbound_receipts →
+inbound_receipt_lines` (increments `inventory.quantity_on_hand` directly — the counterpart to
+`reserveInventory`, which only ever takes stock out).
+
+Full schema is the migrations, read in order — each one is a real fix or feature, not a rewrite.
+Notable ones:
+- `0003` — `cart_slots` uniqueness scoped per-batch, not per-cart-lifetime. The migration itself
+  needed a detach/rebuild/reattach workaround for a D1 limitation (can't toggle
+  `PRAGMA foreign_keys` mid-transaction) — the pattern's in the file if another table ever needs it.
+- `0005` — shipping-label fields (ship-from address, box sizes, label storage) — originally built
+  for MFN, largely reused by Easy Ship (see below).
+- `0006` — `UNIQUE` index on `users.name` for named logins (a plain index, not a table rebuild —
+  `name` isn't referenced by any FK).
+- `0007` — `inbound_receipts`/`inbound_receipt_lines` for receiving.
+- `0008` — Easy Ship state machine columns on `shipments` (`package_identifier`,
+  `handover_slot_id/start/end/method`, `scheduled_package_id`, `label_status`, `label_feed_id`,
+  `label_report_id`) plus `skus.price` (admin-set list/MRP price).
+- `0009` — `skus.reorder_point` for low-stock alerts.
+
+## Design system
+
+Warm, high-contrast, built for a warehouse floor (min 56px tap targets, system font stack — no
+web-font request on unreliable warehouse Wi-Fi). Lives in `src/styles/global.css`. The
+56px-tap-target rule is specifically a `/picker`/`/packer` floor requirement — the `/admin/*`
+shell below targets desktop admin use and doesn't follow it.
+
+- **Admin shell** (`/admin/*` only, added 2026-09-19 during the Seller-Flex-style redesign) —
+  `AdminShell.astro` (`Base` + persistent sidebar + content top bar + `<main>` slot) and
+  `AdminSidebar.astro` (dark, grouped nav links with icons; off-canvas drawer below ~900px via
+  `.admin-sidebar`/`.admin-sidebar-toggle`). Every admin page is now `<AdminShell title="..."
+  current="...">...</AdminShell>` — don't reintroduce the old `Base`/`TopBar`/`AdminNav`/
+  `.screen` boilerplate this replaced (`AdminNav.astro` no longer exists). Sidebar is always
+  dark navy regardless of the light/dark app theme (`--sidebar-*` tokens) — it's chrome, not
+  content, matching Seller Flex's own always-dark sidebar. New reusable component classes:
+  `.stat-grid`/`.stat-card` (KPI row, colored left border), `.stepper-bar`/`.stepper-step`
+  (horizontal step tracker — reusable for any linear status progression, not just pick
+  batches), `.table-thumb` (product image sized for a `<td>`, vs. `.thumb` for flex/`.item-row`
+  contexts), `.truncate-cell` (ellipsis + `title` attr, used for the dashboard's product
+  column), `.scan-row`/`.barcode-wrap` (scan-to-open input + rendered Code128 barcode, see Pick
+  List page). If another admin screen needs a KPI row, a step tracker, or a thumbnail column,
+  reuse these rather than inventing new ones.
+- **Explicit light/dark switch**, not system-preference-following. `Base.astro` defaults to
+  light and renders a fixed sun/moon toggle (top-right, every page) that sets `data-theme` on
+  `<html>` and persists to `localStorage['wms-theme']`. An inline `<script is:inline>` in
+  `<head>` applies the stored theme before first paint (no flash). `--accent: #ad3e0f` (light) /
+  `#e8823f` (dark) — a rust/amber that reads as ecomglider's own tool rather than a generic
+  template, used deliberately sparingly (primary actions, active states) not as a wash.
+- **Elevation**: `--surface` (cards) is meaningfully lighter than `--bg` in both themes;
+  `--surface-inset` (darker than `--surface`) is for inputs specifically, so they read as
+  recessed rather than disappearing into the card around them. `--shadow-btn-primary` is a crisp
+  near-black shadow with a faint accent tint — not a colored glow (an earlier version bled the
+  accent color at near-full opacity and read as a cheap template effect; fixed).
+- **Radius scale**, shape borrowed from Vercel's Geist materials docs (small controls get a
+  tighter radius than large surfaces, values are original): `--radius-sm` (8px, buttons/inputs)
+  < `--radius` (12px, cards) < `--radius-lg` (16px, the auth card).
+- **Status pills**: `.status-pill` + `.status-neutral/-progress/-success/-warning`, small colored
+  dot + text, used for order/pick-task status everywhere.
+- **Navigation**: `src/components/AdminNav.astro` — a hamburger icon (`<details>/<summary>`,
+  no JS needed) opening a dropdown with every admin page, current page highlighted. Used on all
+  admin pages via `<AdminNav current="..." />` in `TopBar`'s slot. This replaced an earlier
+  pattern of hand-written `<a class="pill">` links that multiplied per page and wrapped onto a
+  second line once there were enough admin pages — if you're adding a new admin page, add it to
+  `AdminNav`'s link list, don't hand-roll a nav pill.
+- **Tables vs. cards**: data tables (`<table>` + `.table-scroll` for horizontal overflow) are
+  fine for admin screens meant to be scanned/scrolled (inventory, pick-list). The admin orders
+  list specifically uses `.order-card` rows instead — a table there forced horizontal scroll and
+  mid-word wrapping on real (long) Amazon product titles. If another screen gets flagged as
+  "looks cheap" for the same reason, reuse `.order-card`, don't invent a new pattern.
+- `src/components/TopBar.astro` — brand mark + "ecomglider" wordmark + page section label, used
+  on every screen including login (`.auth-shell`/`.auth-card`).
+
+## What's built (current state, verified live)
+
+- **Amazon order import** (`amazon.ts`, `orders.ts`) — SP-API Orders API, pulls real orders from
+  the live account. Auto-creates SKUs (with real title + image from Amazon's Catalog Items API)
+  for SellerSKUs not seen before. Region-aware endpoint routing (`MARKETPLACE_REGION` —
+  India is EU-region, not NA; extend this map if a new marketplace 403s the same way).
+- **Automatic Amazon sync** (`src/worker.ts`, `src/lib/sync-job.ts`, `src/lib/amazon-sync.ts`) —
+  a Cloudflare Cron Trigger fires every 5 minutes and, per warehouse: pulls new orders (same as
+  the manual "Import from Amazon" button, then auto-batches them), and separately checks Amazon's
+  *current* `OrderStatus` for every local Amazon order that isn't yet `shipped`/`cancelled`
+  (`fetchOrderStatuses` in `amazon.ts`, using the `AmazonOrderIds` targeted-lookup parameter, not
+  a broad re-pull). Amazon is treated as authoritative **only for the two terminal states**:
+  - `Shipped` → local `status` is set to `'shipped'`. This is the **only** place that transition
+    ever happens — nothing in the pick/pack flow sets it directly, since "shipped" is a real
+    carrier event our own floor process can't claim on its own. (Before this existed, orders
+    topped out at `ready_to_ship` forever — a real, now-fixed gap.)
+  - `Canceled` → local `status` is set to `'cancelled'`, and any reservation for units **not yet
+    physically picked** is auto-released back to available stock (pick_tasks still
+    `pending`/`location_confirmed` get cancelled, their inventory reservation released via
+    `releaseReservation`). Units already picked are left alone inventory-wise — the system has no
+    idea which cart/station they're physically sitting in, so it can't safely auto-return them —
+    instead it logs an `order_cancelled` exception event so a human does the physical putback.
+  Everything **before** those two terminal states (batched/picking/picked/packing/packed/
+  ready_to_ship) stays under our own floor-progress tracking and is never regressed by a coarser
+  Amazon status — Amazon showing `Unshipped` doesn't mean anything to us once we've already
+  picked it. **Confirmed firing in production**: watched `wrangler tail` catch the scheduled
+  event (`"*/5 * * * *" @ 1:30:41 PM - Ok`), then found real `order.shipped_sync` audit rows
+  (`user_id: null`, the sync job's signature) created a few seconds later, and confirmed 5 real
+  Amazon orders actually flipped to `status = 'shipped'` in production as a direct result — not
+  a simulated/local test, the real thing running unattended.
+- **Automatic pick-batch creation** — batches are created the moment orders arrive (Amazon import
+  or manual entry), not on a manual button click. `autoBatchNewOrders` in `orders.ts`, wired into
+  both order-arrival API routes. The manual "Create pick batch" button still exists for explicit
+  re-checks (e.g. after receiving more stock for a previously-short order). Batch creation itself
+  still leaves out any order that can't be *fully* reserved (doesn't partially reserve) — that's
+  deliberate, not a bug; the failure message now says exactly which SKU is short and links to
+  Receiving instead of a generic "couldn't batch."
+- **Picking** (`/picker`, `picker.ts`) — flat, zone/bin-sorted list across the whole batch, no
+  scanning, tap "Picked" per line with photo/name shown. "Report issue" for damaged/short-pick.
+  Resumable. Admin printable version at `/admin/pick-list`.
+- **Packing** (`/packer`, `packer.ts`) — station tap-in, tap-to-confirm per item (same pattern as
+  picking, no scanning — `markPackItem`/`POST /api/packer/mark-item`), then AWB scan/manual-entry
+  to apply the shipping label with a hard block on mismatch/duplicate.
+- **Pick/Pack tabs + notifications** — `/picker` and `/packer` are separate routes but present as
+  tabs (`.tab-pill` in `TopBar`), each with a red badge dot when work is waiting on the *other*
+  tab. `GET /api/packer/work-summary` (packer role) returns `{ pickable, packable }` counts,
+  polled every 10s from both pages. Never shows price — see below.
+- **Live auto-refresh** — polling, not push. `/admin` refreshes its orders list every 12s;
+  `/picker`'s "No batches" and `/packer`'s "No orders waiting" screens poll every 8s. All skip
+  the tick when the tab is backgrounded (`document.hidden`). Good enough for this team's volume;
+  if it ever needs to feel more instant, Durable Objects WebSockets is the documented upgrade
+  path (not needed yet).
+- **Inbound receiving** (`/admin/inbound`, `inbound.ts`) — type-ahead product search (title or
+  SKU code, results show photo + name + code + price) with a "can't find it, create new SKU"
+  fallback. Puts stock directly into a bin, creating the SKU×location `inventory` row if it
+  doesn't exist yet (`INSERT ... ON CONFLICT DO UPDATE`).
+- **Inventory management** (`/admin/inventory`) — every SKU×location row with on-hand/reserved,
+  editable on-hand (a direct correction, not a reservation-flow operation — for miscounts/damage
+  write-offs, every edit audit-logged with before/after) and editable price.
+- **Reports dashboard** (`/admin/reports`) — available/reserved stock per SKU, 7-day and 30-day
+  pick velocity, an editable reorder point per SKU driving a low-stock banner (default threshold
+  5 units if unset), and a daily-units-picked table. "Outbound" here means units *picked*
+  (`pick_tasks.picked_at`) — the closest proxy this schema has to a ship date; there's no
+  separate per-unit ship-confirmation timestamp. If the user ever wants true ship-date tracking,
+  that's a new column, not a different query.
+- **Admin management pages** — `/admin/users` (named per-person logins, create/deactivate,
+  4-8-digit PIN, never a hard delete), `/admin/warehouse` (CRUD for zones, locations/bins,
+  packing stations), `/admin/settings` (ship-from address, box sizes).
+- **Order status filter tabs** on `/admin` — All / New / Processing / Ready to ship / Shipped /
+  Cancelled, each with a live count, filtering the same already-fetched order list client-side
+  (no extra API call per tab). The grouping buckets our more granular internal statuses under
+  standard-WMS-style labels (`STATUS_GROUPS` in `admin/index.astro`) — e.g. "Processing" covers
+  batched/picking/picked/packing/packed/partial. Purely a display filter, doesn't change what
+  data is fetched or how status transitions work.
+- **Shipping — Easy Ship** (`amazon.ts`, `shipping.ts`, `/admin/ship`, `/admin/bulk-ship`) —
+  schemas confirmed against Amazon's published SP-API reference and (for the bulk endpoint) an
+  actual Go SDK's generated types, not guessed. **Blocked on SP-API role grant, never exercised
+  live** — see "Next steps" above.
+  - Single order: `listHandoverSlots` → admin picks a slot → `scheduleEasyShipPackage` (no label
+    in the response) → separate async Feeds/Reports pipeline to actually retrieve the label PDF
+    (`requestEasyShipDocuments`/`checkEasyShipFeed`/`checkEasyShipReport`, polled from the UI,
+    never awaited synchronously in one request — Amazon's processing time is unbounded).
+  - Bulk (`/admin/bulk-ship`): `createScheduledPackageBulk` schedules multiple orders in one call
+    and returns `printableDocumentsUrl` — a ZIP of every label, generated synchronously, no
+    Feeds/Reports polling needed for this path. The ZIP is unzipped (`fflate`) and PDF entries
+    are matched to orders **positionally** (an unconfirmed assumption); if the entry count
+    doesn't match the order count, every scheduled shipment falls back to sharing the raw,
+    unstamped ZIP rather than risk mis-assigning a label.
+  - Label stamping: `stampPackageIdentifier` in `label-stamp.ts` prints an admin-entered package
+    identifier (not SKU/qty — that was the original ask, superseded when the user clarified they
+    wanted Amazon's own "Package Identifier" field instead) bottom-right on the label PDF.
+- **Price visibility**: `skus.price` is an admin-set list/MRP price (not Amazon's actual
+  per-order sold price, which isn't captured). Shown on `/admin` and `/admin/inventory`.
+  **Packers never see it** — enforced by simple omission (picker/packer SELECT queries never
+  include `price`); there's no central role-based field filter, so any new packer-facing query
+  that joins `skus` must deliberately leave price out.
+
+## Known bugs fixed / lessons (worth knowing, not just history)
+
+- **D1 FK deletion order** — when deleting an order and everything under it, the safe order is:
+  `exception_events` → `returns` → `awbs` → `shipments` → `packages` → `pick_tasks` →
+  `cart_slots` → `pack_sessions` → `pick_batches` → `order_items` → `orders`. `cart_slots` and
+  `pick_tasks` are easy to get backwards (`pick_tasks.cart_slot_id` references `cart_slots`, so
+  `pick_tasks` must go first) — check migration `0001`'s `REFERENCES` clauses if unsure. D1 runs
+  a whole `--file` as one transaction and rolls back cleanly on any FK violation, so a failed
+  attempt is safe to just fix and retry.
+- **D1 result typing isn't runtime-validated** — a camelCase TS interface over a snake_case D1
+  query result type-checks fine and silently breaks every field access at runtime. Make interface
+  field names match SQL aliases *exactly*. (Found via `packer.ts` once; keep double-checking new
+  raw-SQL queries by eye.)
+- **Bind-argument count mismatches** aren't caught by `astro check`, only at runtime (`Wrong
+  number of parameter bindings`) — double-check placeholder count against `.bind()` args on every
+  new raw insert.
+- **`Astro.locals.runtime.env` doesn't exist** in this Astro version — use
+  `import { env } from 'cloudflare:workers'`.
+- **`cart_slots` uniqueness must be scoped per-batch**, not per-cart-lifetime (a physical cart is
+  reused across batches) — see migration `0003` if another table needs the same fix pattern.
+- **Marketplace region matters** — a request to the wrong SP-API regional endpoint 403s
+  indistinguishably from a real permissions problem. Check `MARKETPLACE_REGION` in `amazon.ts`
+  before assuming a 403 is a role/scope issue — this exact mistake ate significant time twice
+  (once for MFN, understandably, since MFN actually was the wrong API entirely that time).
+- **SP-API sandbox mode needs Amazon's literal magic values** if it's ever turned back on
+  (`AMAZON_SPAPI_SANDBOX=true`) — `CreatedAfter=TEST_CASE_200`, and the *same* literal string as
+  the order id path parameter for `getOrderItems`, not the real order id sandbox just handed
+  back. Real dates/filters don't work in sandbox at all. Documented inline in `amazon.ts`.
+  Currently off — production credentials are in use.
+
+## Open items
+
+Roughly in the order they'll come up; "Next steps" above is the short prioritized version of
+this list.
+
+1. **Amazon Easy Ship SP-API role not yet granted** — blocks all shipping (single + bulk). See
+   "Next steps" #2.
+2. **Real box sizes** not yet entered (only one demo box exists).
+3. **Confirm ship-from address is the real one**, not a placeholder.
+4. **30-day data disposal — committed to Amazon in writing, not yet built.** Needs three scoping
+   decisions from the user before writing a Cloudflare Cron Trigger: (a) does 30 days purge just
+   buyer PII or the whole order record (the latter conflicts with wanting sales/accounting
+   history); (b) is the audit log (no PII, just picker/packer actions) exempt or also purged;
+   (c) does the 30 days count from order creation or ship/completion date. Get these answered
+   before writing the job — over-deleting loses records the user wants, under-deleting makes the
+   stated Amazon policy false.
+5. **Admin account has the same weak PIN auth as the floor-worker login** — flagged as a real gap
+   in the compliance answers, not yet strengthened. Revisit if/when the user wants to act on it.
+6. **Privacy policy URL** — Amazon's Data Protection Policy form asks for one; unclear whether
+   ecomglider.com has a public one.
+7. **No automated PII protection for test/dev data** — real customer PII was used directly from
+   the live Amazon account during development. Flagged as worth moving to sandboxed/anonymized
+   data going forward, not yet changed.
+8. **DLP/USB monitoring, formal incident response plan, vulnerability-scan cadence, and a
+   SAST/dependency-scanning pipeline** are unformalized — answered honestly as "not yet in place"
+   on the compliance form, per the user's own "we'll build this as we move ahead." Intentional,
+   acknowledged gaps, not oversights. `npm audit` was run once (0 vulnerabilities) as a one-off,
+   not a recurring process.
+9. **Cycle counting** (periodic stock audits, distinct from receiving) — explicitly out of scope
+   when the inbound module was built. Real gap if the user ever wants periodic physical counts
+   reconciled against system stock.
+10. **Daily outbound is picking volume, not ship-date volume** — see "What's built" → Reports.
+    Revisit only if the user specifically wants true ship-date tracking.
+11. **Dead code**: `src/pages/api/picker/scan-item.ts` / `verifyItemScan` in `picker.ts` — left
+    over from before the picker dropped mandatory scanning, nothing calls it. Safe to delete.
+12. **Cosmetic**: `Warehouse` type in `types.ts` doesn't include the `ship_from_*` columns from
+    migration `0005` — `shipping.ts` has its own local type for the query it needs, nothing
+    breaks.
+13. **Untested at scale / against a live Amazon account**: the entire Easy Ship integration
+    (slots, single schedule, bulk schedule, label retrieval both paths). Everything UI-testable
+    without live Amazon access has been checked (forms, order selection, package-identifier
+    fields, polling); the actual Amazon calls have not. Treat the bulk ZIP-splitting logic in
+    particular as higher-risk than the rest of the app until verified.
+
+## Amazon Data Protection Policy questionnaire — what was submitted
+
+Required before the Orders/Shipping SP-API roles would fully activate. Answers were drafted
+collaboratively and submitted; worth knowing for next time:
+
+- **Incident Management Point of Contact (IMPOC)**: Rajul Singh, ecomglider.com@gmail.com.
+- **Data disposal**: committed to 30 days (see open item 4 — not yet enforced by code).
+- **Approach taken on every question**: answer honestly from what's actually true of the system
+  (verified facts — e.g. D1 has no public endpoint, Cloudflare handles encryption at rest, D1's
+  Time Travel gives 30-day point-in-time recovery, `npm audit` found 0 vulnerabilities) rather
+  than claiming enterprise-grade practices that don't exist. Several answers explicitly state
+  "not yet formalized" (written IR plan, DLP monitoring, documented password policy). **Do not
+  retroactively "upgrade" these answers to sound more mature than reality without the user
+  asking** — they were deliberately honest, and Amazon can hold the seller to whatever was
+  stated. This is the reference precedent for any future Amazon compliance question: split each
+  question into "what I can verify about the actual system" vs. "what's an org-level fact only
+  the user can state," and never fabricate specifics (named people, certifications, metrics) on
+  the user's behalf.
+
+## Commands
+
+```bash
+# local dev (background; check status/logs/stop with `astro dev status|logs|stop`)
+npx astro dev --background
+
+# type-check
+npx astro check
+
+# apply a new migration
+npx wrangler d1 migrations apply wms-db --local    # local dev DB
+npx wrangler d1 migrations apply wms-db --remote   # production DB — separate database, apply both
+
+# seed local dev data (scripts/seed.sql) — not idempotent, don't run twice without checking
+
+npx wrangler d1 execute wms-db --local --file=scripts/seed.sql
+
+# build + deploy
+npm run build && npx wrangler deploy
+
+# set a production secret (never echo the value back to the user in chat)
+echo "value" | npx wrangler secret put SECRET_NAME
+```
+
+## Secrets (values live in `.dev.vars`, gitignored — never in this file, never in chat)
+
+`AMAZON_LWA_CLIENT_ID`, `AMAZON_LWA_CLIENT_SECRET`, `AMAZON_REFRESH_TOKEN`,
+`AMAZON_MARKETPLACE_ID`, `AMAZON_SPAPI_SANDBOX`, `AMAZON_MERCHANT_ID` (not yet consumed by any
+code path), `SESSION_SECRET`. All mirrored as Worker secrets in production via
+`wrangler secret put` — if you rotate one locally, push it to production too, they don't sync
+automatically.

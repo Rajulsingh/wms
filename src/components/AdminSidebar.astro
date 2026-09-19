@@ -1,0 +1,113 @@
+---
+interface Props {
+  current: string;
+}
+const { current } = Astro.props;
+
+const ICONS: Record<string, string> = {
+  orders: '<rect x="3" y="4" width="18" height="4" rx="1"></rect><path d="M4 8v11a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1V8"></path><path d="M10 13h4"></path>',
+  'pick-list': '<path d="M9 3h6a1 1 0 0 1 1 1v1H8V4a1 1 0 0 1 1-1Z"></path><rect x="5" y="5" width="14" height="16" rx="2"></rect><path d="m9 12 2 2 4-4"></path>',
+  inbound: '<path d="M21 12v7a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-7"></path><path d="M3 12h5l2 3h4l2-3h5"></path><path d="M3 12 6 4h12l3 8"></path>',
+  inventory: '<path d="m3.5 7 8.5-4 8.5 4-8.5 4-8.5-4Z"></path><path d="M3.5 7v10l8.5 4 8.5-4V7"></path><path d="M12 11v10"></path>',
+  ship: '<rect x="2" y="7" width="13" height="9" rx="1"></rect><path d="M15 10h3l3 3v3h-6"></path><circle cx="6.5" cy="18" r="1.6"></circle><circle cx="16.5" cy="18" r="1.6"></circle>',
+  'bulk-ship': '<rect x="2" y="7" width="13" height="9" rx="1"></rect><path d="M15 10h3l3 3v3h-6"></path><circle cx="6.5" cy="18" r="1.6"></circle><circle cx="16.5" cy="18" r="1.6"></circle><path d="M5 4h7"></path>',
+  reports: '<path d="M4 20V10"></path><path d="M11 20V4"></path><path d="M18 20v-7"></path>',
+  warehouse: '<path d="m3 9 9-6 9 6"></path><path d="M5 9v11h14V9"></path><path d="M9 20v-6h6v6"></path>',
+  users: '<circle cx="9" cy="8" r="3.2"></circle><path d="M3.5 20c0-3.3 2.5-6 5.5-6s5.5 2.7 5.5 6"></path><path d="M16 4.6a3.2 3.2 0 0 1 0 6"></path><path d="M15 14c2.6.3 4.5 2.8 4.5 6"></path>',
+  settings: '<circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6V21a2 2 0 1 1-4 0v-.2a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.6-1H3a2 2 0 1 1 0-4h.2a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9a1.7 1.7 0 0 0 1-1.6V3a2 2 0 1 1 4 0v.2a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V9a1.7 1.7 0 0 0 1.6 1H21a2 2 0 1 1 0 4h-.2a1.7 1.7 0 0 0-1.5 1Z"></path>'
+};
+
+const groups: Array<{ label: string; links: Array<{ key: string; href: string; label: string }> }> = [
+  {
+    label: 'Orders',
+    links: [
+      { key: 'orders', href: '/admin', label: 'Orders' },
+      { key: 'pick-list', href: '/admin/pick-list', label: 'Pick lists' }
+    ]
+  },
+  {
+    label: 'Inventory',
+    links: [
+      { key: 'inventory', href: '/admin/inventory', label: 'Inventory' },
+      { key: 'inbound', href: '/admin/inbound', label: 'Receiving' }
+    ]
+  },
+  {
+    label: 'Fulfillment',
+    links: [
+      { key: 'ship', href: '/admin/ship', label: 'Ship' },
+      { key: 'bulk-ship', href: '/admin/bulk-ship', label: 'Bulk ship' }
+    ]
+  },
+  {
+    label: 'Reports',
+    links: [{ key: 'reports', href: '/admin/reports', label: 'Reports' }]
+  },
+  {
+    label: 'Setup',
+    links: [
+      { key: 'warehouse', href: '/admin/warehouse', label: 'Zones, racks & stations' },
+      { key: 'users', href: '/admin/users', label: 'Users' },
+      { key: 'settings', href: '/admin/settings', label: 'Settings' }
+    ]
+  }
+];
+---
+
+<div class="admin-sidebar-backdrop" id="sidebar-backdrop"></div>
+<nav class="admin-sidebar" id="admin-sidebar" aria-label="Admin navigation">
+  <div class="admin-sidebar-brand">
+    <span class="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 8 12 3 3 8l9 5 9-5Z"></path>
+        <path d="M3 8v8l9 5 9-5V8"></path>
+        <path d="M12 13v8"></path>
+      </svg>
+    </span>
+    <span class="brand-text">
+      <span class="brand-name">ecomglider</span>
+      <span class="brand-section">Admin</span>
+    </span>
+  </div>
+  <div class="admin-sidebar-nav">
+    {
+      groups.map((group) => (
+        <div class="admin-sidebar-section">
+          <div class="admin-sidebar-section-label">{group.label}</div>
+          <div class="admin-sidebar-links">
+            {group.links.map((item) => (
+              <a href={item.href} class:list={['admin-sidebar-link', { active: current === item.key }]}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" set:html={ICONS[item.key]} />
+                <span>{item.label}</span>
+              </a>
+            ))}
+          </div>
+        </div>
+      ))
+    }
+  </div>
+</nav>
+
+<script>
+  const sidebar = document.getElementById('admin-sidebar');
+  const backdrop = document.getElementById('sidebar-backdrop');
+
+  function closeSidebar() {
+    sidebar?.classList.remove('open');
+    backdrop?.classList.remove('open');
+  }
+
+  function openSidebar() {
+    sidebar?.classList.add('open');
+    backdrop?.classList.add('open');
+  }
+
+  backdrop?.addEventListener('click', closeSidebar);
+  sidebar?.querySelectorAll('a').forEach((a) => a.addEventListener('click', closeSidebar));
+
+  document.addEventListener('admin-sidebar-toggle', openSidebar);
+  (window as unknown as { __toggleAdminSidebar?: () => void }).__toggleAdminSidebar = () => {
+    if (sidebar?.classList.contains('open')) closeSidebar();
+    else openSidebar();
+  };
+</script>

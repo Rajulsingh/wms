@@ -1,0 +1,137 @@
+---
+import AdminShell from '../../components/AdminShell.astro';
+---
+
+<AdminShell title="Settings" current="settings">
+  <div style="max-width: 560px; display: flex; flex-direction: column; gap: 18px;">
+    <div class="card stack">
+      <h2>Ship-from address</h2>
+      <p>Required by Amazon before a shipping label can be purchased for any order.</p>
+      <form id="address-form" class="stack">
+        <input type="text" id="shipFromName" placeholder="Business / warehouse name" required />
+        <input type="text" id="shipFromAddressLine1" placeholder="Address line 1" required />
+        <input type="text" id="shipFromCity" placeholder="City" required />
+        <input type="text" id="shipFromState" placeholder="State / province code" />
+        <input type="text" id="shipFromPostalCode" placeholder="Postal code" required />
+        <input type="text" id="shipFromCountryCode" placeholder="Country code (e.g. IN, US)" required />
+        <input type="text" id="shipFromPhone" placeholder="Phone" required />
+        <input type="text" id="shipFromEmail" placeholder="Email (optional)" />
+        <button type="submit" class="btn btn-primary">Save address</button>
+      </form>
+      <div id="address-result" class="banner" style="display:none;"></div>
+    </div>
+
+    <div class="card stack">
+      <h2>Box sizes</h2>
+      <p>Reusable box dimensions — picked per order when purchasing a shipping label.</p>
+      <div id="box-list" class="stack"></div>
+      <form id="box-form" class="row" style="flex-wrap: wrap;">
+        <input type="text" id="boxName" placeholder="Name (e.g. Small)" required style="flex: 1; min-width: 120px;" />
+        <input type="number" id="boxLength" placeholder="Length (cm)" required style="width: 100px;" />
+        <input type="number" id="boxWidth" placeholder="Width (cm)" required style="width: 100px;" />
+        <input type="number" id="boxHeight" placeholder="Height (cm)" required style="width: 100px;" />
+        <button type="submit" class="btn">Add box size</button>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    let warehouseId = '';
+
+    async function api(path: string, body?: unknown) {
+      const res = await fetch(path, {
+        method: body === undefined ? 'GET' : 'POST',
+        headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body)
+      });
+      const data: any = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error ?? `Request failed (${res.status})`);
+      return data;
+    }
+
+    function val(id: string): string {
+      return (document.getElementById(id) as HTMLInputElement).value.trim();
+    }
+
+    async function loadAddress() {
+      const w = await api(`/api/admin/warehouse-settings?warehouseId=${warehouseId}`);
+      (document.getElementById('shipFromName') as HTMLInputElement).value = w.ship_from_name ?? '';
+      (document.getElementById('shipFromAddressLine1') as HTMLInputElement).value = w.ship_from_address_line1 ?? '';
+      (document.getElementById('shipFromCity') as HTMLInputElement).value = w.ship_from_city ?? '';
+      (document.getElementById('shipFromState') as HTMLInputElement).value = w.ship_from_state ?? '';
+      (document.getElementById('shipFromPostalCode') as HTMLInputElement).value = w.ship_from_postal_code ?? '';
+      (document.getElementById('shipFromCountryCode') as HTMLInputElement).value = w.ship_from_country_code ?? '';
+      (document.getElementById('shipFromPhone') as HTMLInputElement).value = w.ship_from_phone ?? '';
+      (document.getElementById('shipFromEmail') as HTMLInputElement).value = w.ship_from_email ?? '';
+    }
+
+    async function loadBoxes() {
+      const boxes: Array<{ id: string; name: string; length: number; width: number; height: number; dimension_unit: string }> = await api(
+        `/api/admin/box-sizes?warehouseId=${warehouseId}`
+      );
+      const list = document.getElementById('box-list')!;
+      list.innerHTML = boxes.length
+        ? boxes.map((b) => `<div class="item-row"><span class="name">${b.name}</span><span class="qty">${b.length}×${b.width}×${b.height} ${b.dimension_unit}</span></div>`).join('')
+        : '<p>No box sizes yet.</p>';
+    }
+
+    document.getElementById('address-form')?.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const resultEl = document.getElementById('address-result')!;
+      try {
+        await api('/api/admin/warehouse-settings', {
+          warehouseId,
+          shipFromName: val('shipFromName'),
+          shipFromAddressLine1: val('shipFromAddressLine1'),
+          shipFromCity: val('shipFromCity'),
+          shipFromState: val('shipFromState'),
+          shipFromPostalCode: val('shipFromPostalCode'),
+          shipFromCountryCode: val('shipFromCountryCode'),
+          shipFromPhone: val('shipFromPhone'),
+          shipFromEmail: val('shipFromEmail') || undefined
+        });
+        resultEl.className = 'banner banner-success';
+        resultEl.textContent = 'Saved.';
+        resultEl.style.display = 'block';
+      } catch (err) {
+        resultEl.className = 'banner banner-danger';
+        resultEl.textContent = (err as Error).message;
+        resultEl.style.display = 'block';
+      }
+    });
+
+    document.getElementById('box-form')?.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      try {
+        await api('/api/admin/box-sizes', {
+          warehouseId,
+          name: val('boxName'),
+          length: Number(val('boxLength')),
+          width: Number(val('boxWidth')),
+          height: Number(val('boxHeight')),
+          dimensionUnit: 'centimeters'
+        });
+        (document.getElementById('box-form') as HTMLFormElement).reset();
+        await loadBoxes();
+      } catch (err) {
+        alert((err as Error).message);
+      }
+    });
+
+    async function boot() {
+      const me = await api('/api/auth/me');
+      if (!me.user) {
+        window.location.href = '/login';
+        return;
+      }
+      if (me.user.role !== 'admin') {
+        document.body.innerHTML = `<div class="screen"><p>This account is a "${me.user.role}", not an admin.</p></div>`;
+        return;
+      }
+      warehouseId = me.user.warehouseId;
+      await Promise.all([loadAddress(), loadBoxes()]);
+    }
+
+    boot();
+  </script>
+</AdminShell>

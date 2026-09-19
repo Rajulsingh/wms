@@ -1,0 +1,247 @@
+---
+import AdminShell from '../../components/AdminShell.astro';
+---
+
+<AdminShell title="Receiving" current="inbound">
+  <div style="max-width: 640px; display: flex; flex-direction: column; gap: 18px;">
+    <div class="card stack">
+      <h2>Receive stock</h2>
+      <p>Record what came in and where it was put away. Existing SKUs get more stock; a new SKU code creates it.</p>
+
+      <div class="stack" style="gap: 6px;">
+        <label for="reference">Reference (PO #, supplier, note — optional)</label>
+        <input type="text" id="reference" placeholder="e.g. Supplier ABC, PO-1042" />
+      </div>
+
+      <div id="lines" class="stack"></div>
+      <button class="btn btn-ghost" id="add-line">+ Add another item</button>
+
+      <div id="form-result" class="banner" style="display:none;"></div>
+      <button class="btn btn-primary" id="submit-receipt">Receive stock</button>
+    </div>
+
+    <div class="card stack">
+      <h2>Recent receipts</h2>
+      <div id="receipt-list" class="stack">Loading…</div>
+    </div>
+  </div>
+
+  <script>
+    interface SkuOption {
+      id: string;
+      sku_code: string;
+      name: string;
+      image_url: string | null;
+      price: number | null;
+    }
+    interface LocationOption {
+      id: string;
+      code: string;
+      zone_name: string | null;
+    }
+    interface ReceiptRow {
+      id: string;
+      reference: string | null;
+      received_by_name: string | null;
+      created_at: string;
+      line_count: number;
+      total_quantity: number;
+    }
+
+    let warehouseId = '';
+    let skus: SkuOption[] = [];
+    let locations: LocationOption[] = [];
+    let lineSeq = 0;
+
+    async function api(path: string, body?: unknown) {
+      const res = await fetch(path, {
+        method: body === undefined ? 'GET' : 'POST',
+        headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body)
+      });
+      const data: any = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error ?? `Request failed (${res.status})`);
+      return data;
+    }
+
+    function locationOptionsHtml(): string {
+      return locations.map((l) => `<option value="${l.id}">${l.zone_name ? l.zone_name + ' · ' : ''}${l.code}</option>`).join('');
+    }
+
+    function priceLabel(price: number | null): string {
+      return price != null ? `₹${price.toFixed(2)}` : 'no price set';
+    }
+
+    function addLine() {
+      const id = `line-${lineSeq++}`;
+      const el = document.createElement('div');
+      el.className = 'card stack';
+      el.dataset.lineId = id;
+      el.innerHTML = `
+        <label>Product</label>
+        <input type="text" class="sku-search" placeholder="Search by title or SKU code…" autocomplete="off" />
+        <div class="sku-results stack" style="display:none; gap: 6px;"></div>
+        <div class="selected-sku-preview item-row" style="display:none;"></div>
+        <button class="btn btn-ghost use-new-sku" style="width: auto; min-height: 36px;">Can't find it — create a new SKU</button>
+        <div class="new-sku-fields stack" style="display:none;">
+          <input type="text" class="new-sku-code" placeholder="New SKU code" />
+          <input type="text" class="new-sku-name" placeholder="New SKU name" />
+          <button class="btn btn-ghost use-search-instead" style="width: auto; min-height: 36px;">Search instead</button>
+        </div>
+        <label>Location (bin)</label>
+        <select class="location-select">${locationOptionsHtml()}</select>
+        <label>Quantity</label>
+        <input type="number" class="quantity-input" min="1" value="1" />
+        <button class="btn btn-ghost remove-line" style="width: auto; min-height: 36px;">Remove item</button>`;
+
+      const searchInput = el.querySelector('.sku-search') as HTMLInputElement;
+      const resultsEl = el.querySelector('.sku-results') as HTMLDivElement;
+      const previewEl = el.querySelector('.selected-sku-preview') as HTMLDivElement;
+      const newSkuFields = el.querySelector('.new-sku-fields') as HTMLDivElement;
+
+      function showSearch() {
+        el.removeAttribute('data-sku-id');
+        searchInput.style.display = 'block';
+        resultsEl.style.display = 'none';
+        previewEl.style.display = 'none';
+        newSkuFields.style.display = 'none';
+        searchInput.value = '';
+        searchInput.focus();
+      }
+
+      function selectSku(sku: SkuOption) {
+        el.dataset.skuId = sku.id;
+        searchInput.style.display = 'none';
+        resultsEl.style.display = 'none';
+        newSkuFields.style.display = 'none';
+        previewEl.style.display = 'flex';
+        previewEl.innerHTML = `
+          ${sku.image_url ? `<img class="thumb" src="${sku.image_url}" alt="" />` : '<div class="thumb"></div>'}
+          <span class="name">${sku.name}<br /><span style="font-size: 0.75rem; color: var(--muted);">${sku.sku_code} · ${priceLabel(sku.price)}</span></span>
+          <button class="btn btn-ghost change-sku" style="width: auto; min-height: 36px;">Change</button>`;
+        previewEl.querySelector('.change-sku')?.addEventListener('click', showSearch);
+      }
+
+      searchInput.addEventListener('input', () => {
+        const q = searchInput.value.trim().toLowerCase();
+        if (!q) {
+          resultsEl.style.display = 'none';
+          resultsEl.innerHTML = '';
+          return;
+        }
+        const matches = skus.filter((s) => s.name.toLowerCase().includes(q) || s.sku_code.toLowerCase().includes(q)).slice(0, 6);
+        resultsEl.style.display = matches.length ? 'flex' : 'none';
+        resultsEl.innerHTML = matches
+          .map(
+            (s) => `
+          <div class="item-row sku-result" data-sku-id="${s.id}" style="cursor: pointer;">
+            ${s.image_url ? `<img class="thumb" src="${s.image_url}" alt="" />` : '<div class="thumb"></div>'}
+            <span class="name">${s.name}<br /><span style="font-size: 0.75rem; color: var(--muted);">${s.sku_code} · ${priceLabel(s.price)}</span></span>
+          </div>`
+          )
+          .join('');
+        resultsEl.querySelectorAll('.sku-result').forEach((row) => {
+          row.addEventListener('click', () => {
+            const sku = skus.find((s) => s.id === (row as HTMLElement).dataset.skuId);
+            if (sku) selectSku(sku);
+          });
+        });
+      });
+
+      el.querySelector('.use-new-sku')?.addEventListener('click', () => {
+        searchInput.style.display = 'none';
+        resultsEl.style.display = 'none';
+        previewEl.style.display = 'none';
+        newSkuFields.style.display = 'flex';
+      });
+      el.querySelector('.use-search-instead')?.addEventListener('click', showSearch);
+      el.querySelector('.remove-line')?.addEventListener('click', () => el.remove());
+
+      document.getElementById('lines')!.appendChild(el);
+    }
+
+    function readLines(): Array<{ skuId?: string; newSku?: { skuCode: string; name: string }; locationId: string; quantity: number }> {
+      const cards = Array.from(document.querySelectorAll('#lines > [data-line-id]')) as HTMLElement[];
+      return cards.map((card) => {
+        const skuId = card.dataset.skuId;
+        const locationId = (card.querySelector('.location-select') as unknown as HTMLSelectElement).value;
+        const quantity = Number((card.querySelector('.quantity-input') as HTMLInputElement).value);
+        const line: any = { locationId, quantity };
+        if (skuId) {
+          line.skuId = skuId;
+        } else {
+          line.newSku = {
+            skuCode: (card.querySelector('.new-sku-code') as HTMLInputElement).value.trim(),
+            name: (card.querySelector('.new-sku-name') as HTMLInputElement).value.trim()
+          };
+        }
+        return line;
+      });
+    }
+
+    async function loadReceipts() {
+      const data = await api(`/api/admin/inbound?warehouseId=${warehouseId}`);
+      skus = data.skus;
+      locations = data.locations;
+      renderReceipts(data.receipts);
+      if (!document.querySelector('#lines > [data-line-id]')) addLine();
+    }
+
+    function renderReceipts(receipts: ReceiptRow[]) {
+      const list = document.getElementById('receipt-list')!;
+      list.innerHTML = receipts.length
+        ? receipts
+            .map(
+              (r) => `
+        <div class="item-row">
+          <span class="name">${r.reference ?? '(no reference)'}<br/><span style="font-size:0.75rem; color: var(--muted);">${r.received_by_name ?? 'Unknown'} · ${r.created_at}</span></span>
+          <span class="qty">${r.line_count} lines / ${r.total_quantity} units</span>
+        </div>`
+            )
+            .join('')
+        : '<p>No receipts yet.</p>';
+    }
+
+    document.getElementById('add-line')?.addEventListener('click', addLine);
+
+    document.getElementById('submit-receipt')?.addEventListener('click', async () => {
+      const resultEl = document.getElementById('form-result')!;
+      try {
+        const lines = readLines();
+        if (!lines.length) throw new Error('Add at least one item');
+        await api('/api/admin/inbound', {
+          warehouseId,
+          reference: (document.getElementById('reference') as HTMLInputElement).value,
+          lines
+        });
+        resultEl.className = 'banner banner-success';
+        resultEl.textContent = 'Stock received and put away.';
+        resultEl.style.display = 'block';
+        (document.getElementById('reference') as HTMLInputElement).value = '';
+        document.getElementById('lines')!.innerHTML = '';
+        addLine();
+        await loadReceipts();
+      } catch (err) {
+        resultEl.className = 'banner banner-danger';
+        resultEl.textContent = (err as Error).message;
+        resultEl.style.display = 'block';
+      }
+    });
+
+    async function boot() {
+      const me = await api('/api/auth/me');
+      if (!me.user) {
+        window.location.href = '/login';
+        return;
+      }
+      if (me.user.role !== 'admin') {
+        document.body.innerHTML = `<div class="screen"><p>This account is a "${me.user.role}", not an admin.</p></div>`;
+        return;
+      }
+      warehouseId = me.user.warehouseId;
+      await loadReceipts();
+    }
+
+    boot();
+  </script>
+</AdminShell>

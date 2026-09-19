@@ -1,0 +1,103 @@
+---
+import AdminShell from '../../components/AdminShell.astro';
+---
+
+<AdminShell title="Inventory" current="inventory">
+  <div class="card stack">
+    <h2>Stock by location</h2>
+    <p>On-hand and reserved units per SKU per bin. Edit on-hand directly to correct a miscount or write off damage — this doesn't go through the reservation flow.</p>
+    <div class="table-scroll">
+      <table id="inventory-table">
+        <thead>
+          <tr><th>SKU</th><th>Location</th><th>On hand</th><th>Reserved</th><th>Price</th><th></th></tr>
+        </thead>
+        <tbody id="inventory-rows">
+          <tr><td colspan="6">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    interface Row {
+      id: string;
+      sku_id: string;
+      sku_code: string;
+      sku_name: string;
+      price: number | null;
+      location_id: string;
+      location_code: string;
+      zone_name: string | null;
+      quantity_on_hand: number;
+      quantity_reserved: number;
+    }
+
+    let warehouseId = '';
+
+    async function api(path: string, body?: unknown, method?: string) {
+      const res = await fetch(path, {
+        method: method ?? (body === undefined ? 'GET' : 'POST'),
+        headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body)
+      });
+      const data: any = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error ?? `Request failed (${res.status})`);
+      return data;
+    }
+
+    async function loadInventory() {
+      const rows: Row[] = await api(`/api/admin/inventory?warehouseId=${warehouseId}`);
+      const tbody = document.getElementById('inventory-rows')!;
+      tbody.innerHTML = rows.length
+        ? rows
+            .map(
+              (r) => `
+        <tr data-inv-id="${r.id}" data-sku-id="${r.sku_id}">
+          <td>${r.sku_code}<br><span style="font-size: 0.75rem; color: var(--muted);">${r.sku_name}</span></td>
+          <td>${r.zone_name ? r.zone_name + ' · ' : ''}${r.location_code}</td>
+          <td><input type="number" class="onhand-input" value="${r.quantity_on_hand}" min="0" style="width: 90px; min-height: 40px; padding: 6px 8px;" /></td>
+          <td>${r.quantity_reserved}</td>
+          <td><input type="number" class="price-input" value="${r.price ?? ''}" min="0" step="0.01" placeholder="—" style="width: 90px; min-height: 40px; padding: 6px 8px;" /></td>
+          <td><button class="btn btn-ghost save-btn" style="width: auto; min-height: 36px;">Save</button></td>
+        </tr>`
+            )
+            .join('')
+        : '<tr><td colspan="6">No inventory yet — <a href="/admin/inbound">receive some stock</a> to get started.</td></tr>';
+
+      tbody.querySelectorAll('tr[data-inv-id]').forEach((tr) => {
+        const row = tr as HTMLTableRowElement;
+        const invId = row.dataset.invId!;
+        const skuId = row.dataset.skuId!;
+        row.querySelector('.save-btn')?.addEventListener('click', async () => {
+          const onHand = Number((row.querySelector('.onhand-input') as HTMLInputElement).value);
+          const priceRaw = (row.querySelector('.price-input') as HTMLInputElement).value;
+          const price = priceRaw === '' ? null : Number(priceRaw);
+          try {
+            await Promise.all([
+              api('/api/admin/inventory', { inventoryId: invId, quantityOnHand: onHand }, 'PATCH'),
+              api('/api/admin/skus', { skuId, price }, 'PATCH')
+            ]);
+          } catch (err) {
+            alert((err as Error).message);
+          }
+        });
+      });
+    }
+
+    async function boot() {
+      const me = await api('/api/auth/me');
+      if (!me.user) {
+        window.location.href = '/login';
+        return;
+      }
+      if (me.user.role !== 'admin') {
+        document.body.innerHTML = `<div class="screen"><p>This account is a "${me.user.role}", not an admin.</p></div>`;
+        return;
+      }
+      warehouseId = me.user.warehouseId;
+      await loadInventory();
+    }
+
+    boot();
+  </script>
+</AdminShell>

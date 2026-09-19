@@ -1,0 +1,177 @@
+---
+import AdminShell from '../../components/AdminShell.astro';
+---
+
+<AdminShell title="Zones, racks & stations" current="warehouse">
+  <div style="max-width: 640px; display: flex; flex-direction: column; gap: 18px;">
+    <div class="card stack">
+      <h2>Zones</h2>
+      <p>Top-level areas of the floor (e.g. "Main floor", "Mezzanine").</p>
+      <div id="zone-list" class="stack">Loading…</div>
+      <form id="zone-form" class="row" style="flex-wrap: wrap;">
+        <input type="text" id="zoneName" placeholder="Zone name" required style="flex: 1; min-width: 140px;" />
+        <button type="submit" class="btn" style="width: auto;">Add zone</button>
+      </form>
+    </div>
+
+    <div class="card stack">
+      <h2>Locations (racks / bins)</h2>
+      <p>Pickable locations get picked from; reserve locations are backstock.</p>
+      <div id="location-list" class="stack">Loading…</div>
+      <form id="location-form" class="stack">
+        <select id="locZone"></select>
+        <input type="text" id="locCode" placeholder="Code (e.g. Rack E)" required />
+        <select id="locType">
+          <option value="pickable">Pickable</option>
+          <option value="reserve">Reserve</option>
+        </select>
+        <button type="submit" class="btn" style="width: auto;">Add location</button>
+      </form>
+    </div>
+
+    <div class="card stack">
+      <h2>Packing stations</h2>
+      <div id="station-list" class="stack">Loading…</div>
+      <form id="station-form" class="row" style="flex-wrap: wrap;">
+        <input type="text" id="stationCode" placeholder="Station code (e.g. Station 2)" required style="flex: 1; min-width: 140px;" />
+        <button type="submit" class="btn" style="width: auto;">Add station</button>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    let warehouseId = '';
+
+    async function api(path: string, body?: unknown, method?: string) {
+      const res = await fetch(path, {
+        method: method ?? (body === undefined ? 'GET' : 'POST'),
+        headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body)
+      });
+      const data: any = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error ?? `Request failed (${res.status})`);
+      return data;
+    }
+
+    interface Zone {
+      id: string;
+      name: string;
+    }
+    interface Location {
+      id: string;
+      code: string;
+      type: string;
+      zone_name: string | null;
+      qr_token: string;
+    }
+    interface Station {
+      id: string;
+      code: string;
+      active: number;
+      qr_token: string;
+    }
+
+    let zones: Zone[] = [];
+
+    async function loadZones() {
+      zones = await api(`/api/admin/zones?warehouseId=${warehouseId}`);
+      const list = document.getElementById('zone-list')!;
+      list.innerHTML = zones.length ? zones.map((z) => `<div class="item-row"><span class="name">${z.name}</span></div>`).join('') : '<p>No zones yet.</p>';
+
+      const zoneSelect = document.getElementById('locZone') as unknown as HTMLSelectElement;
+      zoneSelect.innerHTML = `<option value="">— No zone —</option>` + zones.map((z) => `<option value="${z.id}">${z.name}</option>`).join('');
+    }
+
+    async function loadLocations() {
+      const locations: Location[] = await api(`/api/admin/locations?warehouseId=${warehouseId}`);
+      const list = document.getElementById('location-list')!;
+      list.innerHTML = locations.length
+        ? locations
+            .map(
+              (l) =>
+                `<div class="item-row"><span class="name">${l.zone_name ? l.zone_name + ' · ' : ''}${l.code}</span><span class="status-pill ${l.type === 'pickable' ? 'status-progress' : 'status-neutral'}">${l.type}</span></div>`
+            )
+            .join('')
+        : '<p>No locations yet.</p>';
+    }
+
+    async function loadStations() {
+      const stations: Station[] = await api(`/api/admin/stations?warehouseId=${warehouseId}`);
+      const list = document.getElementById('station-list')!;
+      list.innerHTML = stations.length
+        ? stations
+            .map(
+              (s) => `
+        <div class="item-row">
+          <span class="name">${s.code}</span>
+          <span class="status-pill ${s.active ? 'status-success' : 'status-neutral'}">${s.active ? 'active' : 'inactive'}</span>
+          <button class="btn btn-ghost" style="width: auto; min-height: 36px;" data-id="${s.id}" data-active="${s.active}">${s.active ? 'Deactivate' : 'Reactivate'}</button>
+        </div>`
+            )
+            .join('')
+        : '<p>No stations yet.</p>';
+
+      list.querySelectorAll('button[data-id]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const el = btn as HTMLButtonElement;
+          await api('/api/admin/stations', { id: el.dataset.id, active: el.dataset.active !== '1' }, 'PATCH');
+          await loadStations();
+        });
+      });
+    }
+
+    document.getElementById('zone-form')?.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const input = document.getElementById('zoneName') as HTMLInputElement;
+      try {
+        await api('/api/admin/zones', { warehouseId, name: input.value, sequenceNumber: zones.length });
+        input.value = '';
+        await loadZones();
+      } catch (err) {
+        alert((err as Error).message);
+      }
+    });
+
+    document.getElementById('location-form')?.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const zoneId = (document.getElementById('locZone') as unknown as HTMLSelectElement).value;
+      const codeInput = document.getElementById('locCode') as HTMLInputElement;
+      const typeSelect = document.getElementById('locType') as unknown as HTMLSelectElement;
+      try {
+        await api('/api/admin/locations', { warehouseId, zoneId: zoneId || undefined, code: codeInput.value, type: typeSelect.value });
+        codeInput.value = '';
+        await loadLocations();
+      } catch (err) {
+        alert((err as Error).message);
+      }
+    });
+
+    document.getElementById('station-form')?.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const input = document.getElementById('stationCode') as HTMLInputElement;
+      try {
+        await api('/api/admin/stations', { warehouseId, code: input.value });
+        input.value = '';
+        await loadStations();
+      } catch (err) {
+        alert((err as Error).message);
+      }
+    });
+
+    async function boot() {
+      const me = await api('/api/auth/me');
+      if (!me.user) {
+        window.location.href = '/login';
+        return;
+      }
+      if (me.user.role !== 'admin') {
+        document.body.innerHTML = `<div class="screen"><p>This account is a "${me.user.role}", not an admin.</p></div>`;
+        return;
+      }
+      warehouseId = me.user.warehouseId;
+      await Promise.all([loadZones(), loadLocations(), loadStations()]);
+    }
+
+    boot();
+  </script>
+</AdminShell>

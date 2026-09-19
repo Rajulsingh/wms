@@ -1,0 +1,148 @@
+---
+import AdminShell from '../../components/AdminShell.astro';
+---
+
+<AdminShell title="Reports" current="reports">
+  <div id="low-stock-banner"></div>
+
+  <div class="card stack">
+    <h2>Stock &amp; velocity</h2>
+    <p>Current available stock (on hand minus reserved), plus units picked in the last 7 and 30 days. Set a reorder point per SKU to control the low-stock alert above.</p>
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr><th>SKU</th><th>Available</th><th>Reserved</th><th>Last 7d</th><th>Last 30d</th><th>Reorder at</th></tr>
+        </thead>
+        <tbody id="stock-rows">
+          <tr><td colspan="6">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card stack">
+    <h2>Daily units picked</h2>
+    <p>Units picked (left the shelf) per SKU per day, last 30 days — the closest signal this system has to daily outbound volume.</p>
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr><th>Date</th><th>SKU</th><th>Units</th></tr>
+        </thead>
+        <tbody id="daily-rows">
+          <tr><td colspan="3">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    interface StockRow {
+      sku_id: string;
+      sku_code: string;
+      sku_name: string;
+      reorder_point: number | null;
+      on_hand: number;
+      reserved: number;
+      available: number;
+      lowStock: boolean;
+      threshold: number;
+      units_7d: number;
+      units_30d: number;
+    }
+    interface DailyPick {
+      sku_code: string;
+      pick_date: string;
+      units: number;
+    }
+
+    let warehouseId = '';
+
+    async function api(path: string, body?: unknown, method?: string) {
+      const res = await fetch(path, {
+        method: method ?? (body === undefined ? 'GET' : 'POST'),
+        headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body)
+      });
+      const data: any = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error ?? `Request failed (${res.status})`);
+      return data;
+    }
+
+    function renderLowStockBanner(lowStock: StockRow[]) {
+      const el = document.getElementById('low-stock-banner')!;
+      if (!lowStock.length) {
+        el.innerHTML = '';
+        return;
+      }
+      el.innerHTML = `
+        <div class="banner banner-warning">
+          <strong>${lowStock.length} SKU${lowStock.length > 1 ? 's' : ''} at or below reorder point:</strong>
+          ${lowStock.map((r) => `${r.sku_code} (${r.available} left)`).join(', ')}
+          — <a href="/admin/inbound">receive more stock</a>.
+        </div>`;
+    }
+
+    function renderStockRows(rows: StockRow[]) {
+      const tbody = document.getElementById('stock-rows')!;
+      tbody.innerHTML = rows.length
+        ? rows
+            .map(
+              (r) => `
+        <tr data-sku-id="${r.sku_id}">
+          <td>${r.sku_code}<br /><span style="font-size: 0.75rem; color: var(--muted);">${r.sku_name}</span></td>
+          <td>${r.available}${r.lowStock ? ' <span class="status-pill status-warning">low</span>' : ''}</td>
+          <td>${r.reserved}</td>
+          <td>${r.units_7d}</td>
+          <td>${r.units_30d}</td>
+          <td><input type="number" class="reorder-input" min="0" value="${r.reorder_point ?? ''}" placeholder="${r.threshold}" style="width: 80px; min-height: 40px; padding: 6px 8px;" /></td>
+        </tr>`
+            )
+            .join('')
+        : '<tr><td colspan="6">No SKUs yet.</td></tr>';
+
+      tbody.querySelectorAll('.reorder-input').forEach((input) => {
+        input.addEventListener('change', async () => {
+          const tr = (input as HTMLElement).closest('tr')!;
+          const skuId = tr.dataset.skuId!;
+          const raw = (input as HTMLInputElement).value;
+          try {
+            await api('/api/admin/skus', { skuId, reorderPoint: raw === '' ? null : Number(raw) }, 'PATCH');
+            await load();
+          } catch (err) {
+            alert((err as Error).message);
+          }
+        });
+      });
+    }
+
+    function renderDailyRows(rows: DailyPick[]) {
+      const tbody = document.getElementById('daily-rows')!;
+      tbody.innerHTML = rows.length
+        ? rows.map((r) => `<tr><td>${r.pick_date}</td><td>${r.sku_code}</td><td>${r.units}</td></tr>`).join('')
+        : '<tr><td colspan="3">No picks in the last 30 days.</td></tr>';
+    }
+
+    async function load() {
+      const data = await api(`/api/admin/reports?warehouseId=${warehouseId}`);
+      renderLowStockBanner(data.lowStock);
+      renderStockRows(data.stock);
+      renderDailyRows(data.dailyPicks);
+    }
+
+    async function boot() {
+      const me = await api('/api/auth/me');
+      if (!me.user) {
+        window.location.href = '/login';
+        return;
+      }
+      if (me.user.role !== 'admin') {
+        document.body.innerHTML = `<div class="screen"><p>This account is a "${me.user.role}", not an admin.</p></div>`;
+        return;
+      }
+      warehouseId = me.user.warehouseId;
+      await load();
+    }
+
+    boot();
+  </script>
+</AdminShell>

@@ -1,0 +1,219 @@
+---
+import AdminShell from '../../components/AdminShell.astro';
+---
+
+<AdminShell title="Bulk ship" current="bulk-ship">
+  <div id="app" class="stack" style="max-width: 700px;">
+    <p>Loading…</p>
+  </div>
+
+  <script>
+    interface OrderRow {
+      id: string;
+      external_order_id: string;
+      source: string;
+      status: string;
+      first_item_name: string | null;
+    }
+    interface BoxSize {
+      id: string;
+      name: string;
+      length: number;
+      width: number;
+      height: number;
+      dimension_unit: string;
+    }
+    interface HandoverSlot {
+      slotId: string;
+      startTime: string;
+      endTime: string;
+      handoverMethod: 'PICKUP' | 'DROPOFF';
+    }
+
+    const app = document.getElementById('app')!;
+    let warehouseId = '';
+    let boxSizes: BoxSize[] = [];
+    let shippableOrders: OrderRow[] = [];
+    let selectedSlot: HandoverSlot | null = null;
+
+    async function api(path: string, body?: unknown) {
+      const res = await fetch(path, {
+        method: body === undefined ? 'GET' : 'POST',
+        headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body)
+      });
+      const data: any = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error ?? `Request failed (${res.status})`);
+      return data;
+    }
+
+    function formatSlot(s: HandoverSlot): { day: string; time: string } {
+      const start = new Date(s.startTime);
+      const end = new Date(s.endTime);
+      const day = start.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
+      const time = `${start.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })} – ${end.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}`;
+      return { day, time };
+    }
+
+    function renderPicker(error?: string) {
+      app.innerHTML = `
+        ${error ? `<div class="banner banner-danger">${error}</div>` : ''}
+        <div class="card stack">
+          <h2>Orders to ship</h2>
+          <p>Amazon orders not yet shipped. Pick the ones going out together — same box/weight, one pickup slot for all.</p>
+          <div id="order-checks" class="stack">
+            ${shippableOrders.length ? '' : '<p>No unshipped Amazon orders right now.</p>'}
+          </div>
+        </div>
+        <div class="card stack">
+          <label for="box">Box size (applies to every selected order)</label>
+          <select id="box">${boxSizes.map((b) => `<option value="${b.id}">${b.name} (${b.length}×${b.width}×${b.height} ${b.dimension_unit})</option>`).join('')}</select>
+          <label for="weight">Weight per package (grams)</label>
+          <input type="number" id="weight" placeholder="e.g. 450" required />
+          <button class="btn btn-primary" id="get-slots">Get pickup slots</button>
+        </div>
+        <div id="slots"></div>`;
+
+      const list = document.getElementById('order-checks')!;
+      for (const o of shippableOrders) {
+        const row = document.createElement('div');
+        row.className = 'item-row';
+        row.innerHTML = `
+          <input type="checkbox" class="order-check" data-order-id="${o.id}" style="width: 20px; height: 20px; flex-shrink: 0;" />
+          <span class="name">${o.external_order_id}<br /><span style="font-size: 0.75rem; color: var(--muted);">${o.first_item_name ?? ''}</span></span>
+          <input type="text" class="pkg-id-input" data-order-id="${o.id}" placeholder="Package identifier" value="${o.external_order_id}" style="width: 160px; min-height: 40px; padding: 6px 10px; display: none;" />`;
+        list.appendChild(row);
+
+        const checkbox = row.querySelector('.order-check') as HTMLInputElement;
+        const pkgInput = row.querySelector('.pkg-id-input') as HTMLInputElement;
+        checkbox.addEventListener('change', () => {
+          pkgInput.style.display = checkbox.checked ? 'block' : 'none';
+        });
+      }
+
+      document.getElementById('get-slots')?.addEventListener('click', async () => {
+        const selectedIds = Array.from(document.querySelectorAll('.order-check:checked')).map((el) => (el as HTMLInputElement).dataset.orderId!);
+        if (!selectedIds.length) {
+          renderPicker('Select at least one order.');
+          return;
+        }
+        const boxSizeId = (document.getElementById('box') as unknown as HTMLSelectElement).value;
+        const weightGrams = Number((document.getElementById('weight') as HTMLInputElement).value);
+        if (!boxSizeId || !weightGrams) return;
+
+        try {
+          // Slots are queried against one representative order — pickup windows are a
+          // warehouse-level schedule in practice, not meaningfully different per order.
+          const slots: HandoverSlot[] = await api('/api/admin/shipping/slots', { orderId: selectedIds[0], boxSizeId, weightGrams });
+          renderSlots(slots, selectedIds, boxSizeId, weightGrams);
+        } catch (err) {
+          renderPicker((err as Error).message);
+        }
+      });
+    }
+
+    function renderSlots(slots: HandoverSlot[], selectedIds: string[], boxSizeId: string, weightGrams: number) {
+      const slotsEl = document.getElementById('slots')!;
+      if (!slots.length) {
+        slotsEl.innerHTML = '<div class="banner banner-warning">No pickup slots available for this box/weight right now.</div>';
+        return;
+      }
+      slotsEl.innerHTML = `
+        <div class="card stack" style="margin-top: 16px;">
+          <label>Pickup slot (applied to every selected order)</label>
+          <div class="stack" id="slot-options">
+            ${slots
+              .map((s, i) => {
+                const { day, time } = formatSlot(s);
+                return `<button class="btn" data-idx="${i}" style="justify-content: space-between;">
+                  <span>${day}</span><span style="color: var(--muted);">${time}</span>
+                </button>`;
+              })
+              .join('')}
+          </div>
+        </div>`;
+
+      slotsEl.querySelectorAll('button[data-idx]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          slotsEl.querySelectorAll('button[data-idx]').forEach((b) => b.classList.remove('btn-primary'));
+          btn.classList.add('btn-primary');
+          const idx = Number((btn as HTMLButtonElement).dataset.idx);
+          selectedSlot = slots[idx];
+          renderScheduleButton(selectedIds, boxSizeId, weightGrams);
+        });
+      });
+    }
+
+    function renderScheduleButton(selectedIds: string[], boxSizeId: string, weightGrams: number) {
+      let btn = document.getElementById('schedule-all-btn') as HTMLButtonElement | null;
+      if (!btn) {
+        btn = document.createElement('button');
+        btn.id = 'schedule-all-btn';
+        btn.className = 'btn btn-primary';
+        btn.style.marginTop = '16px';
+        document.getElementById('app')!.appendChild(btn);
+      }
+      btn.textContent = `Schedule ${selectedIds.length} order${selectedIds.length > 1 ? 's' : ''}`;
+      btn.onclick = async () => {
+        const orders = selectedIds.map((orderId) => ({
+          orderId,
+          boxSizeId,
+          weightValue: weightGrams,
+          packageIdentifier: (document.querySelector(`.pkg-id-input[data-order-id="${orderId}"]`) as HTMLInputElement).value.trim()
+        }));
+        try {
+          const result = await api('/api/admin/shipping/bulk-schedule', { orders, slot: selectedSlot });
+          renderResult(result);
+        } catch (err) {
+          renderPicker((err as Error).message);
+        }
+      };
+    }
+
+    function renderResult(result: { outcomes: Array<{ externalOrderId: string; ok: boolean; trackingId?: string; error?: string }>; labelSplitOk: boolean }) {
+      app.innerHTML = `
+        <div class="card stack">
+          <h2>Bulk schedule result</h2>
+          ${
+            result.labelSplitOk
+              ? '<div class="banner banner-success">Labels retrieved and stamped individually.</div>'
+              : '<div class="banner banner-warning">Labels retrieved as one shared file (couldn\'t split per order automatically) — open each order\'s shipment to download it.</div>'
+          }
+          <div class="stack">
+            ${result.outcomes
+              .map(
+                (o) =>
+                  `<div class="item-row"><span class="name">${o.externalOrderId}</span><span class="status-pill ${o.ok ? 'status-success' : 'status-warning'}">${o.ok ? 'scheduled' + (o.trackingId ? ' · ' + o.trackingId : '') : o.error}</span></div>`
+              )
+              .join('')}
+          </div>
+          <a href="/admin" class="btn">Back to admin</a>
+        </div>`;
+    }
+
+    async function boot() {
+      const me = await api('/api/auth/me');
+      if (!me.user) {
+        window.location.href = '/login';
+        return;
+      }
+      if (me.user.role !== 'admin') {
+        app.innerHTML = `<p>This account is a "${me.user.role}", not an admin.</p>`;
+        return;
+      }
+      warehouseId = me.user.warehouseId;
+
+      const [orders, boxes] = await Promise.all([api(`/api/admin/orders?warehouseId=${warehouseId}`), api(`/api/admin/box-sizes?warehouseId=${warehouseId}`)]);
+      boxSizes = boxes;
+      shippableOrders = orders.filter((o: OrderRow) => o.source === 'amazon' && o.status !== 'ready_to_ship' && o.status !== 'shipped');
+
+      if (!boxSizes.length) {
+        app.innerHTML = `<p>No box sizes configured yet. <a href="/admin/settings">Add one in Settings</a> first.</p>`;
+        return;
+      }
+      renderPicker();
+    }
+
+    boot();
+  </script>
+</AdminShell>

@@ -1,0 +1,274 @@
+---
+import AdminShell from '../../components/AdminShell.astro';
+---
+
+<AdminShell title="Pick lists" current="pick-list">
+  <style>
+    @media print {
+      .no-print {
+        display: none !important;
+      }
+      body {
+        background: #fff;
+        color: #000;
+      }
+    }
+  </style>
+
+  <div class="no-print card stack">
+    <div class="row" style="flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between;">
+      <select id="batch-select" style="width: auto; flex: 1; min-width: 220px;"></select>
+      <div class="row" style="width: auto; gap: 8px;">
+        <button class="btn" id="print-btn" style="width: auto;">Print pick list</button>
+        <button class="btn" id="download-btn" style="width: auto;">Download pick list</button>
+      </div>
+    </div>
+    <div class="scan-row">
+      <input type="text" id="scan-input" placeholder="Scan or type a pick list barcode…" />
+      <button class="btn" id="scan-btn" type="button" style="width: auto;">Scan</button>
+      <video class="scanner" id="scan-video" style="display:none; width: 220px; max-height: 140px;"></video>
+    </div>
+    <p id="scan-error" style="display:none; color: var(--danger); margin: 0; font-size: 0.85rem;"></p>
+  </div>
+
+  <div id="app" class="stack">
+    <p>Loading…</p>
+  </div>
+
+  <script>
+    import { scanOnce, stopScanning } from '../../lib/scanner-client';
+    import JsBarcode from 'jsbarcode';
+
+    interface Row {
+      pick_task_id: string;
+      zone_name: string | null;
+      location_code: string;
+      sku_code: string;
+      sku_name: string;
+      image_url: string | null;
+      external_order_id: string;
+      order_source: string;
+      quantity_required: number;
+      quantity_picked: number;
+      status: string;
+    }
+
+    interface Batch {
+      id: string;
+      status: string;
+      created_at: string;
+      completed_at: string | null;
+    }
+
+    const app = document.getElementById('app')!;
+    const select = document.getElementById('batch-select') as unknown as HTMLSelectElement;
+    const scanInput = document.getElementById('scan-input') as HTMLInputElement;
+    const scanError = document.getElementById('scan-error') as HTMLParagraphElement;
+    let warehouseId = '';
+    let batches: Batch[] = [];
+    let currentRows: Row[] = [];
+    let currentBatchId = '';
+
+    async function api(path: string, body?: unknown) {
+      const res = await fetch(path, {
+        method: body === undefined ? 'GET' : 'POST',
+        headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body)
+      });
+      const data: any = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error ?? `Request failed (${res.status})`);
+      return data;
+    }
+
+    const STATUS_STYLE: Record<string, string> = {
+      pending: 'status-neutral',
+      picked: 'status-success',
+      damaged: 'status-warning',
+      short: 'status-warning'
+    };
+    function statusPill(status: string): string {
+      const cls = STATUS_STYLE[status] ?? 'status-neutral';
+      return `<span class="status-pill ${cls}">${status}</span>`;
+    }
+
+    const CHECK_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m5 13 4 4L19 7"></path></svg>';
+
+    // Batch lifecycle only (pending/assigned/in_progress -> completed) — packing
+    // and shipping happen per order/shipment in this schema, not per batch, so
+    // a literal Create/Pack/Ship stepper would claim a stage that isn't true
+    // for this batch yet. See pick_batches.status CHECK constraint.
+    function renderStepper(batch: Batch): string {
+      const created = new Date(batch.created_at).toLocaleString();
+      const pickingDone = batch.status === 'completed';
+      const picking = { done: pickingDone, current: !pickingDone && batch.status !== 'cancelled' };
+      const picked = { done: pickingDone, current: false };
+
+      const step = (label: string, meta: string, done: boolean, current: boolean, first = false) => `
+        <div class="stepper-step ${done ? 'done' : current ? 'current' : ''}">
+          ${!first ? '<div class="stepper-step-line"></div>' : ''}
+          <div class="stepper-step-node">${done ? CHECK_ICON : ''}</div>
+          <span class="stepper-step-label">${label}</span>
+          <span class="stepper-step-meta">${meta}</span>
+        </div>`;
+
+      return `<div class="stepper-bar">
+        ${step('Create', created, true, false, true)}
+        ${step('Picking', picking.done ? 'Complete' : picking.current ? 'In progress' : '—', picking.done, picking.current)}
+        ${step('Picked', picked.done ? new Date(batch.completed_at ?? batch.created_at).toLocaleString() : 'Not yet', picked.done, picked.current)}
+      </div>`;
+    }
+
+    function renderBarcode(batchId: string): string {
+      return `<div class="barcode-wrap">
+        <svg id="batch-barcode"></svg>
+        <span class="barcode-id">${batchId}</span>
+      </div>`;
+    }
+
+    async function boot() {
+      const me = await api('/api/auth/me');
+      if (!me.user) {
+        window.location.href = '/login';
+        return;
+      }
+      if (me.user.role !== 'admin') {
+        app.innerHTML = `<p>This account is a "${me.user.role}", not an admin.</p>`;
+        return;
+      }
+      warehouseId = me.user.warehouseId;
+
+      batches = await api(`/api/admin/batches?warehouseId=${warehouseId}`);
+      const params = new URLSearchParams(window.location.search);
+      const preselect = params.get('batchId');
+
+      select.innerHTML = batches.map((b) => `<option value="${b.id}">${b.created_at} · ${b.status}</option>`).join('');
+      if (preselect) select.value = preselect;
+      select.addEventListener('change', () => loadBatch(select.value));
+
+      if (batches.length) await loadBatch(select.value);
+      else app.innerHTML = '<p>No pick batches yet.</p>';
+    }
+
+    async function loadBatch(batchId: string) {
+      if (!batchId) return;
+      const batch = batches.find((b) => b.id === batchId);
+      currentBatchId = batchId;
+      const rows: Row[] = await api(`/api/picker/pick-list?batchId=${batchId}`);
+      currentRows = rows;
+      const orders = new Set(rows.map((r) => r.external_order_id));
+      const skus = new Set(rows.map((r) => r.sku_code));
+      const units = rows.reduce((sum, r) => sum + r.quantity_required, 0);
+
+      app.innerHTML = `
+        ${batch ? `<div class="card">
+          <div class="row" style="justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 16px;">
+            <div class="stack" style="gap: 4px;">
+              <span class="eyebrow">Pick list ID</span>
+              <span class="big-label" style="font-size: 1.4rem;">${batch.id}</span>
+            </div>
+            ${renderBarcode(batch.id)}
+          </div>
+          ${renderStepper(batch)}
+        </div>` : ''}
+        <div class="row no-print" style="gap: 16px;">
+          <span class="pill">Orders: ${orders.size}</span>
+          <span class="pill">SKUs: ${skus.size}</span>
+          <span class="pill">Units: ${units}</span>
+        </div>
+        <div class="table-scroll"><table>
+          <thead>
+            <tr><th>Zone</th><th>Bin</th><th>Product</th><th>SKU</th><th>Order</th><th>Units</th><th>Status</th></tr>
+          </thead>
+          <tbody>
+            ${rows
+              .map(
+                (r) => `<tr>
+                  <td>${r.zone_name ?? '—'}</td>
+                  <td>${r.location_code}</td>
+                  <td>
+                    <div class="row" style="align-items:center; gap:10px;">
+                      ${r.image_url ? `<img class="table-thumb" src="${r.image_url}" alt="" />` : ''}
+                      <span>${r.sku_name}</span>
+                    </div>
+                  </td>
+                  <td>${r.sku_code}</td>
+                  <td>${r.external_order_id}</td>
+                  <td>${r.quantity_required}</td>
+                  <td>${statusPill(r.status)}</td>
+                </tr>`
+              )
+              .join('')}
+          </tbody>
+        </table></div>`;
+
+      if (batch) {
+        const svg = document.getElementById('batch-barcode');
+        if (svg) {
+          try {
+            JsBarcode(svg, batch.id, { format: 'CODE128', displayValue: false, height: 40, margin: 0 });
+          } catch {
+            // Batch IDs are UUIDs (any ASCII), Code128 handles them fine — this is just a defensive no-op if it ever can't.
+          }
+        }
+      }
+    }
+
+    function openBatch(rawId: string) {
+      const id = rawId.trim();
+      const match = batches.find((b) => b.id === id);
+      if (!match) {
+        scanError.textContent = `No pick list found for "${id}".`;
+        scanError.style.display = 'block';
+        return;
+      }
+      scanError.style.display = 'none';
+      select.value = match.id;
+      loadBatch(match.id);
+    }
+
+    scanInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && scanInput.value.trim()) {
+        openBatch(scanInput.value);
+        scanInput.value = '';
+      }
+    });
+
+    document.getElementById('scan-btn')?.addEventListener('click', async () => {
+      const video = document.getElementById('scan-video') as HTMLVideoElement;
+      video.style.display = 'block';
+      try {
+        const text = await scanOnce(video);
+        video.style.display = 'none';
+        openBatch(text);
+      } catch {
+        video.style.display = 'none';
+        stopScanning();
+        scanError.textContent = 'Could not open camera — type the ID instead.';
+        scanError.style.display = 'block';
+      }
+    });
+
+    document.getElementById('print-btn')?.addEventListener('click', () => window.print());
+
+    document.getElementById('download-btn')?.addEventListener('click', () => {
+      if (!currentRows.length) return;
+      const header = ['Zone', 'Bin', 'Product', 'SKU', 'Order', 'Units', 'Status'];
+      const csvEscape = (v: string) => `"${v.replace(/"/g, '""')}"`;
+      const lines = [
+        header.join(','),
+        ...currentRows.map((r) =>
+          [r.zone_name ?? '', r.location_code, r.sku_name, r.sku_code, r.external_order_id, String(r.quantity_required), r.status].map(csvEscape).join(',')
+        )
+      ];
+      const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `pick-list-${currentBatchId}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+
+    boot();
+  </script>
+</AdminShell>

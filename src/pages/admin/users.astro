@@ -1,0 +1,126 @@
+---
+import AdminShell from '../../components/AdminShell.astro';
+---
+
+<AdminShell title="Users" current="users">
+  <div style="max-width: 560px; display: flex; flex-direction: column; gap: 18px;">
+    <div class="card stack">
+      <h2>Add a login</h2>
+      <p>
+        Each person on the floor should sign in as themselves, not share the "admin" or "packer" PIN — Amazon's compliance
+        questionnaire requires being able to individually identify who did what.
+      </p>
+      <form id="user-form" class="stack">
+        <input type="text" id="userName" placeholder="Name" required autocomplete="off" />
+        <select id="userRole">
+          <option value="packer">Packer (picking + packing)</option>
+          <option value="admin">Admin</option>
+        </select>
+        <input type="text" id="userPin" placeholder="4-digit PIN" inputmode="numeric" required autocomplete="off" />
+        <button type="submit" class="btn btn-primary">Add login</button>
+      </form>
+      <div id="form-result" class="banner" style="display:none;"></div>
+    </div>
+
+    <div class="card stack">
+      <h2>Logins</h2>
+      <div id="user-list" class="stack">Loading…</div>
+    </div>
+  </div>
+
+  <script>
+    interface UserRow {
+      id: string;
+      name: string;
+      role: string;
+      active: number;
+      created_at: string;
+    }
+
+    let warehouseId = '';
+    let currentUserId = '';
+
+    async function api(path: string, body?: unknown, method?: string) {
+      const res = await fetch(path, {
+        method: method ?? (body === undefined ? 'GET' : 'POST'),
+        headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body)
+      });
+      const data: any = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error ?? `Request failed (${res.status})`);
+      return data;
+    }
+
+    function val(id: string): string {
+      return (document.getElementById(id) as HTMLInputElement).value.trim();
+    }
+
+    async function loadUsers() {
+      const users: UserRow[] = await api(`/api/admin/users?warehouseId=${warehouseId}`);
+      const list = document.getElementById('user-list')!;
+      list.innerHTML = users
+        .map(
+          (u) => `
+        <div class="item-row">
+          <span class="name">${u.name}</span>
+          <span class="status-pill ${u.role === 'admin' ? 'status-warning' : 'status-progress'}">${u.role}</span>
+          <span class="status-pill ${u.active ? 'status-success' : 'status-neutral'}">${u.active ? 'active' : 'inactive'}</span>
+          ${u.id === currentUserId ? '' : `<button class="btn btn-ghost" style="width:auto; min-height:36px;" data-id="${u.id}" data-active="${u.active}">${u.active ? 'Deactivate' : 'Reactivate'}</button>`}
+        </div>`
+        )
+        .join('');
+
+      list.querySelectorAll('button[data-id]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const el = btn as HTMLButtonElement;
+          const active = el.dataset.active === '1';
+          try {
+            await api('/api/admin/users', { userId: el.dataset.id, active: !active }, 'PATCH');
+            await loadUsers();
+          } catch (err) {
+            alert((err as Error).message);
+          }
+        });
+      });
+    }
+
+    document.getElementById('user-form')?.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const resultEl = document.getElementById('form-result')!;
+      try {
+        await api('/api/admin/users', {
+          warehouseId,
+          name: val('userName'),
+          role: val('userRole'),
+          pin: val('userPin')
+        });
+        (document.getElementById('user-form') as HTMLFormElement).reset();
+        resultEl.className = 'banner banner-success';
+        resultEl.textContent = 'Login added.';
+        resultEl.style.display = 'block';
+        await loadUsers();
+      } catch (err) {
+        resultEl.className = 'banner banner-danger';
+        resultEl.textContent = (err as Error).message;
+        resultEl.style.display = 'block';
+      }
+    });
+
+    async function boot() {
+      const me = await api('/api/auth/me');
+      if (!me.user) {
+        window.location.href = '/login';
+        return;
+      }
+      if (me.user.role !== 'admin') {
+        document.body.innerHTML = `<div class="screen"><p>This account is a "${me.user.role}", not an admin.</p></div>`;
+        return;
+      }
+      warehouseId = me.user.warehouseId;
+      currentUserId = me.user.id;
+      await loadUsers();
+    }
+
+    boot();
+  </script>
+</AdminShell>

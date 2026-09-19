@@ -1,0 +1,224 @@
+---
+import AdminShell from '../../components/AdminShell.astro';
+---
+
+<AdminShell title="Ship order" current="ship">
+  <div id="app" class="stack" style="max-width: 560px;">
+    <p>Loading…</p>
+  </div>
+
+  <script>
+    interface BoxSize {
+      id: string;
+      name: string;
+      length: number;
+      width: number;
+      height: number;
+      dimension_unit: string;
+    }
+    interface HandoverSlot {
+      slotId: string;
+      startTime: string;
+      endTime: string;
+      handoverMethod: 'PICKUP' | 'DROPOFF';
+    }
+
+    const app = document.getElementById('app')!;
+    let warehouseId = '';
+    let orderId = '';
+    let boxSizes: BoxSize[] = [];
+    let labelPollTimer: ReturnType<typeof setInterval> | null = null;
+
+    async function api(path: string, body?: unknown) {
+      const res = await fetch(path, {
+        method: body === undefined ? 'GET' : 'POST',
+        headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body)
+      });
+      const data: any = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error ?? `Request failed (${res.status})`);
+      return data;
+    }
+
+    function formatSlot(s: HandoverSlot): { day: string; time: string } {
+      const start = new Date(s.startTime);
+      const end = new Date(s.endTime);
+      const day = start.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
+      const time = `${start.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })} – ${end.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}`;
+      return { day, time };
+    }
+
+    function renderForm(error?: string) {
+      stopLabelPoll();
+      app.innerHTML = `
+        ${error ? `<div class="banner banner-danger">${error}</div>` : ''}
+        <div class="card stack">
+          <label for="box">Box size</label>
+          <select id="box">${boxSizes.map((b) => `<option value="${b.id}">${b.name} (${b.length}×${b.width}×${b.height} ${b.dimension_unit})</option>`).join('')}</select>
+          <label for="weight">Weight (grams)</label>
+          <input type="number" id="weight" placeholder="e.g. 450" required />
+          <label for="package-id">Package identifier (printed on the label, bottom-right)</label>
+          <input type="text" id="package-id" placeholder="e.g. TAN-6339564" />
+          <button class="btn btn-primary" id="get-slots">Get pickup slots</button>
+        </div>
+        <div id="slots"></div>`;
+
+      document.getElementById('get-slots')?.addEventListener('click', async () => {
+        const boxSizeId = (document.getElementById('box') as unknown as HTMLSelectElement).value;
+        const weightGrams = Number((document.getElementById('weight') as HTMLInputElement).value);
+        const packageIdentifier = (document.getElementById('package-id') as HTMLInputElement).value;
+        if (!boxSizeId || !weightGrams) return;
+        try {
+          const slots: HandoverSlot[] = await api('/api/admin/shipping/slots', { orderId, boxSizeId, weightGrams });
+          renderSlots(slots, boxSizeId, weightGrams, packageIdentifier);
+        } catch (err) {
+          renderForm((err as Error).message);
+        }
+      });
+    }
+
+    function renderSlots(slots: HandoverSlot[], boxSizeId: string, weightGrams: number, packageIdentifier: string) {
+      const slotsEl = document.getElementById('slots')!;
+      if (!slots.length) {
+        slotsEl.innerHTML = '<div class="banner banner-warning">No pickup slots available for this box/weight right now.</div>';
+        return;
+      }
+      slotsEl.innerHTML = `
+        <div class="card stack" style="margin-top: 16px;">
+          <label>Pickup slot</label>
+          <div class="stack" id="slot-options">
+            ${slots
+              .map((s, i) => {
+                const { day, time } = formatSlot(s);
+                return `<button class="btn" data-idx="${i}" style="justify-content: space-between;">
+                  <span>${day}</span><span style="color: var(--muted);">${time}</span>
+                </button>`;
+              })
+              .join('')}
+          </div>
+        </div>`;
+
+      slotsEl.querySelectorAll('button[data-idx]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          slotsEl.querySelectorAll('button[data-idx]').forEach((b) => b.classList.remove('btn-primary'));
+          btn.classList.add('btn-primary');
+          const idx = Number((btn as HTMLButtonElement).dataset.idx);
+          renderScheduleButton(slots[idx], boxSizeId, weightGrams, packageIdentifier);
+        });
+      });
+    }
+
+    function renderScheduleButton(slot: HandoverSlot, boxSizeId: string, weightGrams: number, packageIdentifier: string) {
+      let btn = document.getElementById('schedule-btn') as HTMLButtonElement | null;
+      if (!btn) {
+        btn = document.createElement('button');
+        btn.id = 'schedule-btn';
+        btn.className = 'btn btn-primary';
+        btn.style.marginTop = '16px';
+        btn.textContent = 'Schedule pickup';
+        document.getElementById('app')!.appendChild(btn);
+      }
+      btn.onclick = async () => {
+        try {
+          const result = await api('/api/admin/shipping/schedule', {
+            orderId,
+            boxSizeId,
+            weightValue: weightGrams,
+            weightUnit: 'grams',
+            slot: { slotId: slot.slotId, startTime: slot.startTime, endTime: slot.endTime, handoverMethod: slot.handoverMethod },
+            packageIdentifier
+          });
+          renderScheduled(result.shipmentId, result.trackingId);
+        } catch (err) {
+          renderForm((err as Error).message);
+        }
+      };
+    }
+
+    function renderScheduled(shipmentId: string, trackingId?: string) {
+      app.innerHTML = `
+        <div class="stack" style="text-align: center;">
+          <div class="banner banner-success">Pickup scheduled${trackingId ? ` — tracking ${trackingId}` : ''}</div>
+          <p>Fetching the label from Amazon — this can take a little while (it's an async document request, not instant).</p>
+          <div id="label-status" class="banner banner-warning">Requesting label…</div>
+        </div>`;
+      pollLabel(shipmentId);
+    }
+
+    function stopLabelPoll() {
+      if (labelPollTimer !== null) {
+        clearInterval(labelPollTimer);
+        labelPollTimer = null;
+      }
+    }
+
+    function pollLabel(shipmentId: string) {
+      stopLabelPoll();
+      const check = async () => {
+        try {
+          const result = await api(`/api/admin/shipping/label-status?shipmentId=${shipmentId}`);
+          if (result.labelStatus === 'document_ready' && result.labelBase64) {
+            stopLabelPoll();
+            renderLabel(result.labelBase64, result.labelFileType);
+          } else {
+            const statusEl = document.getElementById('label-status');
+            if (statusEl) statusEl.textContent = `Status: ${result.labelStatus.replace(/_/g, ' ')}…`;
+          }
+        } catch (err) {
+          stopLabelPoll();
+          const statusEl = document.getElementById('label-status');
+          if (statusEl) {
+            statusEl.className = 'banner banner-danger';
+            statusEl.innerHTML = `${(err as Error).message} <button class="btn btn-ghost" id="retry-label" style="width:auto;">Retry</button>`;
+            document.getElementById('retry-label')?.addEventListener('click', async () => {
+              await api('/api/admin/shipping/label-status', { shipmentId });
+              pollLabel(shipmentId);
+            });
+          }
+        }
+      };
+      check();
+      labelPollTimer = setInterval(check, 6000);
+    }
+
+    function renderLabel(labelBase64: string, labelFileType: string) {
+      app.innerHTML = `
+        <div class="stack" style="text-align: center;">
+          <div class="banner banner-success">Label ready</div>
+          ${
+            /pdf/i.test(labelFileType)
+              ? `<embed src="data:${labelFileType};base64,${labelBase64}" type="application/pdf" style="width: 100%; height: 500px; border: 1px solid var(--border); border-radius: var(--radius);" />`
+              : `<img src="data:${labelFileType};base64,${labelBase64}" alt="Shipping label" style="max-width: 100%; border: 1px solid var(--border); border-radius: var(--radius);" />`
+          }
+          <a href="/admin" class="btn">Back to admin</a>
+        </div>`;
+    }
+
+    async function boot() {
+      const me = await api('/api/auth/me');
+      if (!me.user) {
+        window.location.href = '/login';
+        return;
+      }
+      if (me.user.role !== 'admin') {
+        app.innerHTML = `<p>This account is a "${me.user.role}", not an admin.</p>`;
+        return;
+      }
+      warehouseId = me.user.warehouseId;
+      orderId = new URLSearchParams(window.location.search).get('orderId') ?? '';
+      if (!orderId) {
+        app.innerHTML = '<p>No order specified.</p>';
+        return;
+      }
+
+      boxSizes = await api(`/api/admin/box-sizes?warehouseId=${warehouseId}`);
+      if (!boxSizes.length) {
+        app.innerHTML = `<p>No box sizes configured yet. <a href="/admin/settings">Add one in Settings</a> first.</p>`;
+        return;
+      }
+      renderForm();
+    }
+
+    boot();
+  </script>
+</AdminShell>

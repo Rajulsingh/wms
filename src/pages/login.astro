@@ -1,0 +1,66 @@
+---
+import Base from '../layouts/Base.astro';
+---
+
+<Base title="Sign in">
+  <div class="auth-shell">
+    <div class="auth-card stack">
+      <div class="brand" style="margin-bottom: 6px;">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 8 12 3 3 8l9 5 9-5Z"></path>
+            <path d="M3 8v8l9 5 9-5V8"></path>
+            <path d="M12 13v8"></path>
+          </svg>
+        </span>
+        <span class="brand-text">
+          <span class="brand-name">ecomglider</span>
+          <span class="brand-section">Warehouse</span>
+        </span>
+      </div>
+      <h1 class="big-label" style="font-size: 1.6rem;">Sign in</h1>
+      <form id="login-form" class="stack">
+        <div class="stack" style="gap: 6px;">
+          <label for="name">Name</label>
+          <input id="name" name="name" type="text" autocomplete="username" required />
+        </div>
+        <div class="stack" style="gap: 6px;">
+          <label for="pin">PIN</label>
+          <input id="pin" name="pin" type="password" inputmode="numeric" autocomplete="current-password" required />
+        </div>
+        <div id="error" class="banner banner-danger" style="display: none;"></div>
+        <button type="submit" class="btn btn-primary">Sign in</button>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    const form = document.getElementById('login-form') as HTMLFormElement;
+    const errorBox = document.getElementById('error') as HTMLDivElement;
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      errorBox.style.display = 'none';
+      const name = (document.getElementById('name') as HTMLInputElement).value.trim();
+      const pin = (document.getElementById('pin') as HTMLInputElement).value.trim();
+
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, pin })
+      });
+
+      if (!res.ok) {
+        const body: any = await res.json().catch(() => ({ error: 'Sign in failed' }));
+        errorBox.textContent = body.error ?? 'Sign in failed';
+        errorBox.style.display = 'block';
+        return;
+      }
+
+      const user: any = await res.json();
+      // 'packer' is the one floor-worker role now — land on picking first, they can switch to packing from there.
+      const dest = user.role === 'packer' ? '/picker' : '/admin';
+      window.location.href = dest;
+    });
+  </script>
+</Base>
