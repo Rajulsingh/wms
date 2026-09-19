@@ -2,12 +2,13 @@
 interface Props {
   section: string;
   class?: string;
+  homeHref?: string;
 }
-const { section, class: extraClass } = Astro.props;
+const { section, class: extraClass, homeHref = '/packer/home' } = Astro.props;
 ---
 
 <div class:list={['top-nav', extraClass]}>
-  <div class="brand">
+  <a class="brand" href={homeHref} aria-label="Back to home">
     <span class="brand-mark" aria-hidden="true">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <path d="M21 8 12 3 3 8l9 5 9-5Z"></path>
@@ -19,7 +20,7 @@ const { section, class: extraClass } = Astro.props;
       <span class="brand-name">ecomglider</span>
       <span class="brand-section">{section}</span>
     </span>
-  </div>
+  </a>
   <div class="row" style="gap: 8px; align-items: center; flex-wrap: wrap;">
     <slot />
   </div>

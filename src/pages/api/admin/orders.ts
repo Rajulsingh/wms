@@ -1,6 +1,7 @@
 import type { APIRoute } from 'astro';
 import { getDb, logAudit, newId } from '../../../lib/db';
 import { requireUser, AuthError } from '../../../lib/auth';
+import { resolveSkuIdByCode } from '../../../lib/skus';
 
 /** Manual order entry / CSV-row-at-a-time import (§11 MVP: "manual + CSV/API"). One order per call; a CSV upload UI can call this in a loop. */
 export const POST: APIRoute = async (context) => {
@@ -27,14 +28,14 @@ export const POST: APIRoute = async (context) => {
 
     const unmatchedSkus: string[] = [];
     for (const item of body.items) {
-      const sku = await db.prepare(`SELECT id FROM skus WHERE sku_code = ?`).bind(item.skuCode).first<{ id: string }>();
-      if (!sku) {
+      const skuId = await resolveSkuIdByCode(db, item.skuCode);
+      if (!skuId) {
         unmatchedSkus.push(item.skuCode);
         continue;
       }
       await db
         .prepare(`INSERT INTO order_items (id, order_id, sku_id, quantity_ordered) VALUES (?, ?, ?, ?)`)
-        .bind(newId(), orderId, sku.id, item.quantity)
+        .bind(newId(), orderId, skuId, item.quantity)
         .run();
     }
 
@@ -65,6 +66,23 @@ export const GET: APIRoute = async (context) => {
       .bind(warehouseId)
       .all();
     return new Response(JSON.stringify(orders.results), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  } catch (err) {
+    if (err instanceof AuthError) return new Response(JSON.stringify({ error: err.message }), { status: err.status });
+    return new Response(JSON.stringify({ error: (err as Error).message }), { status: 500 });
+  }
+};
+
+/** Sets/clears an order's free-text note (e.g. "free gift included", "multi-qty, double-check count") — surfaced to floor workers on /picker and /packer. */
+export const PATCH: APIRoute = async (context) => {
+  const db = getDb();
+  try {
+    const user = await requireUser(context, db, ['admin']);
+    const body = await context.request.json<{ orderId: string; notes: string | null }>();
+
+    const notes = body.notes?.trim() || null;
+    await db.prepare(`UPDATE orders SET notes = ? WHERE id = ?`).bind(notes, body.orderId).run();
+    await logAudit(db, { userId: user.id, action: 'order.notes_update', entityType: 'order', entityId: body.orderId, metadata: { notes } });
+    return new Response(JSON.stringify({ ok: true, notes }), { status: 200, headers: { 'Content-Type': 'application/json' } });
   } catch (err) {
     if (err instanceof AuthError) return new Response(JSON.stringify({ error: err.message }), { status: err.status });
     return new Response(JSON.stringify({ error: (err as Error).message }), { status: 500 });

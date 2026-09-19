@@ -1,0 +1,140 @@
+---
+import Base from '../../layouts/Base.astro';
+import TopBar from '../../components/TopBar.astro';
+---
+
+<Base title="Dashboard">
+  <div class="screen">
+    <TopBar section="Dashboard" homeHref="/packer/home">
+      <a href="/picker" class="pill tab-pill" style="text-decoration: none;">Pick<span class="badge-dot" id="badge-pick"></span></a>
+      <a href="/packer" class="pill tab-pill" style="text-decoration: none;">Pack<span class="badge-dot" id="badge-pack"></span></a>
+      <span class="pill" id="user-pill">…</span>
+    </TopBar>
+
+    <div id="app" class="stack" style="flex: 1;">
+      <p>Loading…</p>
+    </div>
+  </div>
+
+  <script>
+    interface MyBatch {
+      batchId: string;
+      orderCount: number;
+      skuCount: number;
+      remaining: number;
+    }
+    interface UpcomingBatch {
+      batchId: string;
+      createdAt: string;
+      orderCount: number;
+      skuCount: number;
+      unitCount: number;
+    }
+
+    const app = document.getElementById('app')!;
+    const userPill = document.getElementById('user-pill')!;
+    let warehouseId = '';
+
+    async function api(path: string, body?: unknown) {
+      const res = await fetch(path, {
+        method: body === undefined ? 'GET' : 'POST',
+        headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body)
+      });
+      const data: any = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error ?? `Request failed (${res.status})`);
+      return data;
+    }
+
+    function pollWorkBadge() {
+      setInterval(async () => {
+        if (document.hidden) return;
+        try {
+          const summary = await api(`/api/packer/work-summary?warehouseId=${warehouseId}`);
+          document.getElementById('badge-pick')?.classList.toggle('show', summary.pickable > 0);
+          document.getElementById('badge-pack')?.classList.toggle('show', summary.packable > 0);
+        } catch {
+          // Badge is a convenience, not load-bearing — ignore transient failures.
+        }
+      }, 10000);
+    }
+
+    async function boot() {
+      const me = await api('/api/auth/me');
+      if (!me.user) {
+        window.location.href = '/login';
+        return;
+      }
+      if (me.user.role !== 'packer') {
+        app.innerHTML = `<p>This account is a "${me.user.role}" — the packer dashboard needs a packer login.</p>`;
+        return;
+      }
+      userPill.textContent = me.user.name;
+      warehouseId = me.user.warehouseId;
+      pollWorkBadge();
+
+      await load();
+      setInterval(() => {
+        if (!document.hidden) load();
+      }, 15000);
+    }
+
+    async function load() {
+      try {
+        const data = await api(`/api/packer/dashboard?warehouseId=${warehouseId}`);
+        render(data.myBatches ?? [], data.upcoming ?? []);
+      } catch (err) {
+        app.innerHTML = `<div class="banner banner-danger">${(err as Error).message}</div>`;
+      }
+    }
+
+    function render(myBatches: MyBatch[], upcoming: UpcomingBatch[]) {
+      app.innerHTML = `
+        <div class="stack" style="gap: 10px;">
+          <span class="eyebrow">Assigned to you</span>
+          ${
+            myBatches.length
+              ? myBatches
+                  .map(
+                    (b) => `
+                <div class="card">
+                  <div class="row" style="justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+                    <div class="stack" style="gap: 2px;">
+                      <span style="font-weight: 600;">${b.orderCount} order${b.orderCount > 1 ? 's' : ''} · ${b.skuCount} SKU line${b.skuCount > 1 ? 's' : ''}</span>
+                      <span style="font-size: 0.8rem; color: var(--muted);">${b.remaining > 0 ? `${b.remaining} line${b.remaining > 1 ? 's' : ''} left to pick` : 'Picking complete — ready to pack'}</span>
+                    </div>
+                    <a class="btn btn-primary" style="width: auto; text-decoration: none;" href="${b.remaining > 0 ? '/picker' : '/packer'}">${b.remaining > 0 ? 'Go to picking' : 'Go to packing'}</a>
+                  </div>
+                </div>`
+                  )
+                  .join('')
+              : `<p>Nothing assigned to you right now — head to <a href="/picker">Pick</a> and one will be swept up automatically.</p>`
+          }
+        </div>
+
+        <div class="stack" style="gap: 10px; margin-top: 8px;">
+          <span class="eyebrow">Upcoming — pulled, not yet assigned</span>
+          ${
+            upcoming.length
+              ? `<div class="stack" style="gap: 8px;">
+                  ${upcoming
+                    .map(
+                      (b) => `
+                    <div class="item-row">
+                      <div class="stack" style="gap: 2px; flex: 1;">
+                        <span style="font-weight: 600;">${b.orderCount} order${b.orderCount > 1 ? 's' : ''} · ${b.unitCount} unit${b.unitCount > 1 ? 's' : ''}</span>
+                        <span style="font-size: 0.78rem; color: var(--muted);">${b.skuCount} SKU line${b.skuCount > 1 ? 's' : ''} · created ${new Date(b.createdAt).toLocaleString()}</span>
+                      </div>
+                      <span class="status-pill status-neutral">Waiting</span>
+                    </div>`
+                    )
+                    .join('')}
+                </div>`
+              : `<p>Nothing waiting — every pulled batch is already assigned.</p>`
+          }
+        </div>`;
+    }
+
+    boot();
+  </script>
+</Base>

@@ -307,7 +307,18 @@ p {
   padding: 10px 16px;
 }
 
-.item-row .thumb {
+/*
+ * Base rule, not scoped to .item-row — this is also used bare (no .item-row
+ * wrapper) on /picker, /packer, and admin/inbound's selected-SKU preview.
+ * It was previously scoped as `.item-row .thumb`, so a bare `<img
+ * class="thumb">` outside that wrapper got no sizing at all and rendered at
+ * the image's native resolution — invisible with small seed/placeholder
+ * images, but a real Amazon product photo blew out the whole card and
+ * pushed the SKU name off-screen. Found 2026-09-19 against a real product
+ * image in production; fixed by making this the base rule instead of
+ * `.item-row`-scoped.
+ */
+.thumb {
   width: 44px;
   height: 44px;
   border-radius: 8px;
@@ -584,11 +595,18 @@ tbody tr:hover {
   display: block;
 }
 
-/* Brand lockup — used by TopBar.astro and the login screen. */
+/* Brand lockup — used by TopBar.astro and the login screen. TopBar's is a
+   link back to the packer dashboard, so it needs the anchor defaults
+   (accent color, underline) neutralized to keep looking like a logo. */
 .brand {
   display: flex;
   align-items: center;
   gap: 10px;
+}
+
+a.brand {
+  text-decoration: none;
+  color: inherit;
 }
 
 .brand-mark {
@@ -695,6 +713,8 @@ tbody tr:hover {
   padding: 18px 20px;
   border-bottom: 1px solid var(--sidebar-border);
   flex-shrink: 0;
+  text-decoration: none;
+  color: inherit;
 }
 
 .admin-sidebar-brand .brand-name {

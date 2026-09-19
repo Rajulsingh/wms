@@ -5,7 +5,7 @@ import TopBar from '../../components/TopBar.astro';
 
 <Base title="Pick list">
   <div class="screen">
-    <TopBar section="Picking">
+    <TopBar section="Picking" homeHref="/packer/home">
       <a href="/picker" class="pill tab-pill active" style="text-decoration: none;">Pick<span class="badge-dot" id="badge-pick"></span></a>
       <a href="/packer" class="pill tab-pill" style="text-decoration: none;">Pack<span class="badge-dot" id="badge-pack"></span></a>
       <span class="pill" id="user-pill">…</span>
@@ -17,6 +17,8 @@ import TopBar from '../../components/TopBar.astro';
   </div>
 
   <script>
+    import { escapeHtml } from '../../lib/ui';
+
     interface Row {
       pick_task_id: string;
       zone_name: string | null;
@@ -26,9 +28,15 @@ import TopBar from '../../components/TopBar.astro';
       image_url: string | null;
       external_order_id: string;
       order_source: string;
+      order_notes: string | null;
       quantity_required: number;
       quantity_picked: number;
       status: string;
+    }
+
+    interface BatchEntry {
+      batchId: string;
+      rows: Row[];
     }
 
     interface SkuGroup {
@@ -41,48 +49,15 @@ import TopBar from '../../components/TopBar.astro';
     const app = document.getElementById('app')!;
     const userPill = document.getElementById('user-pill')!;
     let warehouseId = '';
-    let batchId: string | null = null;
-    let rows: Row[] = [];
+    let batchList: BatchEntry[] = [];
     let lastError = '';
-    let pollTimer: ReturnType<typeof setInterval> | null = null;
 
-    // Orders keep arriving and admin keeps creating batches — a picker sitting
-    // on the "no batches"/"picking complete" screen should see new work show up
-    // on its own, not have to keep tapping "check again".
-    function stopPolling() {
-      if (pollTimer !== null) {
-        clearInterval(pollTimer);
-        pollTimer = null;
-      }
-    }
-
-    function pollForBatch() {
-      stopPolling();
-      pollTimer = setInterval(async () => {
-        if (document.hidden) return;
-        const claimed = await api('/api/picker/claim-batch', { warehouseId });
-        if (claimed.batchId) {
-          stopPolling();
-          batchId = claimed.batchId;
-          rows = claimed.rows ?? [];
-          render();
-        }
-      }, 8000);
-    }
-
-    // Badge on the "Pack" tab so a picker knows work is waiting there without
-    // switching over to check — packers never see price here or on that tab.
-    function pollWorkBadge() {
-      setInterval(async () => {
-        if (document.hidden) return;
-        try {
-          const summary = await api(`/api/packer/work-summary?warehouseId=${warehouseId}`);
-          document.getElementById('badge-pack')?.classList.toggle('show', summary.packable > 0);
-        } catch {
-          // Badge is a convenience, not load-bearing — ignore transient failures.
-        }
-      }, 10000);
-    }
+    // Keyed by `${batchId}__${locationCode}__${skuCode}` — a SKU group that's
+    // mid-way through the "why was this short" flow (either a shortfall
+    // entered on "Mark done", or the standalone "Report issue" button).
+    // Rendered inline in that card, not a full-screen takeover, so the rest
+    // of a long multi-batch page doesn't lose its place.
+    const pendingReasonFor: Record<string, { pickTaskIds: string[]; quantity: number }> = {};
 
     async function api(path: string, body?: unknown) {
       const res = await fetch(path, {
@@ -110,14 +85,44 @@ import TopBar from '../../components/TopBar.astro';
       pollWorkBadge();
 
       const claimed = await api('/api/picker/claim-batch', { warehouseId });
-      batchId = claimed.batchId;
-      rows = claimed.rows ?? [];
-      if (!batchId) {
-        renderNoBatch();
-        return;
-      }
-      stopPolling();
+      batchList = claimed.batches ?? [];
       render();
+
+      // Batches keep arriving — admin assigning one directly, or a fresh
+      // auto-sweep once everything currently shown is finished — so this
+      // never stops polling. Only actually re-renders when something new
+      // shows up, so an open "why was this short" panel elsewhere on the
+      // page survives a quiet tick. See HANDOFF.md.
+      setInterval(pollForMore, 8000);
+    }
+
+    async function pollForMore() {
+      if (document.hidden) return;
+      try {
+        const data = await api('/api/picker/claim-batch', { warehouseId });
+        const incoming: BatchEntry[] = data.batches ?? [];
+        const newOnes = incoming.filter((b) => !batchList.some((e) => e.batchId === b.batchId));
+        if (newOnes.length) {
+          batchList.push(...newOnes);
+          render();
+        }
+      } catch {
+        // Transient — ignore, the next tick retries.
+      }
+    }
+
+    // Badge on the "Pack" tab so a picker knows work is waiting there without
+    // switching over to check — packers never see price here or on that tab.
+    function pollWorkBadge() {
+      setInterval(async () => {
+        if (document.hidden) return;
+        try {
+          const summary = await api(`/api/packer/work-summary?warehouseId=${warehouseId}`);
+          document.getElementById('badge-pack')?.classList.toggle('show', summary.packable > 0);
+        } catch {
+          // Badge is a convenience, not load-bearing — ignore transient failures.
+        }
+      }, 10000);
     }
 
     function renderNoBatch() {
@@ -128,33 +133,62 @@ import TopBar from '../../components/TopBar.astro';
           <button class="btn" id="retry">Check again</button>
         </div>`;
       document.getElementById('retry')?.addEventListener('click', boot);
-      pollForBatch();
     }
 
-    // Bulk-pick by SKU, not by order: within one bin, every order that needs
-    // the same SKU collapses into one aggregate line ("KTN3 required 7,
-    // picked 0/7") instead of one card per order. Zone/bin sectioning is
-    // still the outer walking order (unavoidable — the picker can only be in
-    // one bin at a time), but the fragmentation this replaces was never
-    // about location, it was the same SKU at the same bin showing up once
-    // per order. See HANDOFF.md.
+    // Every batch this picker has (auto-swept, or hand-assigned by admin)
+    // renders on ONE continuous page — no "get next batch" click gate.
+    // Freshly added batches (see pollForMore) simply append at the bottom;
+    // the picker just scrolls down to them. See HANDOFF.md.
     function render() {
-      lastError = '';
-      const remaining = rows.filter((r) => r.status === 'pending');
-
-      if (!remaining.length) {
-        app.innerHTML = `
-          <div class="stack" style="flex:1; justify-content:center; text-align:center;">
-            <div class="banner banner-success">Picking complete</div>
-            <div class="big-label">Go to packing station</div>
-            <button class="btn" id="new-batch">Get next batch</button>
-          </div>`;
-        document.getElementById('new-batch')?.addEventListener('click', boot);
+      if (!batchList.length) {
+        renderNoBatch();
         return;
       }
 
+      const allRows = batchList.flatMap((e) => e.rows);
+      const totalRemaining = allRows.filter((r) => r.status === 'pending').length;
+      const totalOrders = new Set(allRows.map((r) => r.external_order_id)).size;
+      const totalSkuLines = new Set(batchList.flatMap((e) => e.rows.map((r) => `${e.batchId}__${r.location_code}__${r.sku_code}`))).size;
+
+      app.innerHTML = `
+        ${lastError ? `<div class="banner banner-danger">${lastError}</div>` : ''}
+        <div class="stack" id="summary" style="flex-direction: row; gap: 16px; flex-wrap: wrap;">
+          <span class="pill">${totalOrders} orders</span>
+          <span class="pill">${totalSkuLines} SKU lines</span>
+          <span class="pill">${totalRemaining} of ${allRows.length} left</span>
+          ${batchList.length > 1 ? `<span class="pill">${batchList.length} batches</span>` : ''}
+        </div>
+        <div class="stack" id="batch-container" style="gap: 22px;"></div>`;
+
+      const container = document.getElementById('batch-container')!;
+      for (const entry of batchList) container.appendChild(renderBatchSection(entry));
+
+      if (totalRemaining === 0) {
+        const banner = document.createElement('div');
+        banner.className = 'banner banner-success';
+        banner.textContent = 'All caught up — new batches will appear here automatically.';
+        container.appendChild(banner);
+      }
+    }
+
+    function renderBatchSection(entry: BatchEntry): HTMLElement {
+      const wrap = document.createElement('div');
+      wrap.className = 'stack';
+      wrap.style.gap = '12px';
+
+      const orderCount = new Set(entry.rows.map((r) => r.external_order_id)).size;
+      const remaining = entry.rows.filter((r) => r.status === 'pending').length;
+      const header = document.createElement('div');
+      header.className = 'row';
+      header.style.justifyContent = 'space-between';
+      header.style.alignItems = 'center';
+      header.innerHTML = `<span class="eyebrow">Batch · ${orderCount} order${orderCount > 1 ? 's' : ''}</span>${
+        remaining === 0 ? '<span class="status-pill status-success">Done</span>' : ''
+      }`;
+      wrap.appendChild(header);
+
       const locGroups: Array<{ key: string; zone: string; bin: string; rows: Row[] }> = [];
-      for (const r of rows) {
+      for (const r of entry.rows) {
         const key = `${r.zone_name ?? '—'}__${r.location_code}`;
         let g = locGroups.find((g) => g.key === key);
         if (!g) {
@@ -164,17 +198,6 @@ import TopBar from '../../components/TopBar.astro';
         g.rows.push(r);
       }
 
-      const skuLineCount = new Set(rows.map((r) => `${r.location_code}__${r.sku_code}`)).size;
-      app.innerHTML = `
-        ${errorBanner()}
-        <div class="stack" id="summary" style="flex-direction: row; gap: 16px; flex-wrap: wrap;">
-          <span class="pill">${new Set(rows.map((r) => r.external_order_id)).size} orders</span>
-          <span class="pill">${skuLineCount} SKU lines</span>
-          <span class="pill">${remaining.length} of ${rows.length} left</span>
-        </div>
-        <div class="stack" id="groups"></div>`;
-
-      const groupsEl = document.getElementById('groups')!;
       for (const locGroup of locGroups) {
         const section = document.createElement('div');
         section.className = 'stack';
@@ -190,94 +213,193 @@ import TopBar from '../../components/TopBar.astro';
           }
           sg.rows.push(r);
         }
-        for (const sg of skuGroups) section.appendChild(renderSkuGroup(sg));
-        groupsEl.appendChild(section);
+        for (const sg of skuGroups) {
+          const groupKey = `${entry.batchId}__${locGroup.bin}__${sg.sku_code}`;
+          section.appendChild(renderSkuGroup(entry, sg, groupKey));
+        }
+        wrap.appendChild(section);
       }
+      return wrap;
     }
 
-    function renderSkuGroup(sg: SkuGroup): HTMLElement {
+    function renderSkuGroup(entry: BatchEntry, sg: SkuGroup, groupKey: string): HTMLElement {
       const required = sg.rows.reduce((sum, r) => sum + r.quantity_required, 0);
       const picked = sg.rows.reduce((sum, r) => sum + r.quantity_picked, 0);
       const pendingRows = sg.rows.filter((r) => r.status === 'pending');
       const done = pendingRows.length === 0;
       const remainingNeeded = required - picked;
       const orderCount = new Set(sg.rows.map((r) => r.external_order_id)).size;
+      const reasonState = pendingReasonFor[groupKey];
 
       const orderBreakdown = sg.rows
-        .map((r) => `${r.external_order_id} ×${r.quantity_required}${r.status !== 'pending' ? ` (got ${r.quantity_picked}, ${r.status})` : ''}`)
+        .map((r) => {
+          const base = `${escapeHtml(r.external_order_id)} ×${r.quantity_required}${r.status !== 'pending' ? ` (got ${r.quantity_picked}, ${r.status})` : ''}`;
+          return r.order_notes ? `${base} <strong style="color: var(--warning-fg);">— ${escapeHtml(r.order_notes)}</strong>` : base;
+        })
         .join(' · ');
+
+      let actionHtml: string;
+      if (done) {
+        const short = picked < required;
+        actionHtml = short
+          ? `<div class="banner banner-warning" style="margin-top: 10px; padding: 8px 12px;">Short — ${required - picked} unresolved</div>`
+          : `<div class="banner banner-success" style="margin-top: 10px; padding: 8px 12px;">Done</div>`;
+      } else if (reasonState) {
+        actionHtml = `
+          <div class="stack" style="margin-top: 10px; gap: 8px; border-top: 1px dashed var(--border); padding-top: 10px;">
+            <span style="font-size: 0.85rem; font-weight: 600;">
+              ${reasonState.quantity > 0 ? `Picking ${reasonState.quantity} of ${remainingNeeded} — why not the rest?` : `Reporting all ${remainingNeeded} — why?`}
+            </span>
+            <select class="reason-select">
+              <option value="damaged">Damaged — none usable</option>
+              <option value="low_stock">Low stock — not enough available</option>
+              <option value="other">Other</option>
+            </select>
+            <input type="text" class="reason-note" placeholder="Add a note (optional)" style="display:none;" />
+            <div class="row" style="gap: 8px;">
+              <button class="btn btn-ghost" data-action="cancel-reason" style="flex:1;">Cancel</button>
+              <button class="btn btn-primary" data-action="submit-reason" style="flex:1;">Submit</button>
+            </div>
+          </div>`;
+      } else {
+        actionHtml = `
+          <div class="row" style="margin-top: 10px; gap: 8px; align-items: center;">
+            <input type="number" class="qty-input" min="0" max="${remainingNeeded}" value="${remainingNeeded}" style="width: 90px; flex: 0 0 auto; min-height: 52px; text-align: center;" />
+            <button class="btn btn-primary" data-action="pick" style="flex: 1;">Mark done</button>
+          </div>
+          <p style="font-size: 0.72rem; margin: 4px 0 0;">If you didn't get the full amount, lower the number before marking done — you'll be asked why.</p>
+          <button class="btn btn-ghost" data-action="issue" style="margin-top: 4px;">Report issue</button>`;
+      }
 
       const el = document.createElement('div');
       el.className = 'card';
       el.innerHTML = `
         <div class="row" style="align-items: center; gap: 12px;">
           ${sg.image_url ? `<img class="thumb" src="${sg.image_url}" alt="" />` : '<div class="thumb"></div>'}
-          <div class="stack" style="gap: 2px; flex: 1;">
+          <div class="stack" style="gap: 2px; flex: 1; min-width: 0;">
             <span style="font-weight: 600;">${sg.sku_name}</span>
             <span style="font-size: 0.8rem; color: var(--muted);">${sg.sku_code} · ${orderCount} order${orderCount > 1 ? 's' : ''}</span>
           </div>
-          <span class="qty">${picked}/${required}</span>
+        </div>
+        <div class="row" style="gap: 24px; margin-top: 10px;">
+          <div class="stack" style="gap: 0;">
+            <span style="font-size: 0.62rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted);">Required</span>
+            <span class="qty" style="font-size: 1.15rem;">${required}</span>
+          </div>
+          <div class="stack" style="gap: 0;">
+            <span style="font-size: 0.62rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted);">Picked</span>
+            <span class="qty" style="font-size: 1.15rem; ${done && picked < required ? 'color: var(--danger);' : ''}">${picked}</span>
+          </div>
         </div>
         <div style="font-size: 0.72rem; color: var(--muted); margin-top: 6px;">${orderBreakdown}</div>
-        ${
-          done
-            ? `<div class="banner banner-success" style="margin-top: 10px; padding: 8px 12px;">Done</div>`
-            : `<div class="row" style="margin-top: 10px; gap: 8px; align-items: center;">
-                 <input type="number" class="qty-input" min="0" max="${remainingNeeded}" value="${remainingNeeded}" style="width: 90px; flex: 0 0 auto; min-height: 52px; text-align: center;" />
-                 <button class="btn btn-primary" data-action="pick" style="flex: 1;">Mark done</button>
-               </div>
-               <button class="btn btn-ghost" data-action="issue" style="margin-top: 8px;">Report issue</button>`
-        }`;
+        ${actionHtml}`;
 
       const pendingIds = pendingRows.map((r) => r.pick_task_id);
-      el.querySelector('[data-action="pick"]')?.addEventListener('click', async () => {
-        const input = el.querySelector('.qty-input') as HTMLInputElement;
-        const qty = Number(input.value);
-        await handleMarkPicked(pendingIds, qty);
-      });
-      el.querySelector('[data-action="issue"]')?.addEventListener('click', () => {
-        renderIssueSheet(sg, pendingIds, remainingNeeded);
-      });
+
+      if (!done && !reasonState) {
+        el.querySelector('[data-action="pick"]')?.addEventListener('click', () => {
+          const input = el.querySelector('.qty-input') as HTMLInputElement;
+          const qty = Number(input.value);
+          if (qty < remainingNeeded) {
+            pendingReasonFor[groupKey] = { pickTaskIds: pendingIds, quantity: qty };
+            render();
+          } else {
+            submitPick(entry, pendingIds, qty);
+          }
+        });
+        el.querySelector('[data-action="issue"]')?.addEventListener('click', () => {
+          pendingReasonFor[groupKey] = { pickTaskIds: pendingIds, quantity: 0 };
+          render();
+        });
+      } else if (reasonState) {
+        const select = el.querySelector('.reason-select') as unknown as HTMLSelectElement;
+        const noteInput = el.querySelector('.reason-note') as HTMLInputElement;
+        select.addEventListener('change', () => {
+          noteInput.style.display = select.value === 'other' ? 'block' : 'none';
+        });
+        el.querySelector('[data-action="cancel-reason"]')?.addEventListener('click', () => {
+          delete pendingReasonFor[groupKey];
+          render();
+        });
+        el.querySelector('[data-action="submit-reason"]')?.addEventListener('click', () => {
+          const reasonValue = select.value;
+          const note = noteInput.value.trim();
+          const { pickTaskIds, quantity } = reasonState;
+          delete pendingReasonFor[groupKey];
+
+          // "Damaged — none usable" only takes the destructive full
+          // write-off path when nothing was actually picked — if some units
+          // were picked (quantity > 0) the reason is just an annotation on
+          // an otherwise ordinary short pick, not an inventory damage claim.
+          if (reasonValue === 'damaged' && quantity === 0) {
+            submitDamaged(entry, pickTaskIds, note ? `Damaged — none usable: ${note}` : 'Damaged — none usable');
+          } else {
+            const label =
+              reasonValue === 'damaged'
+                ? note ? `Damaged (partial): ${note}` : 'Damaged (partial)'
+                : reasonValue === 'low_stock'
+                  ? note ? `Low stock — not enough available: ${note}` : 'Low stock — not enough available'
+                  : note ? `Other: ${note}` : 'Other';
+            submitPick(entry, pickTaskIds, quantity, label);
+          }
+        });
+      }
+
       return el;
     }
 
-    async function handleMarkPicked(pickTaskIds: string[], quantity: number) {
+    // Mutates entry.rows and re-renders BEFORE the network call resolves —
+    // the tap feels instant instead of waiting on a round trip. If the
+    // server disagrees (a race, a stale batch), the optimistic guess is
+    // rolled back and the authoritative rows take over.
+    function applyOptimisticPick(rows: Row[], ids: string[], totalQuantity: number) {
+      let remaining = totalQuantity;
+      for (const id of ids) {
+        const row = rows.find((r) => r.pick_task_id === id);
+        if (!row) continue;
+        const alloc = Math.min(remaining, row.quantity_required);
+        remaining -= alloc;
+        row.quantity_picked = alloc;
+        row.status = alloc >= row.quantity_required ? 'picked' : 'short';
+      }
+    }
+
+    function applyOptimisticDamaged(rows: Row[], ids: string[]) {
+      for (const id of ids) {
+        const row = rows.find((r) => r.pick_task_id === id);
+        if (row) row.status = 'damaged';
+      }
+    }
+
+    async function submitPick(entry: BatchEntry, pickTaskIds: string[], quantity: number, reason?: string) {
+      const snapshot = entry.rows.map((r) => ({ ...r }));
+      applyOptimisticPick(entry.rows, pickTaskIds, quantity);
+      lastError = '';
+      render();
       try {
-        const res = await api('/api/picker/mark-picked', { batchId, pickTaskIds, quantity });
-        rows = res.rows;
+        const res = await api('/api/picker/mark-picked', { batchId: entry.batchId, pickTaskIds, quantity, reason });
+        entry.rows = res.rows;
         render();
       } catch (err) {
+        entry.rows = snapshot;
         lastError = (err as Error).message;
         render();
       }
     }
 
-    function renderIssueSheet(sg: SkuGroup, pendingIds: string[], remainingNeeded: number) {
-      app.innerHTML = `
-        <div class="stack" style="flex:1; justify-content:center; text-align:center;">
-          <span class="eyebrow">${sg.sku_name}</span>
-          <p>Needed: ${remainingNeeded}</p>
-          <p>If only some units are damaged, cancel this and enter how many you actually got in the quantity box instead — the rest is automatically logged as short.</p>
-          <div class="stack">
-            <button class="btn btn-danger" id="damaged">Damaged — none usable</button>
-          </div>
-          <button class="btn btn-ghost" id="cancel">Cancel</button>
-        </div>`;
-
-      document.getElementById('damaged')?.addEventListener('click', async () => {
-        try {
-          rows = await api('/api/picker/report-damaged', { batchId, pickTaskIds: pendingIds });
-          render();
-        } catch (err) {
-          lastError = (err as Error).message;
-          render();
-        }
-      });
-      document.getElementById('cancel')?.addEventListener('click', render);
-    }
-
-    function errorBanner() {
-      return lastError ? `<div class="banner banner-danger">${lastError}</div>` : '';
+    async function submitDamaged(entry: BatchEntry, pickTaskIds: string[], notes: string) {
+      const snapshot = entry.rows.map((r) => ({ ...r }));
+      applyOptimisticDamaged(entry.rows, pickTaskIds);
+      lastError = '';
+      render();
+      try {
+        entry.rows = await api('/api/picker/report-damaged', { batchId: entry.batchId, pickTaskIds, notes });
+        render();
+      } catch (err) {
+        entry.rows = snapshot;
+        lastError = (err as Error).message;
+        render();
+      }
     }
 
     boot();

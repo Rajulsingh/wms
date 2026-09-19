@@ -56,7 +56,7 @@ const groups: Array<{ label: string; links: Array<{ key: string; href: string; l
 
 <div class="admin-sidebar-backdrop" id="sidebar-backdrop"></div>
 <nav class="admin-sidebar" id="admin-sidebar" aria-label="Admin navigation">
-  <div class="admin-sidebar-brand">
+  <a class="admin-sidebar-brand" href="/admin" aria-label="Back to home">
     <span class="brand-mark" aria-hidden="true">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <path d="M21 8 12 3 3 8l9 5 9-5Z"></path>
@@ -68,7 +68,7 @@ const groups: Array<{ label: string; links: Array<{ key: string; href: string; l
       <span class="brand-name">ecomglider</span>
       <span class="brand-section">Admin</span>
     </span>
-  </div>
+  </a>
   <div class="admin-sidebar-nav">
     {
       groups.map((group) => (

@@ -31,6 +31,7 @@ export interface PackBatchItemView {
   order_item_id: string;
   order_id: string;
   external_order_id: string;
+  order_notes: string | null;
   sku_code: string;
   sku_name: string;
   image_url: string | null;
@@ -43,6 +44,7 @@ export interface PackBatchOrderSummary {
   externalOrderId: string;
   packSessionId: string;
   allPacked: boolean;
+  notes: string | null;
 }
 
 export interface PackBatchState {
@@ -52,33 +54,32 @@ export interface PackBatchState {
   allPacked: boolean;
 }
 
-/**
- * Verifies the station QR/barcode (packing-station equivalent of the rack
- * check, §4/§8), then opens (or resumes) packing for the oldest
- * fully-picked *batch* waiting at this warehouse — one `pack_sessions` row
- * per order in that batch, all created together and tagged with the same
- * `pick_batch_id` (migration 0010), so the packer works through every
- * order (SKU-grouped, same pattern as picking) before any label goes on,
- * instead of being pulled one order at a time with a label applied right
- * after each. Every order in a pick_batch reaches 'picked' atomically
- * together (picker.ts's checkBatchCompletion sets them all at once), so
- * "every order sharing a pick_batch_id" is always a coherent, complete
- * unit of packing work — never a partial one. See HANDOFF.md.
- */
-export async function startPackingBatch(db: D1Database, userId: string, stationQrToken: string, warehouseId: string): Promise<PackBatchState | null> {
-  const station = await db.prepare(`SELECT id FROM packing_stations WHERE qr_token = ? AND warehouse_id = ?`).bind(stationQrToken, warehouseId).first<{ id: string }>();
-  if (!station) throw new PackerFlowError('unknown_station', 'This station QR code is not recognized');
-
-  const resumable = await db
+/** Every pick_batch this packer currently has open (as pack_sessions) at this station, oldest first. */
+export async function getMyActivePackBatchIds(db: D1Database, stationId: string, packerId: string): Promise<string[]> {
+  const rows = await db
     .prepare(
-      `SELECT DISTINCT pick_batch_id FROM pack_sessions
+      `SELECT DISTINCT pick_batch_id, MIN(started_at) AS started_at FROM pack_sessions
        WHERE station_id = ? AND packer_id = ? AND status = 'in_progress' AND pick_batch_id IS NOT NULL
-       LIMIT 1`
+       GROUP BY pick_batch_id
+       ORDER BY started_at ASC`
     )
-    .bind(station.id, userId)
-    .first<{ pick_batch_id: string }>();
-  if (resumable) return getPackBatchState(db, resumable.pick_batch_id);
+    .bind(stationId, packerId)
+    .all<{ pick_batch_id: string }>();
+  return rows.results.map((r) => r.pick_batch_id);
+}
 
+/**
+ * Claims the oldest fully-picked *batch* waiting at this warehouse that
+ * nobody's packing yet — one `pack_sessions` row per order in that batch,
+ * all created together and tagged with the same `pick_batch_id` (migration
+ * 0010), so the packer works through every order (SKU-grouped, same
+ * pattern as picking) before any label goes on. Every order in a
+ * pick_batch reaches 'picked' atomically together (picker.ts's
+ * checkBatchCompletion sets them all at once), so "every order sharing a
+ * pick_batch_id" is always a coherent, complete unit of packing work —
+ * never a partial one. Returns null if nothing's waiting. See HANDOFF.md.
+ */
+async function claimNextPackBatch(db: D1Database, userId: string, stationId: string, warehouseId: string): Promise<string | null> {
   const candidate = await db
     .prepare(
       `SELECT pt.pick_batch_id AS id, MIN(pb.completed_at) AS completed_at
@@ -109,13 +110,50 @@ export async function startPackingBatch(db: D1Database, userId: string, stationQ
     const sessionId = newId();
     await db
       .prepare(`INSERT INTO pack_sessions (id, order_id, packer_id, station_id, pick_batch_id, status) VALUES (?, ?, ?, ?, ?, 'in_progress')`)
-      .bind(sessionId, order.id, userId, station.id, candidate.id)
+      .bind(sessionId, order.id, userId, stationId, candidate.id)
       .run();
     await db.prepare(`UPDATE orders SET status = 'packing' WHERE id = ?`).bind(order.id).run();
   }
   await logAudit(db, { userId, action: 'pack.batch_start', entityType: 'pick_batch', entityId: candidate.id, metadata: { orderCount: orders.results.length } });
 
-  return getPackBatchState(db, candidate.id);
+  return candidate.id;
+}
+
+export interface MyPackBatches {
+  stationId: string;
+  batches: PackBatchState[];
+}
+
+/**
+ * Verifies the station QR/barcode (packing-station equivalent of the rack
+ * check, §4/§8), then returns every batch this packer currently has open at
+ * this station — auto-claiming one new batch via claimNextPackBatch only
+ * when they have none, same "claim-time" pattern picker.ts uses. The
+ * packer page renders all of them on one continuous page (no "get next
+ * batch" click gate) — see HANDOFF.md.
+ */
+export async function getMyPackBatches(db: D1Database, userId: string, stationQrToken: string, warehouseId: string): Promise<MyPackBatches> {
+  const station = await db.prepare(`SELECT id FROM packing_stations WHERE qr_token = ? AND warehouse_id = ?`).bind(stationQrToken, warehouseId).first<{ id: string }>();
+  if (!station) throw new PackerFlowError('unknown_station', 'This station QR code is not recognized');
+
+  let batchIds = await getMyActivePackBatchIds(db, station.id, userId);
+  // Unlike picking's claim-time batching (deliberately one auto-swept batch
+  // at a time — see claimNextBatch in picker.ts), packing has no admin-
+  // assignment mechanism to hand out extra batches, so "claim if I have
+  // none" sweeps *every* currently-ready batch at once here, not just one —
+  // otherwise a packer would only ever see one batch until it's finished,
+  // one poll tick apart, instead of everything actually ready right now.
+  if (!batchIds.length) {
+    for (;;) {
+      const claimed = await claimNextPackBatch(db, userId, station.id, warehouseId);
+      if (!claimed) break;
+      batchIds.push(claimed);
+    }
+  }
+
+  const batches: PackBatchState[] = [];
+  for (const id of batchIds) batches.push(await getPackBatchState(db, id));
+  return { stationId: station.id, batches };
 }
 
 export async function getPackBatchState(db: D1Database, pickBatchId: string): Promise<PackBatchState> {
@@ -134,19 +172,30 @@ export async function getPackBatchState(db: D1Database, pickBatchId: string): Pr
   // that query left it blank for exactly that edge case. Orders are the
   // source of truth for their own external id regardless of item status.
   const orderRows = await db
-    .prepare(`SELECT id, external_order_id FROM orders WHERE id IN (${placeholders})`)
+    .prepare(`SELECT id, external_order_id, notes FROM orders WHERE id IN (${placeholders})`)
     .bind(...orderIds)
-    .all<{ id: string; external_order_id: string }>();
+    .all<{ id: string; external_order_id: string; notes: string | null }>();
   const externalIdByOrder = new Map(orderRows.results.map((o) => [o.id, o.external_order_id]));
+  const notesByOrder = new Map(orderRows.results.map((o) => [o.id, o.notes]));
 
+  // 'short' is included alongside 'picked'/'packed' as long as some units
+  // were actually picked (quantity_picked > 0) — a partial short pick still
+  // has real, physical units that need to go in a box. A 'short' item with
+  // quantity_picked = 0 has nothing to pack at all and stays excluded (the
+  // "nothing to pack, every item came back short/damaged" edge case below
+  // still applies to those). Previously this only matched 'picked'/'packed',
+  // so a partial short pick's physically-picked units silently never
+  // appeared anywhere in the packing UI — found 2026-09-19, see HANDOFF.md.
   const items = await db
     .prepare(
-      `SELECT oi.id AS order_item_id, oi.order_id, o.external_order_id, sk.sku_code, sk.name AS sku_name, sk.image_url,
+      `SELECT oi.id AS order_item_id, oi.order_id, o.external_order_id, o.notes AS order_notes, sk.sku_code, sk.name AS sku_name, sk.image_url,
               oi.quantity_picked AS quantity_required, oi.quantity_packed
        FROM order_items oi
        JOIN orders o ON o.id = oi.order_id
        JOIN skus sk ON sk.id = oi.sku_id
-       WHERE oi.order_id IN (${placeholders}) AND oi.status IN ('picked', 'packed')`
+       WHERE oi.order_id IN (${placeholders})
+         AND (oi.status IN ('picked', 'packed') OR (oi.status = 'short' AND oi.quantity_picked > 0))
+       ORDER BY sk.sku_code ASC`
     )
     .bind(...orderIds)
     .all<PackBatchItemView>();
@@ -161,7 +210,8 @@ export async function getPackBatchState(db: D1Database, pickBatchId: string): Pr
     orderId: s.order_id,
     externalOrderId: externalIdByOrder.get(s.order_id) ?? '',
     packSessionId: s.id,
-    allPacked: packedByOrder.get(s.order_id) ?? true
+    allPacked: packedByOrder.get(s.order_id) ?? true,
+    notes: notesByOrder.get(s.order_id) ?? null
   }));
 
   return {
@@ -234,11 +284,13 @@ export async function getPackSessionState(db: D1Database, packSessionId: string)
   const session = await db.prepare(`SELECT * FROM pack_sessions WHERE id = ?`).bind(packSessionId).first<{ id: string; order_id: string; status: string }>();
   if (!session) throw new PackerFlowError('not_found', 'Pack session not found');
 
+  // Same fix as getPackBatchState's items query above — a partial short
+  // pick (status 'short', quantity_picked > 0) still has real units to pack.
   const items = await db
     .prepare(
       `SELECT oi.id as order_item_id, sk.sku_code, sk.name as sku_name, sk.image_url, oi.quantity_picked as quantity_required, oi.quantity_packed
        FROM order_items oi JOIN skus sk ON sk.id = oi.sku_id
-       WHERE oi.order_id = ? AND oi.status IN ('picked', 'packed')`
+       WHERE oi.order_id = ? AND (oi.status IN ('picked', 'packed') OR (oi.status = 'short' AND oi.quantity_picked > 0))`
     )
     .bind(session.order_id)
     .all<PackItemView>();

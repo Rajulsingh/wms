@@ -125,6 +125,7 @@ export interface PickListRow {
   image_url: string | null;
   external_order_id: string;
   order_source: string;
+  order_notes: string | null;
   quantity_required: number;
   quantity_picked: number;
   status: string;
@@ -153,6 +154,7 @@ export async function getPickListView(db: D1Database, batchId: string): Promise<
          sk.image_url,
          o.external_order_id,
          o.source AS order_source,
+         o.notes AS order_notes,
          pt.quantity_required,
          pt.quantity_picked,
          pt.status
@@ -214,8 +216,8 @@ export interface ConfirmQuantityResult {
   batchComplete: boolean;
 }
 
-/** Consumes the reservation for whatever quantity was actually picked. A short pick doesn't fail the call — it's a legitimate outcome logged as an exception (§6), never a dead end for the picker. */
-export async function confirmQuantity(db: D1Database, userId: string, pickTaskId: string, quantity: number): Promise<ConfirmQuantityResult> {
+/** Consumes the reservation for whatever quantity was actually picked. A short pick doesn't fail the call — it's a legitimate outcome logged as an exception (§6), never a dead end for the picker. `reason`, when given, is the picker's chosen explanation for the shortfall (e.g. "Low stock — not enough available") and is appended to the exception note so admin sees why, not just the numbers. */
+export async function confirmQuantity(db: D1Database, userId: string, pickTaskId: string, quantity: number, reason?: string): Promise<ConfirmQuantityResult> {
   const task = await db
     .prepare(`SELECT pt.*, sk.id as sku_id_check FROM pick_tasks pt JOIN skus sk ON sk.id = pt.sku_id WHERE pt.id = ?`)
     .bind(pickTaskId)
@@ -252,7 +254,7 @@ export async function confirmQuantity(db: D1Database, userId: string, pickTaskId
       pickTaskId,
       orderId: orderItem?.order_id,
       userId,
-      notes: `Required ${task.quantity_required}, picked ${quantity}`
+      notes: reason ? `Required ${task.quantity_required}, picked ${quantity} — ${reason}` : `Required ${task.quantity_required}, picked ${quantity}`
     });
   }
   await logAudit(db, { userId, action: 'confirm.quantity', entityType: 'pick_task', entityId: pickTaskId, metadata: { quantity, status } });
@@ -312,7 +314,7 @@ export interface ConfirmGroupResult {
  * concept. This is what makes "pick 5 of the 7 available" fall out for
  * free instead of needing separate bulk-short-pick logic.
  */
-export async function confirmGroupQuantity(db: D1Database, userId: string, pickTaskIds: string[], totalQuantity: number): Promise<ConfirmGroupResult> {
+export async function confirmGroupQuantity(db: D1Database, userId: string, pickTaskIds: string[], totalQuantity: number, reason?: string): Promise<ConfirmGroupResult> {
   if (!pickTaskIds.length) throw new PickerFlowError('not_found', 'No pick tasks given');
 
   const placeholders = pickTaskIds.map(() => '?').join(',');
@@ -340,7 +342,7 @@ export async function confirmGroupQuantity(db: D1Database, userId: string, pickT
   for (const task of tasks.results) {
     const allocated = Math.min(remaining, task.quantity_required);
     remaining -= allocated;
-    const result = await confirmQuantity(db, userId, task.id, allocated);
+    const result = await confirmQuantity(db, userId, task.id, allocated, reason);
     perTask.push({ pickTaskId: task.id, quantity: allocated, status: result.status });
     if (result.batchComplete) batchComplete = true;
   }
@@ -383,6 +385,124 @@ export async function reportDamaged(db: D1Database, userId: string, pickTaskId: 
   await logAudit(db, { userId, action: 'report.damaged', entityType: 'pick_task', entityId: pickTaskId });
 
   await checkBatchCompletion(db, task.pick_batch_id);
+}
+
+/**
+ * Every batch currently active for this picker (assigned or in progress),
+ * oldest first — not just the single "resumable" one `claimNextBatch`
+ * returns. Under the normal claim flow a picker only ever has one active
+ * batch at a time (claimNextBatch won't sweep a second one for them while
+ * they still have one), but admin's manual per-packer assignment (see
+ * `assignBatchToPacker`) can hand someone a second batch directly, so the
+ * picker's "all my batches on one page" view needs to show every one, not
+ * assume there's at most one.
+ */
+export async function getMyActiveBatches(db: D1Database, warehouseId: string, pickerId: string): Promise<string[]> {
+  const rows = await db
+    .prepare(
+      `SELECT id FROM pick_batches WHERE warehouse_id = ? AND assigned_picker_id = ? AND status IN ('assigned', 'in_progress') ORDER BY created_at ASC`
+    )
+    .bind(warehouseId, pickerId)
+    .all<{ id: string }>();
+  return rows.results.map((r) => r.id);
+}
+
+/**
+ * Returns this picker's active batches (rows for each), auto-claiming/
+ * creating one via `claimNextBatch` only when they currently have none —
+ * mirrors the original claim-time behavior for a picker with no work, while
+ * never taking a second batch away from the pending pool for someone who
+ * already has one (admin assignment is the only way to get a second).
+ */
+export async function getMyBatches(db: D1Database, warehouseId: string, pickerId: string): Promise<Array<{ batchId: string; rows: PickListRow[] }>> {
+  let batchIds = await getMyActiveBatches(db, warehouseId, pickerId);
+  if (!batchIds.length) {
+    const claimed = await claimNextBatch(db, warehouseId, pickerId);
+    if (claimed) batchIds = [claimed];
+  }
+  const out: Array<{ batchId: string; rows: PickListRow[] }> = [];
+  for (const batchId of batchIds) {
+    out.push({ batchId, rows: await getPickListView(db, batchId) });
+  }
+  return out;
+}
+
+export interface UpcomingBatchSummary {
+  batchId: string;
+  createdAt: string;
+  orderCount: number;
+  skuCount: number;
+  unitCount: number;
+}
+
+/**
+ * Batches admin has already pulled (created) but nobody has claimed or been
+ * assigned yet — status stays 'pending' only in that narrow window, since
+ * claimNextBatch's own sweep flips it to 'assigned' the instant a picker
+ * claims it. Shown on the packer dashboard as "upcoming work", read-only —
+ * visibility only, not a claim action.
+ */
+export async function getUpcomingBatches(db: D1Database, warehouseId: string): Promise<UpcomingBatchSummary[]> {
+  const batches = await db
+    .prepare(`SELECT id, created_at FROM pick_batches WHERE warehouse_id = ? AND status = 'pending' ORDER BY created_at ASC`)
+    .bind(warehouseId)
+    .all<{ id: string; created_at: string }>();
+
+  const out: UpcomingBatchSummary[] = [];
+  for (const b of batches.results) {
+    const rows = await getPickListView(db, b.id);
+    out.push({
+      batchId: b.id,
+      createdAt: b.created_at,
+      orderCount: new Set(rows.map((r) => r.external_order_id)).size,
+      skuCount: new Set(rows.map((r) => r.sku_code)).size,
+      unitCount: rows.reduce((sum, r) => sum + r.quantity_required, 0)
+    });
+  }
+  return out;
+}
+
+/**
+ * Admin hand-assigns a specific pending/already-assigned batch to a named
+ * packer — sets `assigned_picker_id` directly rather than waiting for that
+ * packer to claim it themselves. This is safe against the general claim
+ * pool: the moment status leaves 'pending', `claimNextBatch`'s sweep query
+ * (`WHERE status = 'pending'`) no longer sees it, so no other picker can
+ * grab it out from under the one admin picked. The named packer then picks
+ * it up automatically next time they load/poll — it's exactly what
+ * `getMyActiveBatches` looks for (assigned_picker_id = them, status
+ * 'assigned'/'in_progress').
+ *
+ * `packerId: null` clears the assignment instead — puts the batch back to
+ * `'pending'` so it returns to the general claim pool (any picker who next
+ * asks for work, or another admin assignment, can pick it up). Only allowed
+ * while nobody has actually started on it yet (same 'pending'/'assigned'
+ * gate as assigning); once a picker has begun ('in_progress'), unassigning
+ * would orphan their in-progress reservations/pick_tasks, so that's blocked
+ * the same way reassigning already is.
+ */
+export async function assignBatchToPacker(db: D1Database, warehouseId: string, batchId: string, packerId: string | null): Promise<void> {
+  const batch = await db
+    .prepare(`SELECT status FROM pick_batches WHERE id = ? AND warehouse_id = ?`)
+    .bind(batchId, warehouseId)
+    .first<{ status: string }>();
+  if (!batch) throw new PickerFlowError('not_found', 'Batch not found');
+  if (batch.status !== 'pending' && batch.status !== 'assigned') {
+    throw new PickerFlowError('wrong_state', `This batch is already ${batch.status} — it can no longer be (re)assigned.`);
+  }
+
+  if (packerId === null) {
+    await db.prepare(`UPDATE pick_batches SET status = 'pending', assigned_picker_id = NULL WHERE id = ?`).bind(batchId).run();
+    return;
+  }
+
+  const packer = await db
+    .prepare(`SELECT id FROM users WHERE id = ? AND warehouse_id = ? AND role = 'packer' AND active = 1`)
+    .bind(packerId, warehouseId)
+    .first<{ id: string }>();
+  if (!packer) throw new PickerFlowError('not_found', 'That packer was not found (or is inactive)');
+
+  await db.prepare(`UPDATE pick_batches SET status = 'assigned', assigned_picker_id = ? WHERE id = ?`).bind(packerId, batchId).run();
 }
 
 export { newId };

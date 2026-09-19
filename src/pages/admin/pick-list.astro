@@ -42,6 +42,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
 
   <script>
     import { scanOnce, stopScanning } from '../../lib/scanner-client';
+    import { withLoading } from '../../lib/ui';
     import JsBarcode from 'jsbarcode';
 
     interface Row {
@@ -63,6 +64,14 @@ if (redirectTo) return Astro.redirect(redirectTo);
       status: string;
       created_at: string;
       completed_at: string | null;
+      assigned_picker_id: string | null;
+      assigned_picker_name: string | null;
+    }
+    interface PackerUser {
+      id: string;
+      name: string;
+      role: string;
+      active: number;
     }
 
     const app = document.getElementById('app')!;
@@ -71,6 +80,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
     const scanError = document.getElementById('scan-error') as HTMLParagraphElement;
     let warehouseId = '';
     let batches: Batch[] = [];
+    let packers: PackerUser[] = [];
     let currentRows: Row[] = [];
     let currentBatchId = '';
 
@@ -192,6 +202,9 @@ if (redirectTo) return Astro.redirect(redirectTo);
       }
       warehouseId = me.user.warehouseId;
 
+      const users: PackerUser[] = await api(`/api/admin/users?warehouseId=${warehouseId}`);
+      packers = users.filter((u) => u.role === 'packer' && u.active);
+
       batches = await api(`/api/admin/batches?warehouseId=${warehouseId}`);
       const params = new URLSearchParams(window.location.search);
       const preselect = params.get('batchId');
@@ -224,6 +237,19 @@ if (redirectTo) return Astro.redirect(redirectTo);
             ${renderBarcode(batch.id)}
           </div>
           ${renderStepper(batch)}
+          <div class="no-print row" style="margin-top: 14px; gap: 10px; align-items: center; flex-wrap: wrap;">
+            <span class="eyebrow" style="flex: 0 0 auto;">Assigned to</span>
+            ${
+              batch.status === 'pending' || batch.status === 'assigned'
+                ? `<select id="assign-select" style="width: auto; flex: 1; min-width: 200px;">
+                     <option value="">— Unassigned —</option>
+                     ${packers.map((p) => `<option value="${p.id}" ${p.id === batch.assigned_picker_id ? 'selected' : ''}>${p.name}</option>`).join('')}
+                   </select>
+                   <button class="btn btn-primary" id="assign-btn" style="width: auto;">${batch.assigned_picker_id ? 'Update' : 'Assign'}</button>`
+                : `<span class="pill">${batch.assigned_picker_name ?? '—'}</span>`
+            }
+          </div>
+          <p id="assign-error" style="display:none; color: var(--danger); margin: 8px 0 0; font-size: 0.85rem;"></p>
         </div>` : ''}
         <div class="row no-print" style="gap: 16px;">
           <span class="pill">Orders: ${orders.size}</span>
@@ -265,6 +291,48 @@ if (redirectTo) return Astro.redirect(redirectTo);
             // Batch IDs are UUIDs (any ASCII), Code128 handles them fine — this is just a defensive no-op if it ever can't.
           }
         }
+
+        // Choosing "— Unassigned —" and submitting clears the assignment
+        // (packerId: null) rather than needing a separate "Unassign" button
+        // — same control either way, the button's label just follows what's
+        // currently selected.
+        document.getElementById('assign-select')?.addEventListener('change', () => {
+          const assignSelect = document.getElementById('assign-select') as unknown as HTMLSelectElement;
+          const assignBtn = document.getElementById('assign-btn') as HTMLButtonElement | null;
+          if (!assignBtn) return;
+          assignBtn.textContent = assignSelect.value ? (batch.assigned_picker_id ? 'Update' : 'Assign') : 'Unassign';
+        });
+
+        document.getElementById('assign-btn')?.addEventListener('click', async (e) => {
+          const assignSelect = document.getElementById('assign-select') as unknown as HTMLSelectElement;
+          const assignError = document.getElementById('assign-error') as HTMLParagraphElement;
+          const packerId = assignSelect.value || null;
+          if (!packerId && !batch.assigned_picker_id) {
+            assignError.textContent = 'Pick a packer to assign this batch to.';
+            assignError.style.display = 'block';
+            return;
+          }
+          const btn = e.currentTarget as HTMLButtonElement;
+          try {
+            await withLoading(btn, packerId ? 'Assigning…' : 'Unassigning…', () =>
+              fetch('/api/admin/batches', {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ warehouseId, batchId: batch.id, packerId })
+              }).then(async (res) => {
+                const data: any = await res.json().catch(() => ({}));
+                if (!res.ok) throw new Error(data.error ?? `Request failed (${res.status})`);
+              })
+            );
+            batches = await api(`/api/admin/batches?warehouseId=${warehouseId}`);
+            select.innerHTML = batches.map((b) => `<option value="${b.id}">${b.created_at} · ${b.status}</option>`).join('');
+            select.value = batch.id;
+            await loadBatch(batch.id);
+          } catch (err) {
+            assignError.textContent = (err as Error).message;
+            assignError.style.display = 'block';
+          }
+        });
       }
     }
 

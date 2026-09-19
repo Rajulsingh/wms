@@ -25,6 +25,8 @@ if (redirectTo) return Astro.redirect(redirectTo);
   </div>
 
   <script>
+    import { withLoading, escapeHtml } from '../../lib/ui';
+
     interface OrderRow {
       id: string;
       external_order_id: string;
@@ -36,6 +38,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
       first_item_image: string | null;
       item_count: number;
       order_value: number | null;
+      notes: string | null;
     }
 
     function productSummary(o: OrderRow): string {
@@ -52,6 +55,18 @@ if (redirectTo) return Astro.redirect(redirectTo);
       if (o.source !== 'amazon') return '';
       if (o.status === 'ready_to_ship' || o.status === 'shipped') return '<span style="color: var(--success); font-weight: 700;">Shipped</span>';
       return `<a href="/admin/ship?orderId=${o.id}" class="order-card-ship">Ship →</a>`;
+    }
+
+    // Compact by design — a table row per order, not an input box per row,
+    // since this table can run to 100 rows and an always-visible text input
+    // in every row would be both visually heavy and (on a narrow phone,
+    // learned the hard way elsewhere this session) a real overflow risk.
+    // Click to reveal a real input just for that cell; see bindNoteCells().
+    function noteCell(o: OrderRow): string {
+      const escaped = escapeHtml(o.notes ?? '');
+      return `<button type="button" class="btn-ghost note-btn" data-order-id="${o.id}" style="text-align:left; padding:4px 6px; min-height:auto; font-weight:400;">
+        ${o.notes ? `<span class="truncate-cell" style="max-width:140px;" title="${escaped}">${escaped}</span>` : '<span style="color: var(--muted);">+ Add note</span>'}
+      </button>`;
     }
 
     const STATUS_STYLE: Record<string, string> = {
@@ -99,9 +114,9 @@ if (redirectTo) return Astro.redirect(redirectTo);
       cancelled: 'Cancelled'
     };
 
-    async function api(path: string, body?: unknown) {
+    async function api(path: string, body?: unknown, method?: string) {
       const res = await fetch(path, {
-        method: body === undefined ? 'GET' : 'POST',
+        method: method ?? (body === undefined ? 'GET' : 'POST'),
         headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
         body: body === undefined ? undefined : JSON.stringify(body)
       });
@@ -162,12 +177,12 @@ if (redirectTo) return Astro.redirect(redirectTo);
       ordersTable.innerHTML = `
         <div class="table-scroll"><table>
           <thead>
-            <tr><th>Order ID</th><th>Product</th><th>Status</th><th>Source</th><th>Value</th><th></th></tr>
+            <tr><th>Order ID</th><th>Product</th><th>Status</th><th>Source</th><th>Value</th><th>Notes</th><th></th></tr>
           </thead>
           <tbody>
             ${filtered
               .map(
-                (o) => `<tr>
+                (o) => `<tr data-order-id="${o.id}">
                   <td style="font-weight:700; font-variant-numeric: tabular-nums; white-space: nowrap;">${o.external_order_id}</td>
                   <td>
                     <div class="row" style="align-items:center; gap:10px;">
@@ -178,12 +193,53 @@ if (redirectTo) return Astro.redirect(redirectTo);
                   <td>${statusPill(o.status)}</td>
                   <td style="white-space: nowrap;">${o.source}${o.customer_name ? ' · ' + o.customer_name : ''}</td>
                   <td style="font-weight:700; white-space: nowrap;">${orderValue(o)}</td>
+                  <td>${noteCell(o)}</td>
                   <td style="white-space: nowrap;">${shipAction(o)}</td>
                 </tr>`
               )
               .join('')}
           </tbody>
         </table></div>`;
+      bindNoteCells();
+    }
+
+    function bindNoteCells() {
+      ordersTable.querySelectorAll<HTMLButtonElement>('.note-btn').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const orderId = btn.dataset.orderId!;
+          const order = allOrders.find((o) => o.id === orderId);
+          const td = btn.closest('td')!;
+          td.innerHTML = `
+            <div class="row" style="gap:6px; align-items:center; min-width:230px;">
+              <input type="text" class="note-input" value="${escapeHtml(order?.notes ?? '')}" placeholder="e.g. free gift included" style="min-height:36px; padding:6px 8px; font-size:0.8rem;" />
+              <button type="button" class="btn btn-primary note-save" style="width:auto; min-height:36px; padding:0 10px;">Save</button>
+              <button type="button" class="btn btn-ghost note-cancel" style="width:auto; min-height:36px; padding:0 10px;">Cancel</button>
+            </div>`;
+          const input = td.querySelector('.note-input') as HTMLInputElement;
+          input.focus();
+          const save = async (e: Event) => {
+            const saveBtn = e.currentTarget as HTMLButtonElement;
+            const notes = input.value.trim() || null;
+            try {
+              await withLoading(saveBtn, 'Saving…', () => api('/api/admin/orders', { orderId, notes }, 'PATCH'));
+              if (order) order.notes = notes;
+              renderOrders();
+            } catch (err) {
+              alert((err as Error).message);
+            }
+          };
+          td.querySelector('.note-save')?.addEventListener('click', save);
+          td.querySelector('.note-cancel')?.addEventListener('click', () => renderOrders());
+          input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              save({ currentTarget: td.querySelector('.note-save') } as unknown as Event);
+            } else if (e.key === 'Escape') {
+              renderOrders();
+            }
+          });
+        });
+      });
     }
 
     async function loadOrders() {
@@ -225,14 +281,19 @@ if (redirectTo) return Astro.redirect(redirectTo);
       // Orders keep arriving (Amazon imports, manual entry) and their status
       // keeps changing as picking/packing happens — refresh automatically so
       // admin doesn't have to keep reloading to see what needs a label next.
+      // Skipped while a note editor is open — a full table rebuild would
+      // wipe out whatever was being typed before it could be saved (found
+      // while testing the notes feature: the refresh clobbered an in-
+      // progress edit within the ~12s window).
       setInterval(() => {
-        if (!document.hidden) loadOrders();
+        if (!document.hidden && !ordersTable.querySelector('.note-input')) loadOrders();
       }, 12000);
     }
 
-    document.getElementById('import-btn')?.addEventListener('click', async () => {
+    document.getElementById('import-btn')?.addEventListener('click', async (e) => {
+      const btn = e.currentTarget as HTMLButtonElement;
       try {
-        const summary = await api('/api/admin/import-amazon-orders', { warehouseId, sinceHours: 72 });
+        const summary = await withLoading(btn, 'Importing…', () => api('/api/admin/import-amazon-orders', { warehouseId, sinceHours: 72 }));
         // Orders are no longer auto-batched on import — batching happens the
         // moment a picker next asks for work, so whatever's open here gets
         // consolidated into one batch then instead of fragmenting into a new
@@ -246,13 +307,14 @@ if (redirectTo) return Astro.redirect(redirectTo);
       }
     });
 
-    document.getElementById('batch-btn')?.addEventListener('click', async () => {
+    document.getElementById('batch-btn')?.addEventListener('click', async (e) => {
       if (!cartId) {
         showResult('No cart configured for this warehouse yet.', 'danger');
         return;
       }
+      const btn = e.currentTarget as HTMLButtonElement;
       try {
-        const result = await api('/api/admin/batches', { warehouseId, cartId, maxOrders: 8 });
+        const result = await withLoading(btn, 'Creating…', () => api('/api/admin/batches', { warehouseId, cartId, maxOrders: 8 }));
         if (!result.batchId) {
           if (result.shortOrders?.length) {
             showResult(
