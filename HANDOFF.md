@@ -676,9 +676,37 @@ never receive through the UI again.
   in — the mandatory scan screen appeared immediately with that exact order, scanned it, and it
   reached `ready_to_ship` normally.
 
+## Recently done (2026-09-20, a fifteenth pass) — faster barcode scanning
+
+The user reported the camera scanner (station labels, AWB codes — `scanner-client.ts`, shared by
+`/packer` and `/admin/pick-list`) felt slow to actually catch a code. Three changes, all in
+`scanOnce`:
+
+- **`delayBetweenScanAttempts` dropped from ZXing's default 500ms to 75ms** — most of the "feels
+  slow" experience is this gap, not the camera or the decoder itself: at 500ms, holding a barcode
+  in frame could sit for up to half a second doing nothing before the next decode attempt even
+  starts.
+- **Restricted to the formats this app actually produces/reads** (`QR_CODE` for station/location
+  labels, plus the common 1D symbologies for AWB/item barcodes — `CODE_128`, `CODE_39`, `EAN_13`,
+  `EAN_8`, `UPC_A`, `UPC_E`, `ITF`) via `DecodeHintType.POSSIBLE_FORMATS`. Unscoped, ZXing's
+  multi-format reader tries every format it knows on every frame, including several 2D formats
+  (PDF417, Data Matrix, Aztec, MaxiCode, RSS) this app never uses — a real, measurable per-attempt
+  cost for zero benefit.
+- **Switched to `decodeFromConstraints`** with an explicit `{ width: 1280, height: 720 }` ideal
+  resolution (the browser's unconstrained default is much lower, which was likely hurting
+  recognition of small/far-away barcodes) and a best-effort `advanced: [{ focusMode: 'continuous' }]`
+  constraint (ignored harmlessly where unsupported, e.g. Safari/iOS, rather than failing the
+  request) so a phone held close to a barcode doesn't sit hunting for focus.
+- **Verified in dev**: no camera hardware exists in the sandboxed browser used for testing, so real
+  scan speed couldn't be measured end-to-end here — confirmed instead that the new constraints
+  object is accepted as valid by `getUserMedia` (a real `NotFoundError` — "no camera" — not a
+  `TypeError`/`OverconstrainedError` that would indicate a malformed constraint) and that the
+  existing graceful fallback to manual entry still works unchanged. **Worth a real-device check**
+  next time someone's on the floor with a phone.
+
 ## Next steps — a prioritized plan
 
-Rewritten 2026-09-20 (fourteen passes across two days — see "Recently done" entries above for the
+Rewritten 2026-09-20 (fifteen passes across two days — see "Recently done" entries above for the
 full story behind each). What's actually not done yet, ordered by what's blocking vs. not. See
 "Open items" below for full detail on each.
 
