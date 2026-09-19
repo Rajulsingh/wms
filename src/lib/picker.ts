@@ -155,6 +155,16 @@ export interface PickListRow {
  * every single product unit"). The underlying reservation/exception
  * machinery (confirmQuantity, reportDamaged) is unchanged — only the
  * location-by-location gating and mandatory scan steps are gone.
+ *
+ * Excludes cancelled orders regardless of the pick_task's own status — a
+ * real bug found live: cancelOrderFromSync (amazon-sync.ts) only cleans up
+ * tasks still 'pending'/'location_confirmed' when Amazon cancels an order,
+ * so one already resolved as 'short' (a picker genuinely found insufficient
+ * stock, then Amazon cancelled it afterward) was never touched and kept
+ * showing as a permanently "unresolved" short pick with no way to clear it,
+ * for an order nothing can or should be done for any more. Filtering here
+ * covers every pre-cancellation task status at once rather than needing
+ * cancelOrderFromSync to handle each one individually.
  */
 export async function getPickListView(db: D1Database, batchId: string): Promise<PickListRow[]> {
   const rows = await db
@@ -179,7 +189,7 @@ export async function getPickListView(db: D1Database, batchId: string): Promise<
        JOIN skus sk ON sk.id = pt.sku_id
        JOIN order_items oi ON oi.id = pt.order_item_id
        JOIN orders o ON o.id = oi.order_id
-       WHERE pt.pick_batch_id = ?
+       WHERE pt.pick_batch_id = ? AND o.status != 'cancelled'
        ORDER BY loc.sequence_number ASC, sk.sku_code ASC`
     )
     .bind(batchId)

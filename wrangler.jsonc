@@ -15,8 +15,23 @@
 	"build": {
 		"command": "npm run build"
 	},
+	// Cloudflare Cron Triggers always run in UTC — there's no timezone
+	// setting. The warehouse only does live picking/packing ~9:00 AM-2:00 PM
+	// IST (Amazon Easy Ship's own cutoff), so checking Amazon every 5 minutes
+	// outside that window is pure waste. The precise window needed 3 cron
+	// expressions (IST = UTC+5:30 doesn't land on a whole hour), but the
+	// account's Workers Free plan caps cron triggers at 5 *total, shared
+	// across every Worker on the account* — 3 new ones alone exceeded it
+	// (confirmed by a real failed deploy, not assumed). Collapsed to one
+	// expression, hours 3-8 UTC = 8:30 AM-2:30 PM IST — slightly wider than
+	// asked (30 min earlier/later on each end) rather than narrower, so nothing
+	// near the cutoff gets missed. An order placed overnight isn't missed
+	// either way — the sync job's own 24h lookback (sync-job.ts) picks it up
+	// on the first run. Revisit with the 3-expression version (see git log)
+	// if the account ever moves to Workers Paid (1,000 cron trigger limit).
+	// See HANDOFF.md.
 	"triggers": {
-		"crons": ["*/5 * * * *"]
+		"crons": ["*/5 3-8 * * *"]
 	},
 	"assets": {
 		"directory": "./dist",

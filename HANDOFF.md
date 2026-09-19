@@ -1048,6 +1048,37 @@ claim every failure is a stock issue, and gave `reserveOrderForPicking`'s "no pe
 clearer reason string distinguishing "already processed, not a stock problem" from a genuinely empty
 order.
 
+## Recently done (2026-09-20, a twenty-third pass) — a stale cancelled-order pick bug, and a business-hours-only sync schedule
+
+Two more items from a live user report, screenshot included.
+
+**"Why is this short unresolved still showing"** — a screenshot showed a SKU card stuck permanently
+at "Short — 2 unresolved" for order `402-0638176-4789928`. Checked production directly: the order's
+own `status` was `'cancelled'`, and its one `pick_task` was correctly `'cancelled'` too (Amazon
+cancelled it while its task was still `'pending'`, and `cancelOrderFromSync` — `amazon-sync.ts` —
+handled that correctly), but **`getPickListView`'s query never filtered by order status at all**, so
+a cancelled order's task kept appearing on the picker's screen forever. Worse, the picker UI's "done
+but short" rendering (`picker/index.astro`) only checks `picked < required`, not the task's actual
+status — so a `'cancelled'` task displays identically to a genuine unresolved short pick, with no way
+to tell them apart or clear it. Fixed at the source: `getPickListView` now excludes
+`o.status = 'cancelled'` outright, regardless of the task's own status — covers this case and any
+other pre-cancellation task status (short, damaged, picked) in one place, rather than needing
+`cancelOrderFromSync` to handle every individual status. Confirmed live: exactly one stale task
+existed in production, and the fixed query now correctly excludes it.
+
+**Sync schedule narrowed to business hours.** The user confirmed 5 minutes is fine, but pointed out
+the warehouse only does live picking/packing ~9:00 AM-2:00 PM IST (Amazon Easy Ship's own cutoff) —
+checking Amazon every 5 minutes around the clock is pure waste outside that window. Cloudflare Cron
+Triggers always run in UTC with no timezone setting, and IST (UTC+5:30) doesn't land on a whole hour,
+so the precise 9:00-2:00 window needed 3 cron expressions — which hit a real, confirmed-by-a-failed-
+deploy wall: the account's Workers Free plan caps cron triggers at **5 total, shared across every
+Worker on the account**, not per-worker. Collapsed to one expression, `*/5 3-8 * * *` (8:30 AM-2:30
+PM IST) — slightly wider than asked on both ends rather than narrower, so nothing near the cutoff is
+ever missed. An order placed overnight still isn't missed either way — `sync-job.ts`'s own 24-hour
+lookback picks it up on the first run of the day regardless of exactly when that first run fires.
+The precise 3-expression version is in git history if the account ever moves to Workers Paid (1,000
+cron trigger limit) and the extra precision becomes worth spending on.
+
 ## Next steps — a prioritized plan
 
 Rewritten 2026-09-20 (twenty-one passes across two days — see "Recently done" entries above for the
