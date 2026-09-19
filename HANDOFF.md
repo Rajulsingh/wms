@@ -321,12 +321,45 @@ shell below targets desktop admin use and doesn't follow it.
   D1-level locking or a Durable Object, which HANDOFF already documents as a deliberate "not
   needed yet" upgrade path for the same reason inventory reservation uses optimistic concurrency
   instead.
-- **Picking** (`/picker`, `picker.ts`) — flat, zone/bin-sorted list across the whole batch, no
-  scanning, tap "Picked" per line with photo/name shown. "Report issue" for damaged/short-pick.
-  Resumable. Admin printable version at `/admin/pick-list`.
+- **Picking — bulk, grouped by SKU** (`/picker`, `picker.ts`; redesigned 2026-09-19). A picker no
+  longer sees one card per order — every order in the batch needing the same SKU from the same
+  bin collapses into one aggregate line ("KTN3 required 7, picked 0/7"), pre-filled with the full
+  remaining quantity, one "Mark done" tap to confirm. Zone/bin sectioning is still the outer
+  walking order (physically unavoidable); the change is that fragmentation *within* a bin visit is
+  gone. Underneath, nothing about per-order reservation tracking changed: `confirmGroupQuantity`
+  (`picker.ts`) allocates the confirmed total across the group's underlying `pick_tasks` in
+  priority/created-at order and settles each one through the same `confirmQuantity` a single-task
+  pick always used — so picking less than the group total falls out as a normal short pick on
+  whichever order(s) didn't get their full share, not a new concept. `reportDamaged` got a group
+  wrapper (`reportGroupDamaged`) the same way. The two picker API routes
+  (`mark-picked.ts`/`report-damaged.ts`) now take `pickTaskIds: string[]` instead of a singular id
+  — always an array now, even for a group of one. Admin's printable/interactive pick-list
+  (`/admin/pick-list`) groups the same way (`groupRowsBySkuLocation`) so the printed sheet matches
+  what a picker actually works from. "Report issue" is now just "Damaged — none usable" for the
+  whole group; a partial short pick is just editing the quantity down before tapping "Mark done."
+  **Real bug found and fixed during this work**: `reportDamaged` never checked/updated batch
+  completion the way `confirmQuantity` did — if a batch's very last outstanding line resolved via
+  damage-report instead of a normal pick, the batch stayed stuck at `assigned`/`in_progress`
+  forever and its order never flipped to `picked`, so it would never reach packing, *and*
+  `claimNextBatch`'s resumable-batch check would keep handing that stuck batch back to the picker
+  on every future claim, silently blocking them from new work. This bug predates the redesign
+  above (reportDamaged's logic was untouched by it) but making damage-report a normal one-tap
+  action instead of a buried sub-flow made it far more likely to hit. Fixed by extracting a shared
+  `checkBatchCompletion` helper and calling it from both `confirmQuantity` and `reportDamaged`.
+  Verified live: reproduced the stuck-batch symptom with a real order, confirmed the fix resolves
+  it (`pick_batches.status` → `completed`, `orders.status` → `picked`).
+  **Packing was deliberately left unchanged in this pass** — the user asked for the same
+  "sorted by SKU, bulk" treatment there too, but packing is structurally one-order-per-session
+  today (`startNextPackSession` pulls one order, one AWB/label per session) since each order needs
+  its own box and its own label regardless of how picking is grouped. Doing the equivalent there
+  for real (sorting a picked batch's SKUs across several simultaneously-open order boxes, only
+  seal/label each one once its own box is complete) is a materially bigger, higher-risk change —
+  it touches the AWB/label-application path, which HANDOFF already flags as sensitive/undertested
+  against a live account. Needs a scoping conversation before touching it, not a guess.
 - **Packing** (`/packer`, `packer.ts`) — station tap-in, tap-to-confirm per item (same pattern as
   picking, no scanning — `markPackItem`/`POST /api/packer/mark-item`), then AWB scan/manual-entry
-  to apply the shipping label with a hard block on mismatch/duplicate.
+  to apply the shipping label with a hard block on mismatch/duplicate. Still one order per pack
+  session — see the picking entry above for why this wasn't changed to match.
 - **Pick/Pack tabs + notifications** — `/picker` and `/packer` are separate routes but present as
   tabs (`.tab-pill` in `TopBar`), each with a red badge dot when work is waiting on the *other*
   tab. `GET /api/packer/work-summary` (packer role) returns `{ pickable, packable }` counts,
@@ -389,6 +422,17 @@ shell below targets desktop admin use and doesn't follow it.
 
 ## Known bugs fixed / lessons (worth knowing, not just history)
 
+- **Every path that resolves a pick_task's terminal state must check batch completion** — not
+  just the "normal" one. `confirmQuantity` (a real/short pick) always checked whether the whole
+  batch was done and flipped `pick_batches.status`/`orders.status` accordingly; `reportDamaged`
+  didn't, for no principled reason — it just predated that check being added and nobody carried
+  it over. If damage-report happened to resolve a batch's very last outstanding line, the batch
+  got stuck at `assigned` forever, its order never reached `picked` (never showing up for
+  packing), and `claimNextBatch`'s resumable-batch check kept re-handing that stuck batch to the
+  picker on every future claim — a real dead end, not just stale data. Fixed by extracting
+  `checkBatchCompletion` in `picker.ts` and calling it from both places. If picker.ts ever grows
+  another way to resolve a pick_task (a new exception type, an admin override), it needs this
+  same call — the bug is exactly "forgot this one call," easy to repeat.
 - **D1 FK deletion order** — when deleting an order and everything under it, the safe order is:
   `exception_events` → `returns` → `awbs` → `shipments` → `packages` → `pick_tasks` →
   `cart_slots` → `pack_sessions` → `pick_batches` → `order_items` → `orders`. `cart_slots` and
@@ -460,6 +504,13 @@ this list.
     without live Amazon access has been checked (forms, order selection, package-identifier
     fields, polling); the actual Amazon calls have not. Treat the bulk ZIP-splitting logic in
     particular as higher-risk than the rest of the app until verified.
+14. **Packing doesn't yet get the same bulk/SKU-grouped treatment picking just got** (see "What's
+    built" → the picking entry, 2026-09-19). The user asked for it on both; picking shipped,
+    packing needs a scoping conversation first since it's a structurally bigger change (one
+    order/one label per pack session today vs. sorting a batch's SKUs across several
+    simultaneously-open order boxes) that touches the same AWB/label path item 13 above already
+    flags as sensitive. Don't guess at this one — ask what "bulk" should mean for packing
+    specifically before building it.
 
 ## Amazon Data Protection Policy questionnaire — what was submitted
 

@@ -170,16 +170,6 @@ export async function getPickListView(db: D1Database, batchId: string): Promise<
   return rows.results;
 }
 
-/**
- * Marks one pick-list line as picked (or short, if `quantity` is less than
- * required) directly — no location-confirm or barcode-scan step first. This
- * is the primary path for the simplified flow; `confirmQuantity` still does
- * the actual reservation/inventory work underneath, unchanged.
- */
-export async function markPicked(db: D1Database, userId: string, pickTaskId: string, quantity: number): Promise<ConfirmQuantityResult> {
-  return confirmQuantity(db, userId, pickTaskId, quantity);
-}
-
 /** NFC-equivalent step: verify the picker is physically at the expected location via its QR/barcode token (§4 — barcode/QR, not NFC, given the mixed iOS/Android fleet). */
 export async function confirmLocation(db: D1Database, userId: string, batchId: string, scannedQrToken: string): Promise<void> {
   const state = await getBatchState(db, batchId);
@@ -267,32 +257,110 @@ export async function confirmQuantity(db: D1Database, userId: string, pickTaskId
   }
   await logAudit(db, { userId, action: 'confirm.quantity', entityType: 'pick_task', entityId: pickTaskId, metadata: { quantity, status } });
 
+  const batchComplete = await checkBatchCompletion(db, task.pick_batch_id);
+
+  return { status, batchComplete };
+}
+
+/**
+ * Marks the batch completed (and its orders 'picked') the moment every one
+ * of its pick_tasks has left 'pending'/'location_confirmed' — regardless of
+ * *how* the last one resolved. Shared by confirmQuantity and reportDamaged:
+ * originally only confirmQuantity did this check, so a batch whose very
+ * last outstanding line resolved via "damaged" instead of a normal pick
+ * would never flip to 'completed' and its order would never reach
+ * 'picked' — silently stuck, never appearing in the packing queue. Found
+ * while testing the bulk group-pick flow; damage-report becoming a much
+ * more directly reachable action (not buried in a sub-sheet) made this
+ * easy to hit, but the bug itself predates that change.
+ */
+async function checkBatchCompletion(db: D1Database, pickBatchId: string): Promise<boolean> {
   const remaining = await db
     .prepare(`SELECT COUNT(*) as c FROM pick_tasks WHERE pick_batch_id = ? AND status IN ('pending', 'location_confirmed')`)
-    .bind(task.pick_batch_id)
+    .bind(pickBatchId)
     .first<{ c: number }>();
   const batchComplete = (remaining?.c ?? 0) === 0;
   if (batchComplete) {
-    await db.prepare(`UPDATE pick_batches SET status = 'completed', completed_at = datetime('now') WHERE id = ?`).bind(task.pick_batch_id).run();
+    await db.prepare(`UPDATE pick_batches SET status = 'completed', completed_at = datetime('now') WHERE id = ?`).bind(pickBatchId).run();
     await db
       .prepare(
         `UPDATE orders SET status = 'picked'
          WHERE id IN (SELECT DISTINCT o.id FROM orders o JOIN order_items oi ON oi.order_id = o.id JOIN pick_tasks pt ON pt.order_item_id = oi.id WHERE pt.pick_batch_id = ?)
          AND status = 'batched'`
       )
-      .bind(task.pick_batch_id)
+      .bind(pickBatchId)
       .run();
   }
+  return batchComplete;
+}
 
-  return { status, batchComplete };
+export interface ConfirmGroupResult {
+  perTask: Array<{ pickTaskId: string; quantity: number; status: 'picked' | 'short' }>;
+  batchComplete: boolean;
+}
+
+/**
+ * Bulk pick confirm — one SKU at one location, however many order_items
+ * happen to need it. The picker sees one aggregate line ("KTN3 required 7,
+ * picked 0/7") instead of one card per order, picks the physical quantity
+ * once, and confirms once. Underneath, nothing about per-order reservation/
+ * exception tracking changes: `totalQuantity` is allocated across the given
+ * tasks in order (highest priority, then oldest order first — same
+ * convention as batch creation) and each task is settled through the exact
+ * same confirmQuantity() a single-task pick already used, so a task that
+ * doesn't get its full share is logged as a normal short pick, not a new
+ * concept. This is what makes "pick 5 of the 7 available" fall out for
+ * free instead of needing separate bulk-short-pick logic.
+ */
+export async function confirmGroupQuantity(db: D1Database, userId: string, pickTaskIds: string[], totalQuantity: number): Promise<ConfirmGroupResult> {
+  if (!pickTaskIds.length) throw new PickerFlowError('not_found', 'No pick tasks given');
+
+  const placeholders = pickTaskIds.map(() => '?').join(',');
+  const tasks = await db
+    .prepare(
+      `SELECT pt.id, pt.quantity_required
+       FROM pick_tasks pt
+       JOIN order_items oi ON oi.id = pt.order_item_id
+       JOIN orders o ON o.id = oi.order_id
+       WHERE pt.id IN (${placeholders})
+       ORDER BY o.priority DESC, o.created_at ASC`
+    )
+    .bind(...pickTaskIds)
+    .all<{ id: string; quantity_required: number }>();
+
+  const totalRequired = tasks.results.reduce((sum, t) => sum + t.quantity_required, 0);
+  if (totalQuantity > totalRequired) {
+    throw new PickerFlowError('over_pick', `Cannot pick more than the required ${totalRequired} without a supervisor override`);
+  }
+
+  let remaining = totalQuantity;
+  const perTask: ConfirmGroupResult['perTask'] = [];
+  let batchComplete = false;
+
+  for (const task of tasks.results) {
+    const allocated = Math.min(remaining, task.quantity_required);
+    remaining -= allocated;
+    const result = await confirmQuantity(db, userId, task.id, allocated);
+    perTask.push({ pickTaskId: task.id, quantity: allocated, status: result.status });
+    if (result.batchComplete) batchComplete = true;
+  }
+
+  return { perTask, batchComplete };
+}
+
+/** Group version of reportDamaged — every task in the group is damaged, none usable. Matches the picker UI's single "Damaged — none usable" action applied to the whole aggregate line, not a partial-damage concept that doesn't exist for a single task either. */
+export async function reportGroupDamaged(db: D1Database, userId: string, pickTaskIds: string[], notes?: string): Promise<void> {
+  for (const pickTaskId of pickTaskIds) {
+    await reportDamaged(db, userId, pickTaskId, notes);
+  }
 }
 
 /** Damaged-item report (§6): pulls the item from sellable inventory and releases its reservation, without blocking the rest of the order. */
 export async function reportDamaged(db: D1Database, userId: string, pickTaskId: string, notes?: string): Promise<void> {
   const task = await db
-    .prepare(`SELECT id, order_item_id, sku_id, location_id, quantity_required FROM pick_tasks WHERE id = ?`)
+    .prepare(`SELECT id, pick_batch_id, order_item_id, sku_id, location_id, quantity_required FROM pick_tasks WHERE id = ?`)
     .bind(pickTaskId)
-    .first<{ id: string; order_item_id: string; sku_id: string; location_id: string; quantity_required: number }>();
+    .first<{ id: string; pick_batch_id: string; order_item_id: string; sku_id: string; location_id: string; quantity_required: number }>();
   if (!task) throw new PickerFlowError('not_found', 'Pick task not found');
 
   const inventory = await db
@@ -313,6 +381,8 @@ export async function reportDamaged(db: D1Database, userId: string, pickTaskId: 
   const orderItem = await db.prepare(`SELECT order_id FROM order_items WHERE id = ?`).bind(task.order_item_id).first<{ order_id: string }>();
   await logException(db, { type: 'damaged', pickTaskId, orderId: orderItem?.order_id, userId, notes });
   await logAudit(db, { userId, action: 'report.damaged', entityType: 'pick_task', entityId: pickTaskId });
+
+  await checkBatchCompletion(db, task.pick_batch_id);
 }
 
 export { newId };

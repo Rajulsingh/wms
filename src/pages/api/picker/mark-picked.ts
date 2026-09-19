@@ -1,15 +1,15 @@
 import type { APIRoute } from 'astro';
 import { getDb } from '../../../lib/db';
 import { requireUser, AuthError } from '../../../lib/auth';
-import { markPicked, getPickListView, PickerFlowError } from '../../../lib/picker';
+import { confirmGroupQuantity, getPickListView, PickerFlowError } from '../../../lib/picker';
 
 export const POST: APIRoute = async (context) => {
   const db = getDb();
   try {
     const user = await requireUser(context, db, ['packer']);
-    const body = await context.request.json<{ batchId: string; pickTaskId: string; quantity: number }>();
+    const body = await context.request.json<{ batchId: string; pickTaskIds: string[]; quantity: number }>();
 
-    const result = await markPicked(db, user.id, body.pickTaskId, body.quantity);
+    const result = await confirmGroupQuantity(db, user.id, body.pickTaskIds, body.quantity);
     const rows = await getPickListView(db, body.batchId);
     return new Response(JSON.stringify({ result, rows }), { status: 200, headers: { 'Content-Type': 'application/json' } });
   } catch (err) {

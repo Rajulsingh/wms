@@ -31,6 +31,13 @@ import TopBar from '../../components/TopBar.astro';
       status: string;
     }
 
+    interface SkuGroup {
+      sku_code: string;
+      sku_name: string;
+      image_url: string | null;
+      rows: Row[];
+    }
+
     const app = document.getElementById('app')!;
     const userPill = document.getElementById('user-pill')!;
     let warehouseId = '';
@@ -124,6 +131,13 @@ import TopBar from '../../components/TopBar.astro';
       pollForBatch();
     }
 
+    // Bulk-pick by SKU, not by order: within one bin, every order that needs
+    // the same SKU collapses into one aggregate line ("KTN3 required 7,
+    // picked 0/7") instead of one card per order. Zone/bin sectioning is
+    // still the outer walking order (unavoidable — the picker can only be in
+    // one bin at a time), but the fragmentation this replaces was never
+    // about location, it was the same SKU at the same bin showing up once
+    // per order. See HANDOFF.md.
     function render() {
       lastError = '';
       const remaining = rows.filter((r) => r.status === 'pending');
@@ -139,74 +153,97 @@ import TopBar from '../../components/TopBar.astro';
         return;
       }
 
-      // Group into zone/bin sections, in the order the list already comes sorted (by location sequence).
-      const groups: Array<{ key: string; zone: string; bin: string; rows: Row[] }> = [];
+      const locGroups: Array<{ key: string; zone: string; bin: string; rows: Row[] }> = [];
       for (const r of rows) {
         const key = `${r.zone_name ?? '—'}__${r.location_code}`;
-        let group = groups.find((g) => g.key === key);
-        if (!group) {
-          group = { key, zone: r.zone_name ?? '—', bin: r.location_code, rows: [] };
-          groups.push(group);
+        let g = locGroups.find((g) => g.key === key);
+        if (!g) {
+          g = { key, zone: r.zone_name ?? '—', bin: r.location_code, rows: [] };
+          locGroups.push(g);
         }
-        group.rows.push(r);
+        g.rows.push(r);
       }
 
+      const skuLineCount = new Set(rows.map((r) => `${r.location_code}__${r.sku_code}`)).size;
       app.innerHTML = `
         ${errorBanner()}
-        <div class="stack" id="summary" style="flex-direction: row; gap: 16px;">
+        <div class="stack" id="summary" style="flex-direction: row; gap: 16px; flex-wrap: wrap;">
           <span class="pill">${new Set(rows.map((r) => r.external_order_id)).size} orders</span>
-          <span class="pill">${rows.length} lines</span>
-          <span class="pill">${remaining.length} left</span>
+          <span class="pill">${skuLineCount} SKU lines</span>
+          <span class="pill">${remaining.length} of ${rows.length} left</span>
         </div>
         <div class="stack" id="groups"></div>`;
 
       const groupsEl = document.getElementById('groups')!;
-      for (const group of groups) {
+      for (const locGroup of locGroups) {
         const section = document.createElement('div');
         section.className = 'stack';
         section.style.gap = '8px';
-        section.innerHTML = `<div class="eyebrow">Zone ${group.zone} · Bin ${group.bin}</div>`;
-        for (const r of group.rows) {
-          section.appendChild(renderRow(r));
+        section.innerHTML = `<div class="eyebrow">Zone ${locGroup.zone} · Bin ${locGroup.bin}</div>`;
+
+        const skuGroups: SkuGroup[] = [];
+        for (const r of locGroup.rows) {
+          let sg = skuGroups.find((sg) => sg.sku_code === r.sku_code);
+          if (!sg) {
+            sg = { sku_code: r.sku_code, sku_name: r.sku_name, image_url: r.image_url, rows: [] };
+            skuGroups.push(sg);
+          }
+          sg.rows.push(r);
         }
+        for (const sg of skuGroups) section.appendChild(renderSkuGroup(sg));
         groupsEl.appendChild(section);
       }
     }
 
-    function renderRow(r: Row): HTMLElement {
+    function renderSkuGroup(sg: SkuGroup): HTMLElement {
+      const required = sg.rows.reduce((sum, r) => sum + r.quantity_required, 0);
+      const picked = sg.rows.reduce((sum, r) => sum + r.quantity_picked, 0);
+      const pendingRows = sg.rows.filter((r) => r.status === 'pending');
+      const done = pendingRows.length === 0;
+      const remainingNeeded = required - picked;
+      const orderCount = new Set(sg.rows.map((r) => r.external_order_id)).size;
+
+      const orderBreakdown = sg.rows
+        .map((r) => `${r.external_order_id} ×${r.quantity_required}${r.status !== 'pending' ? ` (got ${r.quantity_picked}, ${r.status})` : ''}`)
+        .join(' · ');
+
       const el = document.createElement('div');
       el.className = 'card';
-      const done = r.status !== 'pending';
       el.innerHTML = `
         <div class="row" style="align-items: center; gap: 12px;">
-          ${r.image_url ? `<img class="thumb" src="${r.image_url}" alt="" />` : '<div class="thumb"></div>'}
+          ${sg.image_url ? `<img class="thumb" src="${sg.image_url}" alt="" />` : '<div class="thumb"></div>'}
           <div class="stack" style="gap: 2px; flex: 1;">
-            <span style="font-weight: 600;">${r.sku_name}</span>
-            <span style="font-size: 0.8rem; color: var(--muted);">${r.sku_code} · Order ${r.external_order_id}</span>
+            <span style="font-weight: 600;">${sg.sku_name}</span>
+            <span style="font-size: 0.8rem; color: var(--muted);">${sg.sku_code} · ${orderCount} order${orderCount > 1 ? 's' : ''}</span>
           </div>
-          <span class="qty">${r.quantity_picked}/${r.quantity_required}</span>
+          <span class="qty">${picked}/${required}</span>
         </div>
+        <div style="font-size: 0.72rem; color: var(--muted); margin-top: 6px;">${orderBreakdown}</div>
         ${
           done
-            ? `<div class="banner ${r.status === 'picked' ? 'banner-success' : 'banner-warning'}" style="margin-top: 10px; padding: 8px 12px;">${r.status === 'picked' ? 'Picked' : r.status === 'damaged' ? 'Damaged' : 'Short'}</div>`
-            : `<div class="row" style="margin-top: 10px; gap: 8px;">
-                 <button class="btn btn-primary" data-action="pick" data-id="${r.pick_task_id}" data-qty="${r.quantity_required}">Picked</button>
-                 <button class="btn btn-ghost" data-action="issue" data-id="${r.pick_task_id}" data-qty="${r.quantity_required}">Report issue</button>
-               </div>`
+            ? `<div class="banner banner-success" style="margin-top: 10px; padding: 8px 12px;">Done</div>`
+            : `<div class="row" style="margin-top: 10px; gap: 8px; align-items: center;">
+                 <input type="number" class="qty-input" min="0" max="${remainingNeeded}" value="${remainingNeeded}" style="width: 90px; flex: 0 0 auto; min-height: 52px; text-align: center;" />
+                 <button class="btn btn-primary" data-action="pick" style="flex: 1;">Mark done</button>
+               </div>
+               <button class="btn btn-ghost" data-action="issue" style="margin-top: 8px;">Report issue</button>`
         }`;
 
+      const pendingIds = pendingRows.map((r) => r.pick_task_id);
       el.querySelector('[data-action="pick"]')?.addEventListener('click', async () => {
-        await handleMarkPicked(r.pick_task_id, r.quantity_required);
+        const input = el.querySelector('.qty-input') as HTMLInputElement;
+        const qty = Number(input.value);
+        await handleMarkPicked(pendingIds, qty);
       });
       el.querySelector('[data-action="issue"]')?.addEventListener('click', () => {
-        renderIssueSheet(r);
+        renderIssueSheet(sg, pendingIds, remainingNeeded);
       });
       return el;
     }
 
-    async function handleMarkPicked(pickTaskId: string, quantity: number) {
+    async function handleMarkPicked(pickTaskIds: string[], quantity: number) {
       try {
-        const res = await api('/api/picker/mark-picked', { batchId, pickTaskId, quantity });
+        const res = await api('/api/picker/mark-picked', { batchId, pickTaskIds, quantity });
         rows = res.rows;
         render();
       } catch (err) {
@@ -215,34 +252,26 @@ import TopBar from '../../components/TopBar.astro';
       }
     }
 
-    function renderIssueSheet(r: Row) {
+    function renderIssueSheet(sg: SkuGroup, pendingIds: string[], remainingNeeded: number) {
       app.innerHTML = `
         <div class="stack" style="flex:1; justify-content:center; text-align:center;">
-          <span class="eyebrow">${r.sku_name}</span>
-          <p>Required: ${r.quantity_required}</p>
+          <span class="eyebrow">${sg.sku_name}</span>
+          <p>Needed: ${remainingNeeded}</p>
+          <p>If only some units are damaged, cancel this and enter how many you actually got in the quantity box instead — the rest is automatically logged as short.</p>
           <div class="stack">
             <button class="btn btn-danger" id="damaged">Damaged — none usable</button>
-          </div>
-          <div class="stack" style="gap: 6px;">
-            <label for="short-qty">Picked only this many (short pick)</label>
-            <input type="number" id="short-qty" min="0" max="${r.quantity_required}" value="0" />
-            <button class="btn" id="short-submit">Confirm short pick</button>
           </div>
           <button class="btn btn-ghost" id="cancel">Cancel</button>
         </div>`;
 
       document.getElementById('damaged')?.addEventListener('click', async () => {
         try {
-          rows = await api('/api/picker/report-damaged', { batchId, pickTaskId: r.pick_task_id });
+          rows = await api('/api/picker/report-damaged', { batchId, pickTaskIds: pendingIds });
           render();
         } catch (err) {
           lastError = (err as Error).message;
           render();
         }
-      });
-      document.getElementById('short-submit')?.addEventListener('click', async () => {
-        const qty = Number((document.getElementById('short-qty') as HTMLInputElement).value);
-        await handleMarkPicked(r.pick_task_id, qty);
       });
       document.getElementById('cancel')?.addEventListener('click', render);
     }

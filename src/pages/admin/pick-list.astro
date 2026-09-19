@@ -96,6 +96,56 @@ if (redirectTo) return Astro.redirect(redirectTo);
       return `<span class="status-pill ${cls}">${status}</span>`;
     }
 
+    interface SkuLocationGroup {
+      key: string;
+      zone_name: string | null;
+      location_code: string;
+      sku_code: string;
+      sku_name: string;
+      image_url: string | null;
+      quantity_required: number;
+      quantity_picked: number;
+      status: string;
+      orderBreakdown: string;
+    }
+
+    // Same grouping the picker's own app screen uses — same SKU at the same
+    // bin collapses into one line across every order that needs it, so the
+    // printed sheet matches what a picker actually works from instead of
+    // showing four separate rows for one bin visit. See HANDOFF.md.
+    function groupRowsBySkuLocation(rows: Row[]): SkuLocationGroup[] {
+      const byKey = new Map<string, Row[]>();
+      for (const r of rows) {
+        const key = `${r.location_code}__${r.sku_code}`;
+        const existing = byKey.get(key);
+        if (existing) existing.push(r);
+        else byKey.set(key, [r]);
+      }
+
+      return Array.from(byKey.entries()).map(([key, memberRows]) => {
+        const first = memberRows[0];
+        const status = memberRows.every((r) => r.status === 'picked')
+          ? 'picked'
+          : memberRows.some((r) => r.status === 'pending')
+            ? 'pending'
+            : memberRows.some((r) => r.status === 'damaged')
+              ? 'damaged'
+              : 'short';
+        return {
+          key,
+          zone_name: first.zone_name,
+          location_code: first.location_code,
+          sku_code: first.sku_code,
+          sku_name: first.sku_name,
+          image_url: first.image_url,
+          quantity_required: memberRows.reduce((sum, r) => sum + r.quantity_required, 0),
+          quantity_picked: memberRows.reduce((sum, r) => sum + r.quantity_picked, 0),
+          status,
+          orderBreakdown: memberRows.map((r) => `${r.external_order_id} ×${r.quantity_required}`).join(', ')
+        };
+      });
+    }
+
     const CHECK_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m5 13 4 4L19 7"></path></svg>';
 
     // Batch lifecycle only (pending/assigned/in_progress -> completed) — packing
@@ -182,24 +232,24 @@ if (redirectTo) return Astro.redirect(redirectTo);
         </div>
         <div class="table-scroll"><table>
           <thead>
-            <tr><th>Zone</th><th>Bin</th><th>Product</th><th>SKU</th><th>Order</th><th>Units</th><th>Status</th></tr>
+            <tr><th>Zone</th><th>Bin</th><th>Product</th><th>SKU</th><th>Units</th><th>Orders</th><th>Status</th></tr>
           </thead>
           <tbody>
-            ${rows
+            ${groupRowsBySkuLocation(rows)
               .map(
-                (r) => `<tr>
-                  <td>${r.zone_name ?? '—'}</td>
-                  <td>${r.location_code}</td>
+                (g) => `<tr>
+                  <td>${g.zone_name ?? '—'}</td>
+                  <td>${g.location_code}</td>
                   <td>
                     <div class="row" style="align-items:center; gap:10px;">
-                      ${r.image_url ? `<img class="table-thumb" src="${r.image_url}" alt="" />` : ''}
-                      <span>${r.sku_name}</span>
+                      ${g.image_url ? `<img class="table-thumb" src="${g.image_url}" alt="" />` : ''}
+                      <span>${g.sku_name}</span>
                     </div>
                   </td>
-                  <td>${r.sku_code}</td>
-                  <td>${r.external_order_id}</td>
-                  <td>${r.quantity_required}</td>
-                  <td>${statusPill(r.status)}</td>
+                  <td>${g.sku_code}</td>
+                  <td>${g.quantity_picked}/${g.quantity_required}</td>
+                  <td style="font-size: 0.82rem; color: var(--muted);">${g.orderBreakdown}</td>
+                  <td>${statusPill(g.status)}</td>
                 </tr>`
               )
               .join('')}
