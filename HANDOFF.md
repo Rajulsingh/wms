@@ -780,7 +780,13 @@ full story behind each). What's actually not done yet, ordered by what's blockin
    `JC-82IW-CSC1`, and others are all at zero stock with real orders waiting on them. Receive stock
    for each via `/admin/inbound` — every matching blocked order resolves automatically the moment
    its SKU gets stock (no further action needed per order).
-2. **Get the Amazon Easy Ship SP-API role granted.** Still the one thing blocking real use of
+2. **Verify the fifteenth/seventeenth-pass floor-UI changes on a real phone.** Both were built and
+   verified against dev/API state only — no camera hardware in the sandboxed browser used for
+   testing, so scanner speed (75ms poll, restricted formats, higher resolution) was never actually
+   timed against a real barcode, and the bigger-photo/aggregate-order-count picker layout was never
+   seen on an actual small screen. Neither should be *broken*, but "feels fast enough" and "looks
+   right on a phone" are real-device calls, not sandbox ones.
+3. **Get the Amazon Easy Ship SP-API role granted.** Still the one thing blocking real use of
    shipping (single-order, bulk, everything) *and* packing's bulk-label piece (part 2 of 3, see
    "Open items" #14). It's on the user, not something to keep investigating from this end — check
    Seller Central's app-authorization page for an "Easy Ship" scope. Once granted, the very first
@@ -792,32 +798,32 @@ full story behind each). What's actually not done yet, ordered by what's blockin
    the way `scheduleEasyShipBulk` assumes (flagged since item 13, still unverified). None of that
    has ever been exercised against a live account. The bulk/single ship pages now have a
    confirmation step before anything fires, so this smoke test won't happen by accident.
-3. **Work through the remaining SKU-duplicate merges.** The fifth pass fixed all 34 *exact*-name
+4. **Work through the remaining SKU-duplicate merges.** The fifth pass fixed all 34 *exact*-name
    duplicate groups live in one sweep, but `/admin/inventory`'s scanner only catches exact matches
    — near-duplicates (a trailing "(Classic)", a punctuation difference) still need manual review.
    Run "Scan for duplicates" again next session to see what's accumulated since (new orders keep
    auto-creating SKUs for SellerSKU variants never seen before — that's expected, not a bug).
-4. **Real box sizes.** Only demo/test boxes existed as of the start of this session — confirm with
+5. **Real box sizes.** Only demo/test boxes existed as of the start of this session — confirm with
    the user whether their actual box dimensions have been entered in `/admin/settings` yet.
-5. **Confirm the ship-from address is real**, not a placeholder — check `/admin/settings` before
+6. **Confirm the ship-from address is real**, not a placeholder — check `/admin/settings` before
    the first real label purchase.
-6. **Decide the 30-day data-disposal scope** (see open item, below) — this was *committed to
+7. **Decide the 30-day data-disposal scope** (see open item, below) — this was *committed to
    Amazon in writing* with no enforcement code yet. Needs three scoping answers from the user
    before it can be built safely; the cron infrastructure already exists (`src/worker.ts`) so the
    actual job is easy to add once those answers exist.
-7. **Ask-before-building items**: individually-strengthened admin auth (currently same weak PIN
+8. **Ask-before-building items**: individually-strengthened admin auth (currently same weak PIN
    as floor workers), a public privacy policy URL for ecomglider.com, what should happen when an
    Amazon cancellation lands on an order already fully picked/packed (currently just an exception
    event for manual putback), whether the Amazon catalog sync should become automatic (periodic
    cron) rather than a manual button, and the broader HTML-escaping audit flagged as Open item #16
    (the notes feature is covered; older fields like `first_item_name`'s title attribute aren't).
    None of these are urgent; don't build them unprompted.
-8. **Minor cleanup, low priority**: `src/pages/api/picker/scan-item.ts` (and `verifyItemScan` in
+9. **Minor cleanup, low priority**: `src/pages/api/picker/scan-item.ts` (and `verifyItemScan` in
    `picker.ts`) is dead code from before the picker dropped mandatory scanning — nothing calls it.
    `Warehouse` type in `types.ts` is missing the `ship_from_*` columns (cosmetic, nothing breaks).
    No throttling between per-order `GetOrderItems` calls in `fetchUnfulfilledOrders` (see the
    thirteenth pass) — fine at current volume, revisit if SP-API rate-limit errors become frequent.
-9. **If the user says the UI looks off somewhere**, the fix pattern is established (see "Design
+10. **If the user says the UI looks off somewhere**, the fix pattern is established (see "Design
    system") — reuse `AdminShell`/existing component classes. If it's a *mobile* complaint, verify
    with `document.documentElement.scrollWidth` at 375px before guessing — this has caught two real
    bugs this session that weren't visible on desktop (the Required/Picked stat block, and the bare
