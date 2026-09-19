@@ -454,9 +454,55 @@ packer to see what they'd actually finished that day.
   `pack_sessions` already marked `completed`/`partial` by the existing packing flow — neither
   changes any picking/packing behavior, only what's visible.
 
+## Recently done (2026-09-19, a tenth pass) — picking by SKU across everything, packing by order
+
+The user pointed out picking still felt batch/order-organized even after the ninth pass's "all at
+once" fix — every batch rendered as its own section with its own "BATCH · N ORDERS" header, so a
+picker still mentally worked through one batch, then the next, rather than one continuous SKU list.
+Separately, packing had the *opposite* problem: it grouped by SKU across every order in a batch (a
+carryover from picking's own bulk-by-SKU pattern), which hid whether any one order needed more than
+one unit of something — exactly the thing a packer boxing up one order at a time needs to see.
+
+- **Picking (`picker/index.astro`) now renders ONE flat list, zone/bin → SKU, with no batch
+  sectioning and no order sectioning at all.** Every pick_task from every currently-open batch is
+  flattened before grouping — the same SKU at the same bin needed by two different batches (or two
+  different orders) merges into a single card with a single "Mark done" tap, instead of appearing
+  as two separate cards in two separate batch sections. Order id only ever appears as the small
+  breakdown line under a SKU card ("ORDER-A ×3 · ORDER-B ×2"), never as an organizing heading.
+- This meant a bulk pick/damage submission can now span pick_tasks from more than one pick_batch in
+  a single call (previously always exactly one, since the UI never merged across batches before).
+  `confirmGroupQuantity`/`reportGroupDamaged` in picker.ts already had no batch restriction — the
+  only thing that needed to change was the API layer: `/api/picker/mark-picked` and
+  `/api/picker/report-damaged` no longer take a caller-supplied `batchId` (there may be several);
+  instead a new `getBatchIdsForTasks` helper works out which batch(es) the submitted pick_task ids
+  actually touch, and the response carries fresh rows for each of those, keyed by batch id, which
+  the client patches back into whichever `batchList` entries they belong to.
+- **Packing (`packer/index.astro`, `packer.ts`) now groups by order, not SKU.** Each batch's card
+  lists its orders (sorted by external id); each order is its own card listing every SKU line it
+  needs with the quantity right on the row ("Standard Gadget ×3") — a multi-quantity order is
+  visible at a glance instead of being buried inside a cross-order SKU total. One "Mark order
+  packed" tap per order submits every line on it at once (quantities default to what picking
+  delivered, still editable down per line if something turns up missing/broken at the table).
+  `markPackGroup`'s cross-order SKU pooling was removed outright (no longer reachable from
+  anywhere) and replaced with `markPackOrder`, which updates a set of `{orderItemId, quantity}`
+  lines scoped to one order — there was never a real "pool" to allocate within one order's own
+  distinct SKU lines, unlike picking's genuinely-shared physical pile of one SKU across orders.
+  Batch-level sectioning ("BATCH · N ORDERS") was left in place for packing — the user's ask here
+  was specifically the SKU-vs-order axis, and each pick_batch already corresponds to one coherent
+  pack→label→done unit from the eighth pass's design, which nothing about this change touches.
+- **Verified live in dev, including the cross-batch merge**: claimed a batch with one order
+  (3 units of a SKU), left it unfinished, inserted a second order needing 2 more of the *same* SKU
+  at the *same* bin (landing in a separate batch via the ninth pass's sweep), reloaded, and got one
+  merged card ("Required 5, Picked 0", both orders in the breakdown) instead of two separate ones.
+  Picked 4 of 5 (a cross-batch short pick) and confirmed the split landed correctly — one order got
+  its full 3, the other got 1 of its 2 and was marked short — proving the allocation and the
+  per-batch response patching both worked across the batch boundary. Then confirmed packing: the
+  now-picked orders showed up order-first with quantities visible inline, and "Mark order packed"
+  correctly recorded and reflected the packed quantity.
+
 ## Next steps — a prioritized plan
 
-Rewritten 2026-09-19 (end of a long day, nine passes — see "Recently done" entries above for the
+Rewritten 2026-09-19 (end of a long day, ten passes — see "Recently done" entries above for the
 full story behind each). What's actually not done yet, ordered by what's blocking vs. not. See
 "Open items" below for full detail on each.
 

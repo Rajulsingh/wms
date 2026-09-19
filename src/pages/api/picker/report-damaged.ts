@@ -1,17 +1,20 @@
 import type { APIRoute } from 'astro';
 import { getDb } from '../../../lib/db';
 import { requireUser, AuthError } from '../../../lib/auth';
-import { reportGroupDamaged, getPickListView, PickerFlowError } from '../../../lib/picker';
+import { reportGroupDamaged, getBatchIdsForTasks, getPickListView, PickerFlowError } from '../../../lib/picker';
 
+// See mark-picked.ts — pickTaskIds can span more than one pick_batch now.
 export const POST: APIRoute = async (context) => {
   const db = getDb();
   try {
     const user = await requireUser(context, db, ['packer']);
-    const body = await context.request.json<{ batchId: string; pickTaskIds: string[]; notes?: string }>();
+    const body = await context.request.json<{ pickTaskIds: string[]; notes?: string }>();
 
     await reportGroupDamaged(db, user.id, body.pickTaskIds, body.notes);
-    const rows = await getPickListView(db, body.batchId);
-    return new Response(JSON.stringify(rows), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    const batchIds = await getBatchIdsForTasks(db, body.pickTaskIds);
+    const batches = [];
+    for (const batchId of batchIds) batches.push({ batchId, rows: await getPickListView(db, batchId) });
+    return new Response(JSON.stringify({ batches }), { status: 200, headers: { 'Content-Type': 'application/json' } });
   } catch (err) {
     if (err instanceof AuthError) return new Response(JSON.stringify({ error: err.message }), { status: err.status });
     if (err instanceof PickerFlowError) return new Response(JSON.stringify({ error: err.message, code: err.code }), { status: 409 });

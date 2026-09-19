@@ -219,40 +219,35 @@ export async function getPackBatchState(db: D1Database, pickBatchId: string): Pr
   };
 }
 
+export interface PackLineInput {
+  orderItemId: string;
+  quantity: number;
+}
+
 /**
- * Bulk pack confirm — mirrors picker.ts's confirmGroupQuantity. One SKU
- * across however many orders in this packing batch need it: the packer
- * confirms the total once, allocated across the underlying order_items in
- * priority/created-at order. No reservation/short-pick concept here (that
- * already happened at picking) — packing just records what physically went
- * into each box, capped at what picking actually delivered.
+ * Bulk pack confirm for one order — every SKU line on that order at once, in
+ * a single tap, each with its own quantity (no pooling: unlike picking,
+ * where the same SKU genuinely is one shared physical pile across orders,
+ * an order's own SKU lines are independent boxes going into the same
+ * package, so there's nothing to pool). No reservation/short-pick concept
+ * here (that already happened at picking) — packing just records what
+ * physically went into the box, capped at what picking actually delivered.
  */
-export async function markPackGroup(db: D1Database, userId: string, pickBatchId: string, orderItemIds: string[], totalQuantity: number): Promise<PackBatchState> {
-  if (!orderItemIds.length) throw new PackerFlowError('not_found', 'No items given');
+export async function markPackOrder(db: D1Database, userId: string, pickBatchId: string, orderId: string, lines: PackLineInput[]): Promise<PackBatchState> {
+  if (!lines.length) throw new PackerFlowError('not_found', 'No items given');
 
-  const placeholders = orderItemIds.map(() => '?').join(',');
-  const items = await db
-    .prepare(
-      `SELECT oi.id, oi.quantity_picked AS required
-       FROM order_items oi JOIN orders o ON o.id = oi.order_id
-       WHERE oi.id IN (${placeholders})
-       ORDER BY o.priority DESC, o.created_at ASC`
-    )
-    .bind(...orderItemIds)
-    .all<{ id: string; required: number }>();
-
-  const totalRequired = items.results.reduce((sum, i) => sum + i.required, 0);
-  if (totalQuantity < 0 || totalQuantity > totalRequired) {
-    throw new PackerFlowError('bad_quantity', `Quantity must be between 0 and ${totalRequired}`);
+  for (const line of lines) {
+    const item = await db
+      .prepare(`SELECT quantity_picked AS required FROM order_items WHERE id = ? AND order_id = ?`)
+      .bind(line.orderItemId, orderId)
+      .first<{ required: number }>();
+    if (!item) throw new PackerFlowError('not_found', 'Order item not found on this order');
+    if (line.quantity < 0 || line.quantity > item.required) {
+      throw new PackerFlowError('bad_quantity', `Quantity must be between 0 and ${item.required}`);
+    }
+    await db.prepare(`UPDATE order_items SET quantity_packed = ? WHERE id = ?`).bind(line.quantity, line.orderItemId).run();
   }
-
-  let remaining = totalQuantity;
-  for (const item of items.results) {
-    const allocated = Math.min(remaining, item.required);
-    remaining -= allocated;
-    await db.prepare(`UPDATE order_items SET quantity_packed = ? WHERE id = ?`).bind(allocated, item.id).run();
-  }
-  await logAudit(db, { userId, action: 'pack.mark_group', entityType: 'pick_batch', entityId: pickBatchId, metadata: { orderItemIds, quantity: totalQuantity } });
+  await logAudit(db, { userId, action: 'pack.mark_order', entityType: 'order', entityId: orderId, metadata: { lines } });
 
   return getPackBatchState(db, pickBatchId);
 }

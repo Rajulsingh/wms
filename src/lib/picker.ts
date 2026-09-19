@@ -309,6 +309,24 @@ async function checkBatchCompletion(db: D1Database, pickBatchId: string): Promis
   return batchComplete;
 }
 
+/**
+ * Which pick_batches a set of pick_task ids actually belong to — a bulk
+ * pick/damage submission can span more than one batch now that the picker
+ * page groups by SKU across every currently-open batch instead of rendering
+ * one batch at a time (see picker/index.astro). Callers use this to know
+ * which batches' rows need refreshing in the response, without guessing or
+ * requiring the client to already know which batch(es) it touched.
+ */
+export async function getBatchIdsForTasks(db: D1Database, pickTaskIds: string[]): Promise<string[]> {
+  if (!pickTaskIds.length) return [];
+  const placeholders = pickTaskIds.map(() => '?').join(',');
+  const rows = await db
+    .prepare(`SELECT DISTINCT pick_batch_id FROM pick_tasks WHERE id IN (${placeholders})`)
+    .bind(...pickTaskIds)
+    .all<{ pick_batch_id: string }>();
+  return rows.results.map((r) => r.pick_batch_id);
+}
+
 export interface ConfirmGroupResult {
   perTask: Array<{ pickTaskId: string; quantity: number; status: 'picked' | 'short' }>;
   batchComplete: boolean;

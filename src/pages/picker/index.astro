@@ -39,6 +39,13 @@ import TopBar from '../../components/TopBar.astro';
       rows: Row[];
     }
 
+    interface LocationGroup {
+      key: string;
+      zone: string;
+      bin: string;
+      rows: Row[];
+    }
+
     interface SkuGroup {
       sku_code: string;
       sku_name: string;
@@ -52,11 +59,11 @@ import TopBar from '../../components/TopBar.astro';
     let batchList: BatchEntry[] = [];
     let lastError = '';
 
-    // Keyed by `${batchId}__${locationCode}__${skuCode}` — a SKU group that's
-    // mid-way through the "why was this short" flow (either a shortfall
-    // entered on "Mark done", or the standalone "Report issue" button).
-    // Rendered inline in that card, not a full-screen takeover, so the rest
-    // of a long multi-batch page doesn't lose its place.
+    // Keyed by `${locationCode}__${skuCode}` — a SKU group that's mid-way
+    // through the "why was this short" flow. A SKU group is no longer
+    // scoped to one batch (see render() below), so batch id has no place in
+    // this key any more — the same SKU at the same bin across two different
+    // batches is one card, one action, one reason.
     const pendingReasonFor: Record<string, { pickTaskIds: string[]; quantity: number }> = {};
 
     async function api(path: string, body?: unknown) {
@@ -135,33 +142,40 @@ import TopBar from '../../components/TopBar.astro';
       document.getElementById('retry')?.addEventListener('click', boot);
     }
 
-    // Every batch this picker has (auto-swept, or hand-assigned by admin)
-    // renders on ONE continuous page — no "get next batch" click gate.
-    // Freshly added batches (see pollForMore) simply append at the bottom;
-    // the picker just scrolls down to them. See HANDOFF.md.
+    // Every pick_task from every batch this picker has (auto-swept, or
+    // hand-assigned by admin) collapses into ONE flat list, grouped by
+    // location then SKU — never by batch and never by order. A picker's job
+    // is "bring N of this SKU from this bin", not "work through batch A then
+    // batch B" — which order(s) it's for is supporting detail under each
+    // SKU card, not the organizing axis. Two batches needing the same SKU at
+    // the same bin merge into a single card and a single "Mark done" tap
+    // covers both at once. See HANDOFF.md.
+    function allRows(): Row[] {
+      return batchList.flatMap((e) => e.rows);
+    }
+
     function render() {
       if (!batchList.length) {
         renderNoBatch();
         return;
       }
 
-      const allRows = batchList.flatMap((e) => e.rows);
-      const totalRemaining = allRows.filter((r) => r.status === 'pending').length;
-      const totalOrders = new Set(allRows.map((r) => r.external_order_id)).size;
-      const totalSkuLines = new Set(batchList.flatMap((e) => e.rows.map((r) => `${e.batchId}__${r.location_code}__${r.sku_code}`))).size;
+      const rows = allRows();
+      const totalRemaining = rows.filter((r) => r.status === 'pending').length;
+      const totalOrders = new Set(rows.map((r) => r.external_order_id)).size;
+      const totalSkuLines = new Set(rows.map((r) => `${r.location_code}__${r.sku_code}`)).size;
 
       app.innerHTML = `
         ${lastError ? `<div class="banner banner-danger">${lastError}</div>` : ''}
         <div class="stack" id="summary" style="flex-direction: row; gap: 16px; flex-wrap: wrap;">
           <span class="pill">${totalOrders} orders</span>
           <span class="pill">${totalSkuLines} SKU lines</span>
-          <span class="pill">${totalRemaining} of ${allRows.length} left</span>
-          ${batchList.length > 1 ? `<span class="pill">${batchList.length} batches</span>` : ''}
+          <span class="pill">${totalRemaining} of ${rows.length} left</span>
         </div>
-        <div class="stack" id="batch-container" style="gap: 22px;"></div>`;
+        <div class="stack" id="location-container" style="gap: 22px;"></div>`;
 
-      const container = document.getElementById('batch-container')!;
-      for (const entry of batchList) container.appendChild(renderBatchSection(entry));
+      const container = document.getElementById('location-container')!;
+      for (const locGroup of groupByLocation(rows)) container.appendChild(renderLocationSection(locGroup));
 
       if (totalRemaining === 0) {
         const banner = document.createElement('div');
@@ -171,58 +185,43 @@ import TopBar from '../../components/TopBar.astro';
       }
     }
 
-    function renderBatchSection(entry: BatchEntry): HTMLElement {
-      const wrap = document.createElement('div');
-      wrap.className = 'stack';
-      wrap.style.gap = '12px';
-
-      const orderCount = new Set(entry.rows.map((r) => r.external_order_id)).size;
-      const remaining = entry.rows.filter((r) => r.status === 'pending').length;
-      const header = document.createElement('div');
-      header.className = 'row';
-      header.style.justifyContent = 'space-between';
-      header.style.alignItems = 'center';
-      header.innerHTML = `<span class="eyebrow">Batch · ${orderCount} order${orderCount > 1 ? 's' : ''}</span>${
-        remaining === 0 ? '<span class="status-pill status-success">Done</span>' : ''
-      }`;
-      wrap.appendChild(header);
-
-      const locGroups: Array<{ key: string; zone: string; bin: string; rows: Row[] }> = [];
-      for (const r of entry.rows) {
+    function groupByLocation(rows: Row[]): LocationGroup[] {
+      const groups: LocationGroup[] = [];
+      for (const r of rows) {
         const key = `${r.zone_name ?? '—'}__${r.location_code}`;
-        let g = locGroups.find((g) => g.key === key);
+        let g = groups.find((g) => g.key === key);
         if (!g) {
           g = { key, zone: r.zone_name ?? '—', bin: r.location_code, rows: [] };
-          locGroups.push(g);
+          groups.push(g);
         }
         g.rows.push(r);
       }
-
-      for (const locGroup of locGroups) {
-        const section = document.createElement('div');
-        section.className = 'stack';
-        section.style.gap = '8px';
-        section.innerHTML = `<div class="eyebrow">Zone ${locGroup.zone} · Bin ${locGroup.bin}</div>`;
-
-        const skuGroups: SkuGroup[] = [];
-        for (const r of locGroup.rows) {
-          let sg = skuGroups.find((sg) => sg.sku_code === r.sku_code);
-          if (!sg) {
-            sg = { sku_code: r.sku_code, sku_name: r.sku_name, image_url: r.image_url, rows: [] };
-            skuGroups.push(sg);
-          }
-          sg.rows.push(r);
-        }
-        for (const sg of skuGroups) {
-          const groupKey = `${entry.batchId}__${locGroup.bin}__${sg.sku_code}`;
-          section.appendChild(renderSkuGroup(entry, sg, groupKey));
-        }
-        wrap.appendChild(section);
-      }
-      return wrap;
+      return groups;
     }
 
-    function renderSkuGroup(entry: BatchEntry, sg: SkuGroup, groupKey: string): HTMLElement {
+    function renderLocationSection(locGroup: LocationGroup): HTMLElement {
+      const section = document.createElement('div');
+      section.className = 'stack';
+      section.style.gap = '8px';
+      section.innerHTML = `<div class="eyebrow">Zone ${locGroup.zone} · Bin ${locGroup.bin}</div>`;
+
+      const skuGroups: SkuGroup[] = [];
+      for (const r of locGroup.rows) {
+        let sg = skuGroups.find((sg) => sg.sku_code === r.sku_code);
+        if (!sg) {
+          sg = { sku_code: r.sku_code, sku_name: r.sku_name, image_url: r.image_url, rows: [] };
+          skuGroups.push(sg);
+        }
+        sg.rows.push(r);
+      }
+      for (const sg of skuGroups) {
+        const groupKey = `${locGroup.bin}__${sg.sku_code}`;
+        section.appendChild(renderSkuGroup(sg, groupKey));
+      }
+      return section;
+    }
+
+    function renderSkuGroup(sg: SkuGroup, groupKey: string): HTMLElement {
       const required = sg.rows.reduce((sum, r) => sum + r.quantity_required, 0);
       const picked = sg.rows.reduce((sum, r) => sum + r.quantity_picked, 0);
       const pendingRows = sg.rows.filter((r) => r.status === 'pending');
@@ -304,7 +303,7 @@ import TopBar from '../../components/TopBar.astro';
             pendingReasonFor[groupKey] = { pickTaskIds: pendingIds, quantity: qty };
             render();
           } else {
-            submitPick(entry, pendingIds, qty);
+            submitPick(pendingIds, qty);
           }
         });
         el.querySelector('[data-action="issue"]')?.addEventListener('click', () => {
@@ -332,7 +331,7 @@ import TopBar from '../../components/TopBar.astro';
           // were picked (quantity > 0) the reason is just an annotation on
           // an otherwise ordinary short pick, not an inventory damage claim.
           if (reasonValue === 'damaged' && quantity === 0) {
-            submitDamaged(entry, pickTaskIds, note ? `Damaged — none usable: ${note}` : 'Damaged — none usable');
+            submitDamaged(pickTaskIds, note ? `Damaged — none usable: ${note}` : 'Damaged — none usable');
           } else {
             const label =
               reasonValue === 'damaged'
@@ -340,7 +339,7 @@ import TopBar from '../../components/TopBar.astro';
                 : reasonValue === 'low_stock'
                   ? note ? `Low stock — not enough available: ${note}` : 'Low stock — not enough available'
                   : note ? `Other: ${note}` : 'Other';
-            submitPick(entry, pickTaskIds, quantity, label);
+            submitPick(pickTaskIds, quantity, label);
           }
         });
       }
@@ -348,14 +347,42 @@ import TopBar from '../../components/TopBar.astro';
       return el;
     }
 
-    // Mutates entry.rows and re-renders BEFORE the network call resolves —
-    // the tap feels instant instead of waiting on a round trip. If the
-    // server disagrees (a race, a stale batch), the optimistic guess is
-    // rolled back and the authoritative rows take over.
-    function applyOptimisticPick(rows: Row[], ids: string[], totalQuantity: number) {
+    // A pick_task_id is unique across every batch this picker has, so this
+    // just needs to find whichever entry currently holds it — the caller
+    // never needs to know (or care) which batch that is.
+    function findRow(pickTaskId: string): Row | null {
+      for (const entry of batchList) {
+        const row = entry.rows.find((r) => r.pick_task_id === pickTaskId);
+        if (row) return row;
+      }
+      return null;
+    }
+
+    function snapshotAll(): Map<string, Row[]> {
+      return new Map(batchList.map((e) => [e.batchId, e.rows.map((r) => ({ ...r }))]));
+    }
+
+    function restoreSnapshot(snapshot: Map<string, Row[]>) {
+      for (const entry of batchList) {
+        const snap = snapshot.get(entry.batchId);
+        if (snap) entry.rows = snap;
+      }
+    }
+
+    function applyBatchUpdates(batches: Array<{ batchId: string; rows: Row[] }>) {
+      for (const b of batches) {
+        const entry = batchList.find((e) => e.batchId === b.batchId);
+        if (entry) entry.rows = b.rows;
+      }
+    }
+
+    // Mutates whichever rows these ids point to (which may span more than
+    // one batch — see render()) and re-renders BEFORE the network call
+    // resolves, so the tap feels instant. Rolled back on failure.
+    function applyOptimisticPick(ids: string[], totalQuantity: number) {
       let remaining = totalQuantity;
       for (const id of ids) {
-        const row = rows.find((r) => r.pick_task_id === id);
+        const row = findRow(id);
         if (!row) continue;
         const alloc = Math.min(remaining, row.quantity_required);
         remaining -= alloc;
@@ -364,39 +391,40 @@ import TopBar from '../../components/TopBar.astro';
       }
     }
 
-    function applyOptimisticDamaged(rows: Row[], ids: string[]) {
+    function applyOptimisticDamaged(ids: string[]) {
       for (const id of ids) {
-        const row = rows.find((r) => r.pick_task_id === id);
+        const row = findRow(id);
         if (row) row.status = 'damaged';
       }
     }
 
-    async function submitPick(entry: BatchEntry, pickTaskIds: string[], quantity: number, reason?: string) {
-      const snapshot = entry.rows.map((r) => ({ ...r }));
-      applyOptimisticPick(entry.rows, pickTaskIds, quantity);
+    async function submitPick(pickTaskIds: string[], quantity: number, reason?: string) {
+      const snapshot = snapshotAll();
+      applyOptimisticPick(pickTaskIds, quantity);
       lastError = '';
       render();
       try {
-        const res = await api('/api/picker/mark-picked', { batchId: entry.batchId, pickTaskIds, quantity, reason });
-        entry.rows = res.rows;
+        const res = await api('/api/picker/mark-picked', { pickTaskIds, quantity, reason });
+        applyBatchUpdates(res.batches ?? []);
         render();
       } catch (err) {
-        entry.rows = snapshot;
+        restoreSnapshot(snapshot);
         lastError = (err as Error).message;
         render();
       }
     }
 
-    async function submitDamaged(entry: BatchEntry, pickTaskIds: string[], notes: string) {
-      const snapshot = entry.rows.map((r) => ({ ...r }));
-      applyOptimisticDamaged(entry.rows, pickTaskIds);
+    async function submitDamaged(pickTaskIds: string[], notes: string) {
+      const snapshot = snapshotAll();
+      applyOptimisticDamaged(pickTaskIds);
       lastError = '';
       render();
       try {
-        entry.rows = await api('/api/picker/report-damaged', { batchId: entry.batchId, pickTaskIds, notes });
+        const res = await api('/api/picker/report-damaged', { pickTaskIds, notes });
+        applyBatchUpdates(res.batches ?? []);
         render();
       } catch (err) {
-        entry.rows = snapshot;
+        restoreSnapshot(snapshot);
         lastError = (err as Error).message;
         render();
       }

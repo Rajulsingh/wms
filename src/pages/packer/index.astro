@@ -43,12 +43,6 @@ import TopBar from '../../components/TopBar.astro';
       orders: PackBatchOrder[];
       allPacked: boolean;
     }
-    interface SkuGroup {
-      sku_code: string;
-      sku_name: string;
-      image_url: string | null;
-      rows: PackBatchItem[];
-    }
 
     // Each batch is its own self-contained unit that moves through
     // pack -> label -> done in place, on the same continuous page — matches
@@ -280,120 +274,114 @@ import TopBar from '../../components/TopBar.astro';
     // one "Mark done" tap. No barcode scan here — the warehouse's internal
     // SKU doesn't match Amazon's SellerSKU and products aren't individually
     // barcoded, same reason picking dropped scanning.
+    //
+    // Grouped by order, not SKU — the opposite axis from picking. Picking is
+    // "bring N of this SKU, whichever orders it's for" (a floor task); by
+    // the time it reaches the pack station, the units for one order are
+    // already together and the job is "box up this order" — so the packer
+    // needs to see one order's full line list (every SKU it needs, with its
+    // quantity) to know at a glance whether it's a multi-quantity order,
+    // not a SKU pooled across orders they aren't boxing together anyway.
     function renderPackingCard(entry: BatchEntry): HTMLElement {
       const pack = entry.pack;
-      const skuGroups: SkuGroup[] = [];
-      for (const r of pack.items) {
-        let sg = skuGroups.find((sg) => sg.sku_code === r.sku_code);
-        if (!sg) {
-          sg = { sku_code: r.sku_code, sku_name: r.sku_name, image_url: r.image_url, rows: [] };
-          skuGroups.push(sg);
-        }
-        sg.rows.push(r);
-      }
-      // Matches the picked-and-arranged-on-the-table order (see HANDOFF.md
-      // — boxes are physically laid out SKU-sorted, labels applied in that
-      // same order), even though the server already returns items sorted
-      // this way — defensive, cheap, and keeps the two in lockstep.
-      skuGroups.sort((a, b) => a.sku_code.localeCompare(b.sku_code));
-
-      const remainingCount = pack.items.filter((r) => r.quantity_packed < r.quantity_required).length;
-      // An order can legitimately have nothing here at all — every one of
-      // its items came back short/damaged during picking, so there's
-      // nothing physically left to pack for it (it still needs a label).
-      const nothingToPack = skuGroups.length === 0;
+      const orders = pack.orders.slice().sort((a, b) => a.externalOrderId.localeCompare(b.externalOrderId));
+      const remainingCount = orders.filter((o) => !o.allPacked).length;
 
       const card = document.createElement('div');
       card.className = 'stack';
       card.style.gap = '10px';
       card.innerHTML = `
         <div class="row" style="gap: 16px; flex-wrap: wrap;">
-          <span class="pill">${skuGroups.length} SKU lines</span>
+          <span class="pill">${orders.length} order${orders.length > 1 ? 's' : ''}</span>
           <span class="pill">${remainingCount} left</span>
         </div>
-        ${nothingToPack ? '<p>Nothing to pack — every item on these orders came back short or damaged while picking. Apply their labels below.</p>' : ''}
-        <div class="stack" id="groups-${pack.pickBatchId}"></div>
+        <div class="stack" id="orders-${pack.pickBatchId}" style="gap: 14px;"></div>
         ${pack.allPacked ? `<button class="btn btn-primary" data-action="finish-pack">Finish packing — apply labels</button>` : ''}`;
 
-      const groupsEl = card.querySelector(`#groups-${pack.pickBatchId}`)!;
-      for (const sg of skuGroups) groupsEl.appendChild(renderSkuGroup(entry, sg));
+      const ordersEl = card.querySelector(`#orders-${pack.pickBatchId}`)!;
+      for (const order of orders) {
+        const items = pack.items.filter((i) => i.order_id === order.orderId);
+        ordersEl.appendChild(renderOrderCard(entry, order, items));
+      }
       card.querySelector('[data-action="finish-pack"]')?.addEventListener('click', () => finishPacking(entry));
       return card;
     }
 
-    function renderSkuGroup(entry: BatchEntry, sg: SkuGroup): HTMLElement {
-      const required = sg.rows.reduce((sum, r) => sum + r.quantity_required, 0);
-      const packed = sg.rows.reduce((sum, r) => sum + r.quantity_packed, 0);
-      const done = packed >= required;
-      const remainingNeeded = required - packed;
-      const orderCount = new Set(sg.rows.map((r) => r.external_order_id)).size;
-      const orderBreakdown = sg.rows
-        .map((r) => {
-          const base = `${escapeHtml(r.external_order_id)} ×${r.quantity_required}`;
-          return r.order_notes ? `${base} <strong style="color: var(--warning-fg);">— ${escapeHtml(r.order_notes)}</strong>` : base;
-        })
-        .join(' · ');
+    function renderOrderCard(entry: BatchEntry, order: PackBatchOrder, items: PackBatchItem[]): HTMLElement {
+      const totalRequired = items.reduce((sum, i) => sum + i.quantity_required, 0);
+      const totalPacked = items.reduce((sum, i) => sum + i.quantity_packed, 0);
+      // An order can legitimately have zero lines here — every one of its
+      // items came back short/damaged during picking, so there's nothing
+      // physically left to pack for it (it still needs a label).
+      const nothingToPack = items.length === 0;
 
       const el = document.createElement('div');
       el.className = 'card';
       el.innerHTML = `
-        <div class="row" style="align-items: center; gap: 12px;">
-          ${sg.image_url ? `<img class="thumb" src="${sg.image_url}" alt="" />` : '<div class="thumb"></div>'}
-          <div class="stack" style="gap: 2px; flex: 1; min-width: 0;">
-            <span style="font-weight: 600;">${sg.sku_name}</span>
-            <span style="font-size: 0.8rem; color: var(--muted);">${sg.sku_code} · ${orderCount} order${orderCount > 1 ? 's' : ''}</span>
-          </div>
+        <div class="row" style="justify-content: space-between; align-items: center; gap: 10px;">
+          <span style="font-weight: 700; font-variant-numeric: tabular-nums;">${escapeHtml(order.externalOrderId)}</span>
+          ${order.allPacked ? '<span class="status-pill status-success">Packed</span>' : `<span class="status-pill status-neutral">${totalPacked}/${totalRequired}</span>`}
         </div>
-        <div class="row" style="gap: 24px; margin-top: 10px;">
-          <div class="stack" style="gap: 0;">
-            <span style="font-size: 0.62rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted);">Required</span>
-            <span class="qty" style="font-size: 1.15rem;">${required}</span>
-          </div>
-          <div class="stack" style="gap: 0;">
-            <span style="font-size: 0.62rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted);">Packed</span>
-            <span class="qty" style="font-size: 1.15rem;">${packed}</span>
-          </div>
-        </div>
-        <div style="font-size: 0.72rem; color: var(--muted); margin-top: 6px;">${orderBreakdown}</div>
-        ${
-          done
-            ? `<div class="banner banner-success" style="margin-top: 10px; padding: 8px 12px;">Packed</div>`
-            : `<div class="row" style="margin-top: 10px; gap: 8px; align-items: center;">
-                 <input type="number" class="qty-input" min="0" max="${remainingNeeded}" value="${remainingNeeded}" style="width: 90px; flex: 0 0 auto; min-height: 52px; text-align: center;" />
-                 <button class="btn btn-primary" data-action="pack" style="flex: 1;">Mark done</button>
-               </div>`
-        }`;
+        ${order.notes ? `<div class="banner banner-warning" style="margin-top: 6px; padding: 8px 12px;">${escapeHtml(order.notes)}</div>` : ''}
+        ${nothingToPack ? '<p style="font-size: 0.8rem; margin: 8px 0 0;">Nothing to pack — every item on this order came back short or damaged while picking. It still needs a label.</p>' : ''}
+        <div class="stack" id="lines-${order.packSessionId}" style="gap: 10px; margin-top: 10px;"></div>
+        ${!order.allPacked && !nothingToPack ? `<button class="btn btn-primary" data-action="pack-order" style="margin-top: 10px;">Mark order packed</button>` : ''}`;
 
-      const orderItemIds = sg.rows.map((r) => r.order_item_id);
-      el.querySelector('[data-action="pack"]')?.addEventListener('click', async () => {
-        const input = el.querySelector('.qty-input') as HTMLInputElement;
-        const qty = Number(input.value);
-        await handleMarkPacked(entry, orderItemIds, qty);
+      const linesEl = el.querySelector(`#lines-${order.packSessionId}`)!;
+      for (const item of items) linesEl.appendChild(renderOrderLine(item, order.allPacked));
+
+      el.querySelector('[data-action="pack-order"]')?.addEventListener('click', async () => {
+        const lines = items.map((item) => {
+          const input = el.querySelector(`.qty-input[data-item="${item.order_item_id}"]`) as HTMLInputElement;
+          return { orderItemId: item.order_item_id, quantity: Number(input.value) };
+        });
+        await handleMarkPacked(entry, order.orderId, lines);
       });
+      return el;
+    }
+
+    // A multi-quantity line is visible right on the row (e.g. "×3") instead
+    // of being buried in an aggregate SKU total — that's the whole point of
+    // grouping by order. The quantity stays editable (defaulting to the full
+    // required amount) so a packer can still lower it if something turns up
+    // missing/broken at the table, same flexibility picking's short-pick
+    // flow has, just scoped to one line instead of a cross-order pool.
+    function renderOrderLine(item: PackBatchItem, orderDone: boolean): HTMLElement {
+      const el = document.createElement('div');
+      el.className = 'row';
+      el.style.alignItems = 'center';
+      el.style.gap = '12px';
+      el.innerHTML = `
+        ${item.image_url ? `<img class="thumb" src="${item.image_url}" alt="" />` : '<div class="thumb"></div>'}
+        <div class="stack" style="gap: 2px; flex: 1; min-width: 0;">
+          <span style="font-weight: 600;">${item.sku_name} <span style="color: var(--muted); font-weight: 400;">×${item.quantity_required}</span></span>
+          <span style="font-size: 0.8rem; color: var(--muted);">${item.sku_code}</span>
+        </div>
+        ${
+          orderDone
+            ? `<span class="status-pill status-success">${item.quantity_packed}</span>`
+            : `<input type="number" class="qty-input" data-item="${item.order_item_id}" min="0" max="${item.quantity_required}" value="${item.quantity_required}" style="width: 70px; flex: 0 0 auto; min-height: 44px; text-align: center;" />`
+        }`;
       return el;
     }
 
     // Mutates entry.pack.items and re-renders before the network call
     // resolves — the tap feels instant instead of waiting on a round trip.
     // Rolled back if the server disagrees.
-    function applyOptimisticPack(items: PackBatchItem[], orderItemIds: string[], totalQuantity: number) {
-      let remaining = totalQuantity;
-      for (const id of orderItemIds) {
-        const item = items.find((i) => i.order_item_id === id);
-        if (!item) continue;
-        const alloc = Math.min(remaining, item.quantity_required);
-        remaining -= alloc;
-        item.quantity_packed = alloc;
+    function applyOptimisticPackOrder(items: PackBatchItem[], lines: Array<{ orderItemId: string; quantity: number }>) {
+      for (const line of lines) {
+        const item = items.find((i) => i.order_item_id === line.orderItemId);
+        if (item) item.quantity_packed = line.quantity;
       }
     }
 
-    async function handleMarkPacked(entry: BatchEntry, orderItemIds: string[], quantity: number) {
+    async function handleMarkPacked(entry: BatchEntry, orderId: string, lines: Array<{ orderItemId: string; quantity: number }>) {
       const snapshot = entry.pack.items.map((i) => ({ ...i }));
-      applyOptimisticPack(entry.pack.items, orderItemIds, quantity);
+      applyOptimisticPackOrder(entry.pack.items, lines);
       lastError = '';
       render();
       try {
-        entry.pack = await api('/api/packer/mark-item', { pickBatchId: entry.pack.pickBatchId, orderItemIds, quantity });
+        entry.pack = await api('/api/packer/mark-item', { pickBatchId: entry.pack.pickBatchId, orderId, lines });
         render();
       } catch (err) {
         entry.pack.items = snapshot;
