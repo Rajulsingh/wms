@@ -1,5 +1,10 @@
 ---
 import AdminShell from '../../components/AdminShell.astro';
+import { getDb } from '../../lib/db';
+import { requireAdminPage } from '../../lib/auth';
+
+const redirectTo = await requireAdminPage(Astro, getDb());
+if (redirectTo) return Astro.redirect(redirectTo);
 ---
 
 <AdminShell title="Settings" current="settings">

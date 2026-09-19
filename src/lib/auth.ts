@@ -96,3 +96,24 @@ export class AuthError extends Error {
     super(message);
   }
 }
+
+/**
+ * Server-side admin gate for every `src/pages/admin/*.astro` page. Returns a
+ * redirect path if the request shouldn't see the page at all, or `null` if
+ * it's an admin session and rendering can proceed. Every admin page must
+ * call this and `return Astro.redirect(path)` itself if it gets one back —
+ * the actual redirect has to happen in the page's own frontmatter, not in a
+ * shared/nested component (AdminShell.astro tried that; Astro.redirect()
+ * from a nested component doesn't actually redirect, confirmed live).
+ * Without this, the admin sidebar/nav (Users, Settings, etc.) was rendered
+ * server-side for *any* logged-in session — API routes already 403 a
+ * non-admin, but the page shell itself wasn't gated, so a packer navigating
+ * straight to an /admin/* URL would see the full admin nav before client-side
+ * JS could react and wipe it.
+ */
+export async function requireAdminPage(context: APIContext, db: D1Database): Promise<string | null> {
+  const user = await getCurrentUser(context, db);
+  if (!user) return '/login';
+  if (user.role !== 'admin') return '/picker';
+  return null;
+}

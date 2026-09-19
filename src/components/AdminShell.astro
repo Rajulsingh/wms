@@ -7,6 +7,13 @@ interface Props {
   current: string;
 }
 const { title, current } = Astro.props;
+
+// The server-side admin gate (redirecting a non-admin session away before
+// any of this renders) lives in each page's own frontmatter, not here —
+// Astro.redirect() only actually redirects when returned from a top-level
+// page component; called from a nested component like this one it silently
+// produces an empty response instead (confirmed, not assumed). See
+// requireAdminPage() in lib/auth.ts and every src/pages/admin/*.astro file.
 ---
 
 <Base title={title}>
