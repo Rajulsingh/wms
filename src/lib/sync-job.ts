@@ -1,5 +1,5 @@
 import { fetchUnfulfilledOrders } from './amazon';
-import { importAmazonOrders } from './orders';
+import { importAmazonOrders, retryBlockedOrders } from './orders';
 import { syncOrderStatuses } from './amazon-sync';
 
 export interface SyncJobResult {
@@ -10,6 +10,8 @@ export interface SyncJobResult {
   statusChecked: number;
   statusShipped: number;
   statusCancelled: number;
+  retried: number;
+  retrySucceeded: number;
 }
 
 /**
@@ -18,13 +20,26 @@ export interface SyncJobResult {
  * from Amazon". Per warehouse: pulls new orders, then checks Amazon's
  * current status for every local Amazon order that isn't yet resolved (see
  * amazon-sync.ts for why that's a separate targeted call, not part of the
- * same pull). Deliberately does NOT batch what it imports — batching
- * happens at claim time instead (see claimNextBatch in picker.ts), so
- * whatever a picker gets when they next ask for work is everything that's
- * piled up since the last claim, not whatever happened to land in this one
- * 5-minute window. One warehouse's failure doesn't stop the rest — this
- * runs unattended, so a transient SP-API error for one warehouse shouldn't
- * silently starve every other warehouse's sync too.
+ * same pull), then retries reservation for anything still sitting blocked.
+ *
+ * That retry step matters more than it looks: `reserveOrderForPicking` at
+ * import time is a one-shot attempt — if it fails, the order sits at
+ * 'pending' until *something* retries it, and previously the only ways that
+ * happened were an admin clicking "Retry blocked orders" or a picker's own
+ * page polling (claimAvailableBatch's orphan-recovery in picker.ts, which
+ * only fires while that page is actually open). A real incident showed the
+ * gap this leaves: orders sat "blocked — short on stock" for a long stretch
+ * even once real stock was available, because nobody had a picker page open
+ * and nobody had clicked retry — not a stock problem, a nobody-retried-it
+ * problem. Retrying here means it self-heals within one cron tick regardless
+ * of whether any human or picker session happens to be active.
+ *
+ * Deliberately does NOT batch what it imports as a separate step — batching
+ * happens via reserveOrderForPicking inside importAmazonOrders itself, and
+ * this retry step covers anything that didn't succeed there. One warehouse's
+ * failure doesn't stop the rest — this runs unattended, so a transient
+ * SP-API error for one warehouse shouldn't silently starve every other
+ * warehouse's sync too.
  */
 export async function runAmazonSyncJob(db: D1Database): Promise<SyncJobResult[]> {
   const warehouses = await db.prepare(`SELECT id FROM warehouses`).all<{ id: string }>();
@@ -36,6 +51,7 @@ export async function runAmazonSyncJob(db: D1Database): Promise<SyncJobResult[]>
       const amazonOrders = await fetchUnfulfilledOrders(since);
       const importSummary = await importAmazonOrders(db, wh.id, amazonOrders);
       const statusResult = await syncOrderStatuses(db, wh.id);
+      const retryResult = await retryBlockedOrders(db, wh.id);
 
       results.push({
         warehouseId: wh.id,
@@ -44,7 +60,9 @@ export async function runAmazonSyncJob(db: D1Database): Promise<SyncJobResult[]>
         newSkusCreated: importSummary.newSkusCreated.length,
         statusChecked: statusResult.checked,
         statusShipped: statusResult.shipped,
-        statusCancelled: statusResult.cancelled
+        statusCancelled: statusResult.cancelled,
+        retried: retryResult.retried,
+        retrySucceeded: retryResult.succeeded
       });
     } catch (err) {
       console.error(`Amazon sync job failed for warehouse ${wh.id}:`, err);

@@ -148,8 +148,12 @@ import TopBar from '../../components/TopBar.astro';
         <div class="stack" style="gap: 10px; margin-top: 8px;">
           <span class="eyebrow">Upcoming — pulled, not yet assigned</span>
           ${
+            // Not always a real stock shortage — this order just hasn't been
+            // retried yet. The sync job now retries automatically every
+            // ~5 minutes (sync-job.ts), so this should self-clear on its own
+            // shortly; it only needs stock if it's still here after a while.
             unbatched && unbatched.orderCount > 0
-              ? `<div class="banner banner-danger">${unbatched.orderCount} order${unbatched.orderCount > 1 ? 's' : ''} blocked — short on stock (${unbatched.unitCount} unit${unbatched.unitCount > 1 ? 's' : ''} needed). <a href="/admin/inbound">Receive stock</a> or ask admin to retry.</div>`
+              ? `<div class="banner banner-danger">${unbatched.orderCount} order${unbatched.orderCount > 1 ? 's' : ''} waiting to be assigned (${unbatched.unitCount} unit${unbatched.unitCount > 1 ? 's' : ''} needed) — rechecks automatically every few minutes. Still here a while? <a href="/admin/inbound">Receive stock</a> if it's genuinely short.</div>`
               : ''
           }
           ${

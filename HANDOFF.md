@@ -1079,6 +1079,33 @@ lookback picks it up on the first run of the day regardless of exactly when that
 The precise 3-expression version is in git history if the account ever moves to Workers Paid (1,000
 cron trigger limit) and the extra precision becomes worth spending on.
 
+## Recently done (2026-09-20, a twenty-fourth pass) — blocked-order retry made automatic, not manual
+
+User report: "36 orders blocked — short on stock" sitting on the packer dashboard, asking why
+batching "takes so long" and wanting it "quick and auto" so a packer opening the app just sees
+work waiting. Checked production directly rather than assuming: **stock was never actually the
+problem** — every blocked SKU had far more available than needed (e.g. one needed 8, had 1224
+available). The real issue: `reserveOrderForPicking` is a one-shot attempt at import time: if it
+fails, the order sits at `'pending'` until *something* retries it, and until now the only things
+that ever did were an admin manually clicking "Retry blocked orders" or a picker's own page
+polling (`claimAvailableBatch`'s orphan-recovery in `picker.ts` — real, but only fires while that
+specific page happens to be open). The packer *dashboard*'s "blocked" banner (`getUnbatchedOrderSummary`)
+is a pure count/display query — it never retries anything itself, so it could sit there indefinitely
+even once stock was genuinely available, looking exactly like a stuck/slow system when really nobody
+had retried it yet. Watched this resolve live and unprompted mid-investigation (a real picker's page
+polling triggered the existing orphan-recovery) — direct proof the retry mechanism itself works fine
+the moment something actually calls it.
+
+**Fixed by making retry automatic**: `runAmazonSyncJob` (`sync-job.ts`) now calls
+`retryBlockedOrders` for each warehouse after every import/status-sync — so blocked orders self-heal
+within one cron tick (~5 min, business-hours-only per the twenty-third pass) regardless of whether
+any admin or picker session happens to be active. `SyncJobResult` gained `retried`/`retrySucceeded`
+fields for observability. Also softened the packer dashboard's banner wording (`packer/home.astro`)
+— no longer asserts "short on stock" or "ask admin to retry" (both were often simply wrong, and the
+latter is now often unnecessary), instead explains it rechecks automatically and only points at
+receiving stock if it's *still* there after a while. Confirmed live: the 36 orders this report was
+about all reached `'packing'` shortly after.
+
 ## Next steps — a prioritized plan
 
 Rewritten 2026-09-20 (twenty-one passes across two days — see "Recently done" entries above for the
