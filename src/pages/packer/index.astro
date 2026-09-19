@@ -44,16 +44,23 @@ import TopBar from '../../components/TopBar.astro';
       allPacked: boolean;
     }
 
-    // Each batch is its own self-contained unit that moves through
-    // pack -> label -> done in place, on the same continuous page — matches
-    // the real floor workflow (pack this batch's boxes, label this batch's
-    // boxes, then move to the next) more closely than a single shared
-    // label queue across every batch would. See HANDOFF.md.
-    type BatchPhase = 'packing' | 'labeling' | 'done';
+    // Each entry is one order's own packing ticket (batching no longer
+    // bundles several orders together — see HANDOFF.md). Labeling is NOT
+    // per-entry any more: a packer marks orders packed one at a time as
+    // they go, then a single page-level "Finish packing" action (see
+    // finishAllReady below) completes every ready order at once and hands
+    // off to one shared AWB-scanning queue — matches the real floor
+    // workflow described by the user: pack several, then label the batch
+    // of finished ones together, not one scan screen per order. See
+    // HANDOFF.md.
     interface BatchEntry {
       pack: PackBatchState;
-      phase: BatchPhase;
-      labelQueue: PackBatchOrder[];
+    }
+    type SortMode = 'sku' | 'order';
+    interface OrderRow {
+      entry: BatchEntry;
+      order: PackBatchOrder;
+      items: PackBatchItem[];
     }
 
     const app = document.getElementById('app')!;
@@ -61,6 +68,8 @@ import TopBar from '../../components/TopBar.astro';
     let warehouseId = '';
     let currentStationToken = '';
     let batchList: BatchEntry[] = [];
+    let labelQueue: PackBatchOrder[] = [];
+    let sortMode: SortMode = 'sku';
     let lastError = '';
     let pollTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -156,7 +165,7 @@ import TopBar from '../../components/TopBar.astro';
     }
 
     function toEntry(pack: PackBatchState): BatchEntry {
-      return { pack, phase: 'packing', labelQueue: [] };
+      return { pack };
     }
 
     async function startSession(stationQrToken: string, btn?: HTMLButtonElement) {
@@ -196,7 +205,47 @@ import TopBar from '../../components/TopBar.astro';
       }
     }
 
+    // Every order across every currently-open entry, flattened into one
+    // list — same principle as picking's flat SKU list, just the other
+    // axis. Grouped by order, not SKU: picking is "bring N of this SKU,
+    // whichever orders it's for" (a floor task); by the pack station the
+    // units for one order are already together and the job is "box up this
+    // order", so the packer needs one order's full line list (every SKU it
+    // needs, with its quantity) to know at a glance whether it's a
+    // multi-quantity order.
+    function flattenOrders(): OrderRow[] {
+      return batchList.flatMap((entry) =>
+        entry.pack.orders.map((order) => ({ entry, order, items: entry.pack.items.filter((i) => i.order_id === order.orderId) }))
+      );
+    }
+
+    // "Nothing to pack" orders (every item came back short/damaged during
+    // picking) sort last in SKU mode — there's no SKU to sort them by.
+    function primarySkuCode(items: PackBatchItem[]): string {
+      if (!items.length) return '￿';
+      return items.reduce((min, i) => (i.sku_code < min ? i.sku_code : min), items[0].sku_code);
+    }
+
+    function sortRows(rows: OrderRow[]): OrderRow[] {
+      const sorted = rows.slice();
+      if (sortMode === 'sku') {
+        sorted.sort((a, b) => primarySkuCode(a.items).localeCompare(primarySkuCode(b.items)) || a.order.externalOrderId.localeCompare(b.order.externalOrderId));
+      } else {
+        sorted.sort((a, b) => a.order.externalOrderId.localeCompare(b.order.externalOrderId));
+      }
+      return sorted;
+    }
+
+    function getReadyEntries(): BatchEntry[] {
+      return batchList.filter((e) => e.pack.allPacked);
+    }
+
     function render() {
+      if (labelQueue.length) {
+        renderLabelScreen();
+        return;
+      }
+
       if (!batchList.length) {
         app.innerHTML = `
           <div class="stack" style="flex:1; justify-content:center; text-align:center;">
@@ -212,96 +261,60 @@ import TopBar from '../../components/TopBar.astro';
         return;
       }
 
-      const totalOrders = new Set(batchList.flatMap((e) => e.pack.orders.map((o) => o.orderId))).size;
-      const totalSkuLines = new Set(batchList.flatMap((e) => e.pack.items.map((i) => `${e.pack.pickBatchId}__${i.sku_code}`))).size;
-      const remaining = batchList.filter((e) => e.phase !== 'done').length;
+      const rows = sortRows(flattenOrders());
+      const totalSkuLines = new Set(rows.flatMap((r) => r.items.map((i) => i.sku_code))).size;
+      const readyEntries = getReadyEntries();
+      const readyOrderCount = readyEntries.reduce((sum, e) => sum + e.pack.orders.length, 0);
 
       app.innerHTML = `
         ${errorBanner()}
-        <div class="stack" id="summary" style="flex-direction: row; gap: 16px; flex-wrap: wrap;">
-          <span class="pill">${totalOrders} orders</span>
-          <span class="pill">${totalSkuLines} SKU lines</span>
+        <div class="row" style="justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+          <div class="row" id="summary" style="width: auto; gap: 16px; flex-wrap: wrap;">
+            <span class="pill">${rows.length} orders</span>
+            <span class="pill">${totalSkuLines} SKU lines</span>
+          </div>
+          <select id="sort-select" style="width: auto;">
+            <option value="sku">Sort by SKU</option>
+            <option value="order">Sort by order ID</option>
+          </select>
         </div>
-        <div class="stack" id="batch-container" style="gap: 22px;"></div>`;
+        ${readyOrderCount > 0 ? `<button class="btn btn-primary" id="finish-all">Finish packing — apply labels (${readyOrderCount})</button>` : ''}
+        <div class="stack" id="order-container" style="gap: 14px; margin-top: 6px;"></div>`;
 
-      const container = document.getElementById('batch-container')!;
-      for (const entry of batchList) container.appendChild(renderEntry(entry));
+      const select = document.getElementById('sort-select') as unknown as HTMLSelectElement;
+      select.value = sortMode;
+      select.addEventListener('change', () => {
+        sortMode = select.value as SortMode;
+        render();
+      });
+      document.getElementById('finish-all')?.addEventListener('click', finishAllReady);
 
-      if (remaining === 0) {
-        const banner = document.createElement('div');
-        banner.className = 'banner banner-success';
-        banner.textContent = 'All caught up — new orders will appear here automatically.';
-        container.appendChild(banner);
-      }
+      const container = document.getElementById('order-container')!;
+      for (const row of rows) container.appendChild(renderOrderCard(row));
     }
 
-    // Each entry is one order's own ticket (batching no longer bundles
-    // several orders together — see HANDOFF.md), so there's no batch-level
-    // wrapper any more, just this order's own phase-dependent content
-    // directly in the list.
-    function renderEntry(entry: BatchEntry): HTMLElement {
-      if (entry.phase === 'done') {
-        const banner = document.createElement('div');
-        banner.className = 'banner banner-success';
-        banner.textContent = 'All labels applied.';
-        return banner;
-      }
-      if (entry.phase === 'labeling') return renderLabelCard(entry);
-      return renderPackingCard(entry);
-    }
-
-    // Bulk pack by SKU, not by order: every order in the batch needing the
-    // same SKU collapses into one aggregate line, same pattern /picker uses
-    // — pick the number up once (or edit it down if something's missing),
-    // one "Mark done" tap. No barcode scan here — the warehouse's internal
-    // SKU doesn't match Amazon's SellerSKU and products aren't individually
-    // barcoded, same reason picking dropped scanning.
-    //
-    // Grouped by order, not SKU — the opposite axis from picking. Picking is
-    // "bring N of this SKU, whichever orders it's for" (a floor task); by
-    // the time it reaches the pack station, the units for one order are
-    // already together and the job is "box up this order" — so the packer
-    // needs to see one order's full line list (every SKU it needs, with its
-    // quantity) to know at a glance whether it's a multi-quantity order,
-    // not a SKU pooled across orders they aren't boxing together anyway.
-    function renderPackingCard(entry: BatchEntry): HTMLElement {
-      const pack = entry.pack;
-      const orders = pack.orders.slice().sort((a, b) => a.externalOrderId.localeCompare(b.externalOrderId));
-      const remainingCount = orders.filter((o) => !o.allPacked).length;
-
-      const card = document.createElement('div');
-      card.className = 'stack';
-      card.style.gap = '10px';
-      card.innerHTML = `
-        <div class="row" style="gap: 16px; flex-wrap: wrap;">
-          <span class="pill">${orders.length} order${orders.length > 1 ? 's' : ''}</span>
-          <span class="pill">${remainingCount} left</span>
-        </div>
-        <div class="stack" id="orders-${pack.pickBatchId}" style="gap: 14px;"></div>
-        ${pack.allPacked ? `<button class="btn btn-primary" data-action="finish-pack">Finish packing — apply labels</button>` : ''}`;
-
-      const ordersEl = card.querySelector(`#orders-${pack.pickBatchId}`)!;
-      for (const order of orders) {
-        const items = pack.items.filter((i) => i.order_id === order.orderId);
-        ordersEl.appendChild(renderOrderCard(entry, order, items));
-      }
-      card.querySelector('[data-action="finish-pack"]')?.addEventListener('click', () => finishPacking(entry));
-      return card;
-    }
-
-    function renderOrderCard(entry: BatchEntry, order: PackBatchOrder, items: PackBatchItem[]): HTMLElement {
+    function renderOrderCard(row: OrderRow): HTMLElement {
+      const { entry, order, items } = row;
       const totalRequired = items.reduce((sum, i) => sum + i.quantity_required, 0);
       const totalPacked = items.reduce((sum, i) => sum + i.quantity_packed, 0);
       // An order can legitimately have zero lines here — every one of its
       // items came back short/damaged during picking, so there's nothing
       // physically left to pack for it (it still needs a label).
       const nothingToPack = items.length === 0;
+      // Flagged so a packer double-checks before boxing it up as if it were
+      // a routine single-item order — easy to under-pack by habit otherwise.
+      const isMultiItem = items.length > 1;
+      const isMultiQty = items.some((i) => i.quantity_required > 1);
 
       const el = document.createElement('div');
       el.className = 'card';
       el.innerHTML = `
-        <div class="row" style="justify-content: space-between; align-items: center; gap: 10px;">
-          <span style="font-weight: 700; font-variant-numeric: tabular-nums;">${escapeHtml(order.externalOrderId)}</span>
+        <div class="row" style="justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap;">
+          <div class="row" style="width: auto; gap: 6px; align-items: center;">
+            <span style="font-weight: 700; font-variant-numeric: tabular-nums;">${escapeHtml(order.externalOrderId)}</span>
+            ${isMultiItem ? '<span class="status-pill status-warning">Multi-item</span>' : ''}
+            ${isMultiQty ? '<span class="status-pill status-warning">Multi-qty</span>' : ''}
+          </div>
           ${order.allPacked ? '<span class="status-pill status-success">Packed</span>' : `<span class="status-pill status-neutral">${totalPacked}/${totalRequired}</span>`}
         </div>
         ${order.notes ? `<div class="banner banner-warning" style="margin-top: 6px; padding: 8px 12px;">${escapeHtml(order.notes)}</div>` : ''}
@@ -372,69 +385,73 @@ import TopBar from '../../components/TopBar.astro';
       }
     }
 
-    async function finishPacking(entry: BatchEntry) {
-      // Optimistic: entry.pack.orders is exactly what completePackingBatch
-      // will hand back on success (it processes that set — the only way
-      // this call fails is a real error, never a partial result), so move
-      // straight to the label phase instead of waiting on the round trip.
-      const previousPhase = entry.phase;
-      entry.phase = 'labeling';
-      entry.labelQueue = entry.pack.orders.slice();
+    // The single, page-level "Finish packing" action: completes every
+    // order that's currently packed-and-ready (across every entry, not just
+    // one), removes those entries from the working list, and hands off to
+    // one shared label-scanning queue — so a packer packs several orders
+    // one at a time, then labels the finished batch of them together in one
+    // continuous scan-and-go screen, instead of a separate scan screen
+    // popping up after every single order. See HANDOFF.md.
+    async function finishAllReady() {
+      const readyEntries = getReadyEntries();
+      if (!readyEntries.length) return;
+
       lastError = '';
-      render();
-      try {
-        const { results } = await api('/api/packer/complete', { pickBatchId: entry.pack.pickBatchId });
-        entry.labelQueue = (results as Array<{ orderId: string; packSessionId: string; outcome: string }>).map(
-          (r) => entry.pack.orders.find((o) => o.orderId === r.orderId)!
-        );
-        if (entry.labelQueue.length === 0) entry.phase = 'done';
-        render();
-      } catch (err) {
-        entry.phase = previousPhase;
-        entry.labelQueue = [];
-        lastError = (err as Error).message;
-        render();
+      const queue: PackBatchOrder[] = [];
+      const completed: BatchEntry[] = [];
+      for (const entry of readyEntries) {
+        try {
+          const { results } = await api('/api/packer/complete', { pickBatchId: entry.pack.pickBatchId });
+          for (const r of results as Array<{ orderId: string }>) {
+            const order = entry.pack.orders.find((o) => o.orderId === r.orderId);
+            if (order) queue.push(order);
+          }
+          completed.push(entry);
+        } catch (err) {
+          lastError = (err as Error).message;
+        }
       }
+      batchList = batchList.filter((e) => !completed.includes(e));
+      labelQueue.push(...queue);
+      render();
     }
 
-    function renderLabelCard(entry: BatchEntry): HTMLElement {
-      const order = entry.labelQueue[0];
-      const card = document.createElement('div');
-      card.className = 'card stack';
-      card.style.textAlign = 'center';
-      card.innerHTML = `
-        <span class="eyebrow">Apply label · ${entry.labelQueue.length} left</span>
-        <div class="big-label">${escapeHtml(order.externalOrderId)}</div>
-        ${order.notes ? `<div class="banner banner-warning">${escapeHtml(order.notes)}</div>` : ''}
-        <p>Scan AWB</p>
-        <video class="scanner" id="video-${entry.pack.pickBatchId}" style="display:none;"></video>
-        <button class="btn btn-primary" data-action="scan-awb">Scan AWB barcode</button>
-        <button class="btn btn-ghost" data-action="manual-awb">Enter AWB manually</button>`;
+    function renderLabelScreen() {
+      const order = labelQueue[0];
+      app.innerHTML = `
+        <div class="stack" style="flex:1; justify-content:center; text-align:center;">
+          <span class="eyebrow">Apply label · ${labelQueue.length} left</span>
+          <div class="big-label">${escapeHtml(order.externalOrderId)}</div>
+          ${order.notes ? `<div class="banner banner-warning">${escapeHtml(order.notes)}</div>` : ''}
+          <p>Scan AWB</p>
+          <video class="scanner" id="video" style="display:none;"></video>
+          <button class="btn btn-primary" id="scan-awb">Scan AWB barcode</button>
+          <button class="btn btn-ghost" id="manual-awb">Enter AWB manually</button>
+        </div>`;
 
-      card.querySelector('[data-action="scan-awb"]')?.addEventListener('click', async () => {
-        const video = card.querySelector(`#video-${entry.pack.pickBatchId}`) as HTMLVideoElement;
+      document.getElementById('scan-awb')?.addEventListener('click', async () => {
+        const video = document.getElementById('video') as HTMLVideoElement;
         video.style.display = 'block';
         try {
           const text = await scanOnce(video);
-          await handleAwb(entry, order, text);
+          await handleAwb(order, text);
         } catch {
           showError('Could not open camera — use manual entry.');
           render();
         }
       });
-      card.querySelector('[data-action="manual-awb"]')?.addEventListener('click', () => {
+      document.getElementById('manual-awb')?.addEventListener('click', () => {
         // No "correct" AWB to suggest (it's arbitrary carrier text) — offer a fresh unique one instead of making you invent a string each time.
         renderManualEntry(
           'AWB code',
-          (code) => handleAwb(entry, order, code),
+          (code) => handleAwb(order, code),
           () => render(),
           `TEST-AWB-${Math.random().toString(36).slice(2, 8).toUpperCase()}`
         );
       });
-      return card;
     }
 
-    async function handleAwb(entry: BatchEntry, order: PackBatchOrder, awbCode: string) {
+    async function handleAwb(order: PackBatchOrder, awbCode: string) {
       stopScanning();
       // Immediate feedback the moment a code is scanned/submitted — AWB
       // application is a hard-block safety check (duplicate/mismatch), so
@@ -443,14 +460,13 @@ import TopBar from '../../components/TopBar.astro';
       lastError = '';
       app.innerHTML = `
         <div class="stack" style="flex:1; justify-content:center; text-align:center;">
-          <span class="eyebrow">Apply label · ${entry.labelQueue.length} left</span>
+          <span class="eyebrow">Apply label · ${labelQueue.length} left</span>
           <div class="big-label">${escapeHtml(order.externalOrderId)}</div>
           <p>Checking ${escapeHtml(awbCode)}…</p>
         </div>`;
       try {
         await api('/api/packer/apply-awb', { packSessionId: order.packSessionId, awbCode });
-        entry.labelQueue = entry.labelQueue.filter((o) => o.orderId !== order.orderId);
-        if (entry.labelQueue.length === 0) entry.phase = 'done';
+        labelQueue = labelQueue.filter((o) => o.orderId !== order.orderId);
         render();
       } catch (err) {
         // Hard block — AWB mismatch/duplicate. Deliberately does not fall through to ready-to-ship.

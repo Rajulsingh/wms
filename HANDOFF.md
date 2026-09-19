@@ -562,9 +562,48 @@ cart/cart_slot creation.
   prints one order's sheet at a time. Left as-is; revisit only if it turns out to matter in
   practice.
 
+## Recently done (2026-09-20, a twelfth pass) — packing sort/highlighting, one shared label queue
+
+Two fixes to `/packer` (`packer/index.astro`): a sort control for the now order-first list
+(default by SKU, so orders needing the same product cluster together), highlighting for orders
+that need more than one item or more than one unit of something, and a fix to a fragmentation
+problem the eleventh pass's batching removal introduced — each order finishing packing on its own
+now meant a separate "Finish packing → scan AWB" screen popped up after *every single order*, one
+at a time, instead of once for the whole batch of orders a packer had just finished.
+
+- **Sort control**: a `<select>` next to the summary pills, options "Sort by SKU" (default) and
+  "Sort by order ID". Sorting now happens once, page-level, over every order across every
+  currently-open entry flattened together (`flattenOrders()`) — SKU mode sorts by each order's
+  lowest `sku_code` (so `flattenOrders`'s "nothing to pack" orders, with no SKU at all, sort last),
+  order mode by `external_order_id`, matching what existed before this pass as the *only* option.
+- **Multi-item/multi-qty highlighting**: a `status-warning` pill next to the order id — "Multi-item"
+  when an order has more than one distinct SKU, "Multi-qty" when any line needs more than one unit.
+  Both can show together. Purely visual, no behavior change — just makes an easy-to-under-pack
+  order stand out before the packer boxes it up as if it were routine.
+- **The real fix — one shared label queue instead of one per order**: "Mark order packed" no longer
+  triggers labeling for that order by itself. Instead, a single page-level "Finish packing — apply
+  labels (N)" button appears (N = how many orders across the whole page are currently packed and
+  ready) the moment at least one order is ready — not gated on every order being done, so a packer
+  can pack a few, finish-and-label those, and keep packing more without waiting. Clicking it
+  completes every ready order's pack session in one pass (`completePackingBatch`, once per
+  underlying `pick_batch_id`), removes those entries from the working list, and pushes all their
+  orders into one shared `labelQueue` — the exact same scan-AWB screen as before, just fed from a
+  combined list instead of one order's own singleton queue, so scanning steps through every order
+  in one continuous flow instead of a fresh "Finish packing" click needed before each one.
+  `renderLabelCard`/`handleAwb` dropped their `entry` parameter entirely in the process — AWB
+  application was already keyed only by `packSessionId`, no batch context needed, so the whole
+  per-entry indirection was unnecessary once the queue moved to the page level.
+- **Verified live in dev**: three orders (one multi-item, one multi-qty, one plain) picked and
+  moved to packing — confirmed the SKU-default sort ordering, both highlight badges appearing on
+  exactly the right orders and neither on the plain one, the "Finish packing" count updating
+  correctly as each order was individually marked packed (1 → 3, never appearing before the first
+  was done), one click completing all three and opening one shared "3 left" scan screen, and
+  scanning through all three in sequence down to an empty queue — all three reached
+  `ready_to_ship`.
+
 ## Next steps — a prioritized plan
 
-Rewritten 2026-09-20 (eleven passes across two days — see "Recently done" entries above for the
+Rewritten 2026-09-20 (twelve passes across two days — see "Recently done" entries above for the
 full story behind each). What's actually not done yet, ordered by what's blocking vs. not. See
 "Open items" below for full detail on each.
 
