@@ -310,6 +310,52 @@ export async function completePackSession(db: D1Database, userId: string, packSe
   return outcome;
 }
 
+export interface PendingLabelOrder {
+  orderId: string;
+  externalOrderId: string;
+  packSessionId: string;
+  notes: string | null;
+}
+
+/**
+ * Orders this packer has already marked packed (`pack_sessions` status
+ * `completed`/`partial`) but hasn't scanned an AWB for yet — the mandatory
+ * next step, still outstanding. Needed because completing a pack session
+ * moves the order's status past `'picked'`, out of `getMyPackBatches`'
+ * own query entirely — without this, a packer who navigates away (or the
+ * page reloads) mid-labeling would lose every trace of which orders still
+ * need a label: stuck, with no way back to finish them, since the normal
+ * packing list no longer has anywhere to show them.
+ *
+ * Checked on every tap-in/poll (`start-session.ts`) and always takes
+ * precedence over the normal packing list client-side, so labeling can't
+ * be skipped just by leaving the page and coming back. Scoped to this
+ * packer's own pack_sessions, same ownership model as everything else here.
+ * "Not yet labeled" = no `packages` row references this pack_session yet —
+ * that's exactly what `applyAwb` sets the moment a label is actually
+ * applied, whether matching a pre-purchased label or creating a fresh one.
+ */
+export async function getPendingLabelQueue(db: D1Database, packerId: string): Promise<PendingLabelOrder[]> {
+  const rows = await db
+    .prepare(
+      `SELECT ps.id AS pack_session_id, ps.order_id, o.external_order_id, o.notes
+       FROM pack_sessions ps
+       JOIN orders o ON o.id = ps.order_id
+       WHERE ps.packer_id = ? AND ps.status IN ('completed', 'partial')
+         AND NOT EXISTS (SELECT 1 FROM packages p WHERE p.pack_session_id = ps.id)
+       ORDER BY ps.completed_at ASC`
+    )
+    .bind(packerId)
+    .all<{ pack_session_id: string; order_id: string; external_order_id: string; notes: string | null }>();
+
+  return rows.results.map((r) => ({
+    orderId: r.order_id,
+    externalOrderId: r.external_order_id,
+    packSessionId: r.pack_session_id,
+    notes: r.notes
+  }));
+}
+
 export interface PackerDailyOrder {
   orderId: string;
   externalOrderId: string;

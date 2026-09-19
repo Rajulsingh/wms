@@ -168,6 +168,16 @@ import TopBar from '../../components/TopBar.astro';
       return { pack };
     }
 
+    interface PendingLabelOrder {
+      orderId: string;
+      externalOrderId: string;
+      packSessionId: string;
+      notes: string | null;
+    }
+    function toLabelOrder(o: PendingLabelOrder): PackBatchOrder {
+      return { orderId: o.orderId, externalOrderId: o.externalOrderId, packSessionId: o.packSessionId, notes: o.notes, allPacked: true };
+    }
+
     async function startSession(stationQrToken: string, btn?: HTMLButtonElement) {
       stopScanning();
       currentStationToken = stationQrToken;
@@ -178,6 +188,14 @@ import TopBar from '../../components/TopBar.astro';
         const batches: PackBatchState[] = result?.batches ?? [];
         stopPolling();
         batchList = batches.map(toEntry);
+        // Server truth on a fresh tap-in — always resumes any outstanding
+        // AWB scans left over from before (a reload, a browser-back, a
+        // dropped connection mid-labeling), instead of losing track of them.
+        // Scanning is mandatory: render() shows this queue before anything
+        // else whenever it's non-empty, so there's no way to reach the
+        // normal packing list while one of these is still outstanding. See
+        // getPendingLabelQueue in lib/packer.ts.
+        labelQueue = ((result?.pendingLabels ?? []) as PendingLabelOrder[]).map(toLabelOrder);
         render();
         // Always polling from here on, not just while empty — a station stays
         // tapped in and new batches keep getting picked; freshly ready ones
@@ -198,6 +216,13 @@ import TopBar from '../../components/TopBar.astro';
         const newOnes = incoming.filter((b) => !batchList.some((e) => e.pack.pickBatchId === b.pickBatchId));
         if (newOnes.length) {
           batchList.push(...newOnes.map(toEntry));
+          render();
+        }
+
+        const incomingLabels = ((result?.pendingLabels ?? []) as PendingLabelOrder[]).map(toLabelOrder);
+        const newLabels = incomingLabels.filter((o) => !labelQueue.some((q) => q.orderId === o.orderId));
+        if (newLabels.length) {
+          labelQueue.push(...newLabels);
           render();
         }
       } catch {

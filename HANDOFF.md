@@ -648,9 +648,37 @@ no scheduling/purchasing, per the standing safety rule):
   small delay between calls (or batching) if volume grows enough to hit SP-API's rate limit
   routinely rather than occasionally.
 
+## Recently done (2026-09-20, a fourteenth pass) — a real "orders vanish after Finish packing" bug
+
+The user reported: click "Finish packing", the AWB-scan screen appears, then click browser-back —
+there's no way back to scanning, and it should be mandatory. This was a real, not cosmetic, bug:
+`completePackingBatch` moves an order's status past `'picked'` the instant "Finish packing" is
+clicked — straight out of `getMyPackBatches`' own query. The soon-to-scan order was only ever
+tracked in the browser tab's in-memory `labelQueue`; navigating away (back button, a reload, a
+dropped connection) lost that memory with nothing server-side to recover it from. The order sat
+`'completed'`/`'partial'` forever, invisible to the normal packing list, needing an AWB it could
+never receive through the UI again.
+
+- **`getPendingLabelQueue` (packer.ts)**: finds every pack_session this packer completed that
+  still has no `packages` row referencing it (`applyAwb` is what sets that, whether matching a
+  pre-purchased label or creating a fresh one) — i.e. exactly the "packed but not yet labeled"
+  set. Added to `/api/packer/start-session`'s response (`pendingLabels`) alongside `batches`,
+  so it's included on both the initial tap-in *and* every 8s poll.
+- **`packer/index.astro`** now merges `pendingLabels` into `labelQueue` on both calls (dedup by
+  order id on poll, full replace on a fresh tap-in) — and since `render()` already shows the
+  label screen first whenever `labelQueue` is non-empty (from the twelfth pass), this makes
+  scanning mandatory in the only way a plain web page realistically can: not by blocking the
+  browser's own back button, but by *always* re-surfacing the outstanding scan queue the moment
+  the packer lands back on `/packer`, before the normal packing list can even appear.
+- **Verified live in dev**: packed and completed an order via direct API calls (bypassing the UI,
+  simulating "already clicked Finish packing"), confirmed a fresh `start-session` call returned
+  it in `pendingLabels` with zero batches, then loaded `/packer` fresh in the browser and tapped
+  in — the mandatory scan screen appeared immediately with that exact order, scanned it, and it
+  reached `ready_to_ship` normally.
+
 ## Next steps — a prioritized plan
 
-Rewritten 2026-09-20 (thirteen passes across two days — see "Recently done" entries above for the
+Rewritten 2026-09-20 (fourteen passes across two days — see "Recently done" entries above for the
 full story behind each). What's actually not done yet, ordered by what's blocking vs. not. See
 "Open items" below for full detail on each.
 
