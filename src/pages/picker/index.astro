@@ -224,7 +224,17 @@ import TopBar from '../../components/TopBar.astro';
       const picked = sg.rows.reduce((sum, r) => sum + r.quantity_picked, 0);
       const pendingRows = sg.rows.filter((r) => r.status === 'pending');
       const done = pendingRows.length === 0;
-      const remainingNeeded = required - picked;
+      // NOT required - picked: if an earlier round already resolved one of
+      // this card's order-lines as a short pick (quantity_picked left at 0,
+      // status no longer 'pending'), that line's full quantity_required
+      // still counts toward `required` above but contributes nothing to
+      // `picked` — so required-picked overstates what's still actually
+      // pickable through this button. pendingIds (submitted below) only
+      // ever covers pendingRows, so the input's own ceiling has to match
+      // that same subset or the server's real total-required check (which
+      // sums quantity_required over exactly those pending tasks) rejects a
+      // quantity the picker was correctly shown as "still needed".
+      const remainingNeeded = pendingRows.reduce((sum, r) => sum + r.quantity_required, 0);
       const reasonState = pendingReasonFor[groupKey];
 
       // Which orders need this SKU, collapsed into a count instead of
