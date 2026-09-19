@@ -43,49 +43,382 @@ apply-labels screen). Don't re-litigate or redo any of these without a reason.
 - **Packing is bulk/multi-order per batch** (part 1 of a 3-part ask — parts 2/3 still open, see
   "Open items" #14). See "What's built" → the packing entry.
 
+## Recently done (2026-09-19, later in the same day) — picker/packer UX pass
+
+A second, separate round of work the same day, after the bulk-picking/packing redesign above.
+User-requested: a reason dropdown on short/damaged picks, a clearer required-vs-picked display,
+admin-assignable batches, a packer dashboard, no more "get next batch" click gate, and
+instant-feeling taps. See "What's built" for the actual behavior; this is just the pointer list.
+
+- **Picker "Report issue" is now a reason dropdown**, not a single "Damaged" button — "Damaged —
+  none usable", "Low stock — not enough available", or "Other" (free-text note). Also fires
+  automatically whenever the entered quantity is less than what's needed, not just from the
+  standalone button. See "What's built" → the picking entry, and `confirmQuantity`/
+  `confirmGroupQuantity`'s new `reason` parameter in `picker.ts`.
+- **Required and Picked are now two explicit, always-visible numbers** on each SKU card, not a
+  compact "M/N" fraction — a short pick used to just say "Done" with no indication it was short.
+  See `renderSkuGroup` in `src/pages/picker/index.astro`.
+- **Admin can hand-assign a specific pick batch to a specific packer** (`/admin/pick-list`, a new
+  "Assigned to" control on the batch card) instead of every batch going into the general
+  first-picker-who-asks pool. See `assignBatchToPacker` in `picker.ts`.
+- **New packer dashboard** (`/packer/home`) — what's assigned to you, plus a read-only "pulled but
+  not yet assigned" list so a packer can see work coming without claiming it early. See "What's
+  built" → Packer dashboard.
+- **The picker page is one continuous scroll of every batch you have**, not "claim one, finish it,
+  click for the next." New batches (admin-assigned, or freshly auto-swept once you're caught up)
+  just append at the bottom. See "What's built" → the picking entry, `getMyBatches` in `picker.ts`.
+- **Picking/packing taps update the screen immediately**, not after the round trip — optimistic
+  local update first, reconciled with the server's response a moment later, rolled back on
+  failure. See `submitPick`/`submitDamaged` in `picker/index.astro`, `handleMarkPacked` in
+  `packer/index.astro`.
+- **The logo in the top bar is now a link back to a home page** — `/packer/home` for
+  picker/packer, `/admin` for admin's sidebar logo (which was already admin's own home page).
+- **Real bug found and fixed**: the new Required/Picked stat block on a SKU card overflowed
+  horizontally on a 375px phone (`scrollWidth` 407 vs 375) — the thumb + name + stat block tried
+  to fit in one row. Fixed by moving Required/Picked to their own row below the name instead of
+  cramming everything into one `flex` row. Another instance of "verify with `scrollWidth` at
+  375px, don't eyeball it" (see "Next steps" #7 below — this is the second time that's caught a
+  real bug this project didn't see coming from a desktop screenshot).
+
+## Recently done (2026-09-19, a third pass the same day) — the follow-up punch list
+
+After the picker/packer UX pass above, the user asked for a punch list of what was still
+outstanding, then said "fix them one by kne [one by one]." Four items, all fixed and verified live
+in a local browser session (test orders created, exercised, then cleaned up — nothing left behind
+in the local dev DB), **then deployed to production** (migration `0011` applied `--remote`,
+`npm run build && npx wrangler deploy`) — this is the first of the day's three UX passes that
+actually reached the live site before a follow-up bug report came in; see the next section.
+
+1. **"Instant" extended beyond just picking/packing's Mark-done button.** Two different fixes
+   depending on whether the outcome could be predicted:
+   - Admin's "Import from Amazon", "Create pick batch", and the pick-list "Assign" button, plus
+     packer's station tap-in buttons — none of these can be guessed optimistically (a real network/
+     DB call decides the actual result), so instead they disable themselves and show a loading
+     label ("Importing…", "Creating…", "Assigning…", "Connecting…") the instant they're tapped,
+     rather than sitting inert until the round trip resolves. New helper: `withLoading()` in
+     `src/lib/ui.ts`.
+   - Packer's "Finish packing — apply labels" button *can* be predicted (once it's clickable,
+     `completePackingBatch` always succeeds for exactly `state.orders` — the only failure mode is a
+     real error, never a partial result), so it now jumps straight to the apply-labels queue before
+     the network call resolves, reconciled after.
+   - AWB scan/manual-entry is a hard-block safety check (duplicate/mismatch), so it deliberately
+     stays *not* optimistic — but now shows an immediate "Checking &lt;code&gt;…" screen instead of
+     looking inert while the check runs.
+2. **Real bug fixed: partial short-picked items never reached the packing view.**
+   `getPackBatchState`'s (and `getPackSessionState`'s) items query only matched `order_items.status
+   IN ('picked', 'packed')` — a *partial* short pick (`status = 'short'`, `quantity_picked` between
+   0 and required) was silently excluded even though real units were physically picked and needed
+   to go in a box. Fixed by widening both queries to also match `status = 'short' AND
+   quantity_picked > 0` (a fully-zero short/damaged line still correctly has nothing to pack). This
+   was tracked as Open item #15 — now resolved, removed from that list. Verified live: a 5-of-8
+   partial short pick correctly showed up in packing with the right quantity.
+3. **Admin can now unassign a batch**, not just assign/reassign one. Reuses the same "Assigned to"
+   control on `/admin/pick-list` rather than a separate button — picking "— Unassigned —" and
+   submitting clears `assigned_picker_id` and puts the batch back to `status = 'pending'` (the
+   general claim pool), same gate as assigning (blocked once a picker has actually started, i.e.
+   `in_progress`). `assignBatchToPacker` in `picker.ts` now takes `packerId: string | null`.
+4. **Per-order notes/special-instructions field**, the one explicitly-deferred piece from the
+   picking/packing redesign earlier in the day. New `orders.notes` column (migration `0011`,
+   nullable free text). Admin edits it inline on `/admin` — a compact "+ Add note" button per row
+   (not an always-visible input in every row of what can be a 100-row table) that expands to a real
+   input + Save/Cancel just for that cell. Surfaced to the floor on both `/picker` and `/packer` in
+   the order-breakdown line under each SKU card, and additionally on packer's apply-labels/AWB
+   screen (arguably the most useful spot for "free gift included" — it's the last thing seen before
+   a box ships). **Real bug found and fixed while building this**: the admin orders table's 12s
+   auto-refresh was rebuilding the whole table (and wiping out an in-progress note edit) before
+   there was a chance to hit Save — reproduced directly while testing. Fixed by skipping that
+   refresh tick while a note editor is open (`ordersTable.querySelector('.note-input')`), and added
+   a Cancel button (previously there was no way to back out of an opened editor at all except
+   letting a refresh clobber it).
+   **Also fixed in the same pass, not asked for but found by inspection**: none of this note text
+   was HTML-escaped before being dropped into `innerHTML` templates (a pre-existing gap — nothing
+   in this app escapes user-entered strings before templating them into the DOM, and free-text
+   notes were the first field that made this a *stored* XSS risk rather than a theoretical one,
+   since an admin's note is later rendered on every picker's and packer's screen). New
+   `escapeHtml()` helper in `src/lib/ui.ts`, used everywhere the note itself is rendered (admin's
+   table cell and edit input, `/picker`'s and `/packer`'s order-breakdown lines, packer's AWB
+   screen). Order IDs and scanned AWB codes picked up the same escaping while in there, since
+   they're rendered the same way. This was **not** applied as a general audit of every other
+   pre-existing unescaped field in the app (e.g. `first_item_name`'s title attribute on `/admin`)
+   — only the new notes feature and what it touched. Worth a dedicated pass if the user wants one.
+
+## Recently done (2026-09-19, a fourth pass) — real production bug, caught by the user
+
+The user checked the deployed site on their phone right after the third pass went live and sent a
+screenshot: on `/picker`, a real Amazon product photo (a guitar neck, not a small placeholder) was
+rendering at full native resolution and blowing the whole card out sideways — the SKU name text
+was pushed almost entirely off-screen to the right.
+
+**Root cause**: `.thumb` in `src/styles/global.css` was scoped as `.item-row .thumb`, not a bare
+`.thumb` rule. `/picker`'s and `/packer`'s SKU-group cards (and admin/inbound's selected-SKU
+preview) use `<img class="thumb">` *without* an `.item-row` wrapper — so it got no sizing at all
+and rendered at the image's native pixel dimensions. This bug **predates every change made in this
+whole session** — the exact same markup was already there before any of today's work started. It
+only became visible now because local testing all day used seed-data placeholder images (deliberately
+small, 160×160 from placehold.co) which never triggered it, while the user's real catalog has
+normal-sized Amazon product photos (hundreds of pixels), and this was the first time the redesigned
+`/picker` page was checked against real data on a real phone.
+
+**Fix**: made `.thumb` (44×44, `object-fit: cover`, rounded) the base rule instead of
+`.item-row`-scoped, so it works wherever it's used, bare or wrapped. One-line-of-reasoning lesson
+for next time: **seed/test data with small placeholder images can hide a real sizing bug that only
+shows up against actual product photos** — worth occasionally checking a real image URL (or at
+least a large one) when testing anything image-related, not just placeholders.
+
+Verified locally against a 900×1200 test image on both `/picker` and `/packer` (mobile viewport,
+`scrollWidth` checked against `innerWidth` — no overflow), then redeployed.
+
+## Recently done (2026-09-19, a fifth pass) — SKU merge tool, from a real "short on stock" report
+
+Right after the fourth pass deployed, the user hit "Create pick batch" for real orders and got "No
+orders could be fully reserved — short on stock" for 4 SellerSKUs, even after they'd (they said)
+already updated inventory. Investigated directly against the **production** D1 database
+(`--remote`, read-only queries first) rather than guessing.
+
+**Root cause, confirmed by querying production**: none of the 4 blocked SellerSKUs had *any*
+`inventory` row at all — not "stock is 0", literally no SKU×location record has ever existed for
+them. Each one turned out to be a **duplicate of a product already stocked under a different SKU
+code** — e.g. `UP-SCCR-LE61` ("4 Tier Katana Wall Mount Holder") is the exact same product as
+`KTN4`, which already had 15 units received. Amazon sent a SellerSKU string that didn't match the
+code the user originally used for that product, so `importAmazonOrders`'s auto-create-on-order-import
+logic (which matches strictly on `sku_code = sellerSku`) correctly-by-its-own-logic created a
+brand-new, empty SKU instead of recognizing it as the same item — and `/admin/inventory` can only
+edit *existing* stock rows, so the user's attempt to "update inventory" for these had nowhere to
+land. This wasn't a one-off — it's a structural gap that would keep recurring for any product
+Amazon ever references under more than one SellerSKU.
+
+**Fix — a real SKU-merge feature, not just a one-time data fix** (user explicitly asked for this
+over just unblocking the 4 orders):
+- New `skus.merged_into_id` column (migration `0012`, self-referential, nullable). Merging never
+  deletes the duplicate SKU row — it's flagged with `merged_into_id` pointing at the surviving SKU,
+  so its `sku_code` keeps resolving correctly. This matters: if it were deleted, the *same*
+  SellerSKU showing up on a future Amazon order would just spawn a fresh duplicate again, right
+  back where this started.
+- `src/lib/skus.ts` (new) — `resolveSkuIdByCode()` (looks up a `sku_code`, follows a
+  `merged_into_id` redirect if present, returns null if the code doesn't exist at all) and
+  `mergeSku()` (moves every `inventory` row — summing into the target's existing row at the same
+  location if one exists, since `inventory` has a `UNIQUE (sku_id, location_id)` constraint — plus
+  every `order_items` and `pick_tasks` row, from source SKU to target SKU; sets
+  `merged_into_id`; logs an audit entry). `previewSkuMerge()` is the read-only version shown before
+  committing.
+- **Every place that auto-creates a SKU from an incoming code now goes through
+  `resolveSkuIdByCode` first** instead of a bare `sku_code = ?` lookup — `importAmazonOrders`
+  (`orders.ts`, the automatic-sync path that caused this), `syncAmazonCatalog`
+  (`catalog-sync.ts`, updates the *surviving* SKU's name/image, not the dead one's), `receiveStock`
+  (`inbound.ts`, so receiving against an old/duplicate code lands stock on the survivor), and the
+  manual order-entry route (`api/admin/orders.ts`). Missing even one of these would leave a hole
+  where the same bug could resurface.
+- Merged-away SKUs are filtered (`WHERE merged_into_id IS NULL`) out of `/api/admin/skus`,
+  receiving's SKU picker (`/api/admin/inbound` GET), and the reports stock table — so a merged
+  duplicate doesn't linger as a confusing dead entry in any admin-facing list. (`/admin/inventory`
+  needs no filter — a merged SKU has zero inventory rows left after the merge, so it never appears
+  there regardless.)
+- **New admin UI**: a "Merge duplicate SKUs" panel at the top of `/admin/inventory` — two SKU-code
+  inputs (source to retire, target to keep), a "Preview merge" step showing exactly what will move
+  (inventory locations/units, order lines, pick tasks) before anything happens, then "Confirm
+  merge". `GET`/`POST /api/admin/sku-merge`.
+
+Verified end-to-end locally: created a duplicate-SKU scenario matching the user's exact situation
+(a stocked "canonical" SKU + an empty "duplicate" SKU with a pending order line), merged them
+through the UI, confirmed the order line moved to the canonical SKU, confirmed a *second* new order
+placed against the duplicate's code resolved straight to the canonical SKU with **no new duplicate
+created**, confirmed the duplicate disappeared from `/api/admin/skus`, and confirmed
+"Create pick batch" then succeeded for both orders using the canonical SKU's existing stock — the
+exact failure mode reported, reproduced and fixed. Then applied migration `0012` to production and
+redeployed.
+
+The user then pushed back, correctly: "every other sku will face the same problem." Queried
+production directly (read-only) to check scale before assuming it was just those 4 —
+**41 duplicate-name groups out of 231 total SKUs**, roughly a third of the whole catalog. Manually
+typing 41 pairs one at a time wasn't realistic, so built a scanner instead of just fixing the 4:
+
+- `findDuplicateSkus()` in `lib/skus.ts` — groups every non-merged SKU by exact,
+  case/whitespace-normalized name (deliberately **exact match only**, not fuzzy/similarity — a
+  false-positive merge is a real mutation, and Amazon listing titles being byte-identical across
+  two genuinely different products is effectively impossible in practice, whereas requiring only a
+  fuzzy match risks merging two products that just happen to sound similar). This means it's not
+  exhaustive — a duplicate with a slightly different title, like the `U8-9OI6-L4OE`/`GUNM-2` pair
+  from the original incident (one has a trailing "(Classic)"), won't be caught by the scanner and
+  still needs to be found and merged by hand the way that one was.
+  Computes a `suggestedKeepId` per group (prefers whichever candidate already has stock, then more
+  order history, then older) as a starting suggestion only — never auto-merges anything.
+- `GET /api/admin/sku-duplicates` exposes it.
+- `/admin/inventory`'s "Possible duplicate SKUs" panel: "Scan for duplicates" button, one row per
+  group with a "Merge X → Y" action per non-suggested candidate. Clicking it **doesn't merge
+  directly** — it fills the manual merge form above and fires the same preview step, so every
+  merge, whether typed by hand or picked from the scan, goes through the identical
+  human-reviewed preview-then-confirm flow. No bulk/one-click "merge all" exists on purpose.
+
+Verified locally against the dev D1 (which turns out to already mirror much of production's real
+catalog — the scan found 41 real-looking groups there too, plus a synthetic test pair added and
+confirmed merging correctly). No new migration — reuses `merged_into_id` from the pass above.
+Deployed.
+
+**Update, same session**: user pushed back — "every other sku will face the same problem" — then,
+after the scanner shipped and confirmed the real count (34 live groups / 70 SKUs at that moment;
+the earlier "41" was a stale count from a few minutes earlier, since the 5-minute Amazon sync cron
+keeps creating new SKUs the whole time this was being worked on), said "I have confirmed all you
+may merge." All 34 exact-match groups (36 individual merges — two groups had 3 candidates each)
+were executed directly against production: exported the scan data, generated a SQL script that
+replicates `mergeSku()`'s exact logic (inventory summed at colliding locations, `order_items`/
+`pick_tasks` redirected, `merged_into_id` set — never a raw `DELETE FROM skus`), ran it via
+`wrangler d1 execute --remote --file=`. **D1 rejects explicit `BEGIN TRANSACTION`/`COMMIT` in a
+`--file` run** ("use state.storage.transaction() instead") — it already wraps the whole file in one
+transaction itself, so those two lines had to be stripped before it would run; the whole batch is
+still atomic. Verified before and after: total `quantity_on_hand`/`quantity_reserved` across all
+`inventory`, and total row counts in `order_items`/`pick_tasks`, were bit-for-bit identical
+pre/post-merge (560 units, 31 order lines, 17 pick tasks, no change) — nothing created or lost, only
+moved. Confirmed `remaining_duplicate_groups` = 0 afterward.
+The 4th original pair (`U8-9OI6-L4OE` ↔ `GUNM-2`, the "(Classic)"-suffix one the exact-match scanner
+can't see) was merged by hand the same way, but into `GN-HLDR` — not `GUNM-2` directly, since
+`GUNM-2` had itself just been merged into `GN-HLDR` in the batch above; merging into an
+already-merged SKU would have created a redirect chain, which `mergeSku`'s `loadMergeable` check
+exists specifically to reject. Both the bulk batch and this one got a manual `audit_log` entry
+(`action: 'sku.merge.bulk'` / `'sku.merge'`, `user_id: NULL`, same pattern as the sync job's own
+`user_id: null` signature) since they didn't go through the API route that normally logs this.
+**Net effect**: the catalog went from 41→34→0 live duplicate groups in one session. New duplicates
+will still occur (every SellerSKU variant Amazon hasn't been seen under yet still auto-creates a
+SKU on order import) — that's expected and by design, not a bug; `/admin/inventory`'s scanner is
+the ongoing tool for catching them, not a one-time fix.
+
+## Recently done (2026-09-19, a sixth pass) — packing loses "Get next batch" too
+
+While the bulk SKU merge above was mid-flight, the user raised a separate complaint: `/packer`
+still had the same "Get next batch" click-gate that `/picker` had already lost earlier in the
+session — "it all orders should be on one page only infinite scroll and packer just sees them
+sorted by batch." Applied the same continuous-scroll treatment to packing, but adapted to how
+packing actually differs from picking:
+
+- **Backend** (`packer.ts`): `startPackingBatch` (claimed one batch, singular) split into
+  `claimNextPackBatch` (the claim-one-batch logic, now private) plus two new exports:
+  `getMyActivePackBatchIds` (every pick_batch this packer has open at this station) and
+  `getMyPackBatches` (returns all of them, auto-claiming when the packer has none). **Deliberately
+  not** the same "one auto-swept batch at a time" restraint `claimNextBatch` uses for picking —
+  picking's restraint exists specifically so admin's per-packer assignment (see the second pass
+  above) isn't fought over; packing has no equivalent assignment mechanism, so `getMyPackBatches`
+  sweeps and claims *every* currently-ready batch at once when the packer has zero active ones, in
+  a loop. Without that change, a packer would only ever see one batch at a time anyway, one poll
+  tick apart — same complaint, just slower.
+- `/api/packer/start-session` now returns `{ stationId, batches: [...] }` instead of one
+  `PackBatchState` — and doubles as the poll endpoint (called repeatedly with the same
+  `stationQrToken`), same pattern as `/api/picker/claim-batch`.
+- **Client** (`packer/index.astro`): each batch is now a self-contained unit that moves through
+  `packing → labeling → done` **in place, inline, on the same page** — not a shared label queue
+  across every batch. This was a deliberate choice, not the more obvious "one combined AWB queue":
+  the real floor workflow (documented earlier in this file) is pack *this* batch's boxes, then
+  label *this* batch's boxes, then move to the next — treating every ready batch's labels as one
+  interleaved queue would contradict that. Clicking "Finish packing" on a batch card transforms
+  just that card into an inline AWB-scan flow (own video element, own queue scoped to that batch's
+  orders); once every label in it is applied it becomes a "Done" banner and stays visible (matches
+  how `/picker` leaves resolved batches on screen, rather than making them vanish). Polling (8s,
+  always on, same as picking) only appends genuinely new batch ids — it doesn't touch batches
+  already rendered, so it can't interrupt an in-progress AWB scan or reset a half-typed quantity
+  elsewhere on the page.
+  "Finish packing" is still optimistic (jumps to the label phase immediately, reconciled after —
+  unchanged from before), and AWB application is still deliberately non-optimistic (hard-block
+  duplicate/mismatch check) — both behaviors carried over from the earlier picking work, not
+  revisited here.
+- Also fixed while touching this file: `errorBanner()`/AWB-mismatch screen weren't running
+  `lastError`/the caught error message through `escapeHtml()` — same class of gap as the notes
+  feature's escaping fix, caught by extension while rewriting this page, not a new report.
+
+Verified locally end-to-end: two separate pick batches picked, tapped into a station and both
+appeared together immediately (no "get next batch" anywhere), packed and finished one — its card
+became an inline AWB scan while the other batch's SKU groups stayed fully interactive below it,
+applied its label — it turned into a "Done" banner, packed and finished the second the same way,
+ended on "All caught up — new batches will appear here automatically." No console errors, no
+mobile overflow (`scrollWidth` checked at 375px).
+
+## Recently done (2026-09-19, a seventh pass) — matching Amazon's own Seller Flex pack screen
+
+The user shared real screenshots of Amazon's own Seller Flex tool (sellerflex.amazon.in — pick →
+pack → "Update Box" bulk action on selected orders → "Bulk Pack Confirmation" modal → separate
+Print/Download of invoice+label) and asked to match that pattern in our admin Easy Ship pages
+(`/admin/ship`, `/admin/bulk-ship`) — still blocked on the SP-API role grant per item #1, so none
+of this could be exercised against a real Amazon response; verified as far as it's possible to
+verify without that (see below).
+
+- **`/admin/bulk-ship` rewritten**: previously forced one box size and one weight onto every
+  selected order via a single global dropdown — the backend (`scheduleEasyShipBulk`,
+  `BulkScheduleOrderInput`) already accepted per-order `boxSizeId`/`weightValue`/
+  `packageIdentifier`, the client just wasn't using that. Now each order row has its own box/
+  weight/package-identifier, plus a bulk "Update box" action (select rows, pick a box + weight,
+  one click applies both to every checked row) — the direct equivalent of Seller Flex's
+  Action Center → Update Box.
+- **New confirmation gate before generating a label** — `confirmDangerousAction()` in
+  `src/lib/ui.ts` (title + warning text + a checkbox that has to be ticked before "Continue"
+  enables), mirroring Seller Flex's own "Bulk Pack Confirmation" step. Added to **both**
+  `/admin/bulk-ship` and the single-order `/admin/ship` (which had no confirmation step at all
+  before this — scheduling fired straight off the slot-selection click). This is a UI-level
+  reinforcement of the existing chat-level rule ("never purchase a real Amazon shipping label
+  without the user's explicit go-ahead in that session") — the rule itself doesn't change, this
+  just makes it harder to fire by an accidental click once that role is granted.
+- **Real functional gap fixed, found while doing this**: `/admin/bulk-ship`'s result screen never
+  actually gave admin a way to *get* the generated label — it showed a scheduled/failed status per
+  order and stopped. `scheduleEasyShipBulk` already stores the label synchronously (bulk's
+  `printableDocumentsUrl` path doesn't need the async Feeds/Reports polling the single-order flow
+  uses), so `/api/admin/shipping/label-status?shipmentId=` already had everything needed — the
+  result screen now calls it per successful order and renders **Print** (opens the label in a new
+  tab) and **Download** (an `<a download>` on the data URL) next to each one, or a Download-only
+  ZIP link for the couldn't-split-per-order fallback case.
+- **Verified without touching any Amazon API**: per HANDOFF's own existing note ("getting pickup
+  slots is free and safe to test; scheduling is not"), and to stay well inside that even further,
+  testing here deliberately stopped *before* even fetching pickup slots — `confirmDangerousAction`
+  was exercised directly (Continue starts disabled, ticking the checkbox enables it, Cancel
+  resolves `false` and removes the modal, Continue resolves `true`), and the per-order box/weight/
+  bulk-"Update box" UI was verified via direct DOM assertions (check a row → bulk bar appears →
+  apply a box+weight → the checked row's own select/input reflect it). **Nothing in this pass
+  called `listHandoverSlots`, `scheduleEasyShipPackage`, or `createScheduledPackageBulk`** — those
+  remain genuinely untested against a live response, same as before this pass (see Open item #13).
+
 ## Next steps — a prioritized plan
 
-What's actually not done yet, ordered by what's blocking vs. not. See "Open items" below for
-full detail on each.
+Rewritten 2026-09-19 (end of a long day, seven passes — see "Recently done" entries above for the
+full story behind each). What's actually not done yet, ordered by what's blocking vs. not. See
+"Open items" below for full detail on each.
 
-1. **Get the Amazon Easy Ship SP-API role granted.** This is the one thing blocking real use of
+1. **Get the Amazon Easy Ship SP-API role granted.** Still the one thing blocking real use of
    shipping (single-order, bulk, everything) *and* packing's bulk-label piece (part 2 of 3, see
    "Open items" #14). It's on the user, not something to keep investigating from this end — check
    Seller Central's app-authorization page for an "Easy Ship" scope. Once granted, the very first
    thing to do is a live smoke test of `/admin/ship` on one real order, watching closely for: the
    real `labelFileType` Amazon returns, which page of the combined PDF is actually the label
-   (currently assumes last), and whether the `DocumentReportReferenceID` regex parse in
-   `checkEasyShipFeed` actually matches Amazon's real feed-processing-report format. None of that
-   has ever been exercised against a live account.
-2. **Real box sizes.** Only one demo box exists. Needs the user to enter their actual box
-   dimensions in the "Manage" menu → Zones/racks/stations, or wherever box sizes ended up (check
-   `/admin/settings`).
-3. **Confirm the ship-from address is real**, not the placeholder used during testing — check
-   `/admin/settings` before the first real label purchase.
-4. **Decide the 30-day data-disposal scope** (see open item, below) — this was *committed to
+   (currently assumes last), whether the `DocumentReportReferenceID` regex parse in
+   `checkEasyShipFeed` matches Amazon's real feed-processing-report format, and — new since the
+   seventh pass — whether `createScheduledPackageBulk`'s label ZIP actually splits 1:1 per order
+   the way `scheduleEasyShipBulk` assumes (flagged since item 13, still unverified). None of that
+   has ever been exercised against a live account. The bulk/single ship pages now have a
+   confirmation step before anything fires, so this smoke test won't happen by accident.
+2. **Work through the remaining SKU-duplicate merges.** The fifth pass fixed all 34 *exact*-name
+   duplicate groups live in one sweep, but `/admin/inventory`'s scanner only catches exact matches
+   — near-duplicates (a trailing "(Classic)", a punctuation difference) still need manual review.
+   Run "Scan for duplicates" again next session to see what's accumulated since (new orders keep
+   auto-creating SKUs for SellerSKU variants never seen before — that's expected, not a bug).
+3. **Real box sizes.** Only demo/test boxes existed as of the start of this session — confirm with
+   the user whether their actual box dimensions have been entered in `/admin/settings` yet.
+4. **Confirm the ship-from address is real**, not a placeholder — check `/admin/settings` before
+   the first real label purchase.
+5. **Decide the 30-day data-disposal scope** (see open item, below) — this was *committed to
    Amazon in writing* with no enforcement code yet. Needs three scoping answers from the user
    before it can be built safely; the cron infrastructure already exists (`src/worker.ts`) so the
-   actual job is easy to add once those answers exist — it can piggyback on the same scheduled
-   handler pattern as the Amazon sync, doesn't need new plumbing.
-5. **Smaller, ask-before-building items**: individually-strengthened admin auth (currently same
-   weak PIN as floor workers), a public privacy policy URL for ecomglider.com, whether the
-   picker/packer "no mandatory scanning" philosophy needs any adjustment now that pickup-slot
-   labels exist, what should happen when an Amazon cancellation lands on an order that's already
-   been fully picked/packed (currently just flagged via an exception event for manual putback —
-   see "Automatic Amazon sync" below), whether the Amazon catalog sync should become automatic
-   (periodic cron) rather than a manual button, and a per-order notes/special-instructions field
-   for packing (see "Open items" #14, part 1's "not included"). None of these are urgent; don't
-   build them unprompted.
-6. **Minor cleanup, low priority**: `src/pages/api/picker/scan-item.ts` (and `verifyItemScan` in
-   `picker.ts`) is dead code from before the picker dropped mandatory scanning — nothing calls
-   it. Safe to delete next time you're in that area, not worth a dedicated pass on its own.
-   `Warehouse` type in `types.ts` is missing the `ship_from_*` columns (cosmetic, nothing
-   breaks).
-7. **If the user says the UI still looks off somewhere else**, the fix pattern is already
-   established (see "Design system" below) — reuse `AdminShell`/the existing component classes
-   rather than inventing new ones. If it's specifically a *mobile* complaint, verify with
-   `document.documentElement.scrollWidth` at 375px before guessing at a fix — a past bug here
-   wasn't visually obvious on desktop at all, don't just eyeball a screenshot.
+   actual job is easy to add once those answers exist.
+6. **Ask-before-building items**: individually-strengthened admin auth (currently same weak PIN
+   as floor workers), a public privacy policy URL for ecomglider.com, what should happen when an
+   Amazon cancellation lands on an order already fully picked/packed (currently just an exception
+   event for manual putback), whether the Amazon catalog sync should become automatic (periodic
+   cron) rather than a manual button, and the broader HTML-escaping audit flagged as Open item #16
+   (the notes feature is covered; older fields like `first_item_name`'s title attribute aren't).
+   None of these are urgent; don't build them unprompted.
+7. **Minor cleanup, low priority**: `src/pages/api/picker/scan-item.ts` (and `verifyItemScan` in
+   `picker.ts`) is dead code from before the picker dropped mandatory scanning — nothing calls it.
+   `Warehouse` type in `types.ts` is missing the `ship_from_*` columns (cosmetic, nothing breaks).
+8. **If the user says the UI looks off somewhere**, the fix pattern is established (see "Design
+   system") — reuse `AdminShell`/existing component classes. If it's a *mobile* complaint, verify
+   with `document.documentElement.scrollWidth` at 375px before guessing — this has caught two real
+   bugs this session that weren't visible on desktop (the Required/Picked stat block, and the bare
+   `.thumb` sizing bug against a real product photo). **Also test image-related UI against a large
+   real image, not just small seed placeholders** — the `.thumb` bug specifically hid behind
+   160×160 placeholder images all session and only showed up against a real Amazon product photo.
 
 ## Read this before touching anything
 
@@ -172,6 +505,10 @@ Notable ones:
 - `0009` — `skus.reorder_point` for low-stock alerts.
 - `0010` — `pack_sessions.pick_batch_id`, so a pack session can cover a whole batch of orders
   instead of exactly one (see "What's built" → the packing entry).
+- `0011` — `orders.notes`, nullable free text for the per-order notes/special-instructions field
+  (see "What's built" → Order notes).
+- `0012` — `skus.merged_into_id`, self-referential nullable FK for the SKU-merge tool (see "What's
+  built" → SKU merge).
 
 ## Design system
 
@@ -302,8 +639,33 @@ shell below targets desktop admin use and doesn't follow it.
   (`mark-picked.ts`/`report-damaged.ts`) now take `pickTaskIds: string[]` instead of a singular id
   — always an array now, even for a group of one. Admin's printable/interactive pick-list
   (`/admin/pick-list`) groups the same way (`groupRowsBySkuLocation`) so the printed sheet matches
-  what a picker actually works from. "Report issue" is now just "Damaged — none usable" for the
-  whole group; a partial short pick is just editing the quantity down before tapping "Mark done."
+  what a picker actually works from.
+  **Updated later the same day (2026-09-19)**: "Report issue" is now a reason dropdown — "Damaged
+  — none usable", "Low stock — not enough available", or "Other" (free-text note) — not just a
+  single "Damaged" button, and it opens automatically whenever the entered quantity is less than
+  what's needed (not only from the standalone button), so a short pick can't complete silently
+  without saying why. Each SKU card shows **Required** and **Picked** as two explicit numbers, not
+  a compact fraction, so "needed 5, only got 2" is obvious rather than inferred from a "Done"
+  banner. Whether "Damaged" writes off the whole task's inventory (`reportGroupDamaged`, the
+  destructive path) or is just an annotation on an ordinary short pick (`confirmGroupQuantity` with
+  a `reason` string, appended to the `short_pick` exception's notes) depends on whether anything
+  was actually picked: quantity 0 → destructive write-off; quantity > 0 → annotated short pick,
+  never both, since a task that already has units picked shouldn't have its whole required
+  quantity marked damaged. See `renderSkuGroup`'s reason-panel logic in `picker/index.astro` and
+  the `reason?: string` parameter threaded through `confirmQuantity`/`confirmGroupQuantity` in
+  `picker.ts`.
+  The picker page is also no longer "claim one batch, finish it, tap for the next" — it's every
+  batch currently assigned to you (`getMyBatches`/`getMyActiveBatches` in `picker.ts`) rendered as
+  one continuous scroll, polled every 8s for anything new (a fresh auto-sweep once you're caught
+  up, or a batch admin hand-assigned — see below) which just appends at the bottom rather than
+  replacing what's already on screen, so an open "why was this short" panel elsewhere on the page
+  survives a quiet poll tick. Admin can now hand-assign a specific batch to a specific packer
+  (`assignBatchToPacker` in `picker.ts`, UI on `/admin/pick-list` — see its own entry below)
+  instead of every batch going through the general first-picker-who-asks pool; a batch admin
+  assigns is excluded from that pool the moment its status leaves `pending`, so nobody else can
+  claim it out from under the named packer. Marking a group done or reporting an issue updates the
+  screen immediately (an optimistic local update before the network call resolves, reconciled with
+  the server's response and rolled back on failure) instead of waiting on the round trip.
   **Real bug found and fixed during this work**: `reportDamaged` never checked/updated batch
   completion the way `confirmQuantity` did — if a batch's very last outstanding line resolved via
   damage-report instead of a normal pick, the batch stayed stuck at `assigned`/`in_progress`
@@ -334,6 +696,13 @@ shell below targets desktop admin use and doesn't follow it.
   to change). This matches the floor workflow the user described: pack everything first
   (physically arranging finished boxes SKU-sorted on the table), then label everything at once
   matching that same order.
+  **Updated 2026-09-19 (a sixth pass, same day)**: no more "Get next batch" click gate — every
+  batch a packer has open at a station shows on one continuous page at once (`getMyPackBatches` in
+  `packer.ts`, sweeps *all* currently-ready batches, not just one — packing has no per-packer
+  admin-assignment mechanism the way picking does, so there's no reason to hold any back). Each
+  batch moves through pack → label → done **in place, inline**, not via a page navigation or a
+  batch-wide queue — see "Recently done" for why a shared cross-batch label queue was deliberately
+  rejected in favor of this.
   **Edge case, worth knowing**: an order whose items all came back short/damaged during *picking*
   has nothing left with status `picked`/`packed`, so it legitimately shows zero SKU lines to pack
   — `getPackBatchState` treats it as vacuously "already packed" (nothing to do) and it goes
@@ -347,15 +716,66 @@ shell below targets desktop admin use and doesn't follow it.
   **Not built yet** — parts 2 and 3 of the same redesign (bulk label content: SKU-sorted, short
   SKU code stamped, invoice pages stripped; and direct thermal-printer printing, likely via QZ
   Tray). See "Open items" #14 for the full three-part breakdown and what's blocking each.
+  **Bug found 2026-09-19, fixed later the same day**: `getPackBatchState`'s (and
+  `getPackSessionState`'s) items query originally only included `order_items` with status
+  `'picked'` or `'packed'` — an item that came back a *partial* short pick (status `'short'`, but
+  `quantity_picked > 0`) never appeared in the packing view at all, even though real units were
+  physically picked for it. Fixed by widening both queries to also match `status = 'short' AND
+  quantity_picked > 0` (a fully-zero short/damaged line still correctly has nothing to pack — that
+  edge case below is unaffected). See "Recently done" (the follow-up punch list) for the fix.
+  **Updated later the same day (2026-09-19)**: SKU groups are now sorted by `sku_code` (server-side
+  `ORDER BY` in `getPackBatchState`, plus a defensive client-side sort) so the packed-and-arranged-
+  on-the-table order actually matches what the user described (see "Recently done" above for the
+  full floor-workflow spec this is built against). "Mark done" also updates the screen immediately
+  now, the same optimistic-then-reconcile pattern as picking.
+- **Packer dashboard** (`/packer/home`, added 2026-09-19) — a packer's own home page: what's
+  currently assigned to them (`getMyActiveBatches`, with a "Go to picking"/"Go to packing" link
+  depending on whether picking is still outstanding), and a read-only "upcoming — pulled, not yet
+  assigned" list (`getUpcomingBatches` — batches admin created via "Create pick batch" that nobody
+  has claimed or been assigned yet; visibility only, not a claim action). The top-bar logo on
+  every picker/packer/admin screen now links back to a home page (`/packer/home` for picker/
+  packer via `TopBar`'s new `homeHref` prop, `/admin` for admin's sidebar logo) instead of being
+  inert.
+- **Admin batch assignment** (`/admin/pick-list`, added 2026-09-19) — an "Assigned to" control on
+  the batch card lets admin hand a specific pending/assigned batch to a specific packer
+  (`PATCH /api/admin/batches`, `assignBatchToPacker` in `picker.ts`) instead of leaving every
+  batch to the general claim pool. Once assigned, it's excluded from that pool (status leaves
+  `'pending'`) and surfaces automatically on the named packer's `/picker` page and dashboard next
+  time they load or poll. The same control also unassigns — selecting "— Unassigned —" and
+  submitting (`packerId: null`) puts the batch back to `'pending'`, same gate as assigning (blocked
+  once a picker has actually started, `'in_progress'`). Button label follows the selection
+  ("Assign" / "Update" / "Unassign").
+- **Order notes** (`orders.notes`, migration `0011`, added 2026-09-19) — a free-text per-order
+  field for what used to only exist on the admin's handwritten paper pick list ("free gift
+  included", "multi-qty, double-check count"). Admin edits it inline on `/admin`'s orders table
+  (`PATCH /api/admin/orders`) — a compact "+ Add note" button per row that expands to a real input
+  + Save/Cancel just for that cell, not an always-visible input in every row of what can be a
+  100-row table. Surfaced to the floor on both `/picker` and `/packer` in the order-breakdown line
+  under each SKU card, and on packer's apply-labels/AWB screen. Threaded through
+  `getPickListView`/`getPackBatchState` (`picker.ts`/`packer.ts`) as `order_notes`. All rendering
+  goes through the new `escapeHtml()` in `src/lib/ui.ts` — see "Open items" #16 for the broader
+  (pre-existing, not fully audited) escaping gap this only partially addresses.
+- **SKU merge** (`skus.merged_into_id`, migration `0012`, added 2026-09-19) — for when the same
+  physical product ends up under two SKU records (Amazon sends a SellerSKU that doesn't match the
+  code already in use — see "Recently done," fifth pass, for the real incident that drove this).
+  `/admin/inventory` has a "Merge duplicate SKUs" panel: enter the duplicate's code and the code to
+  keep, preview what moves, confirm. `mergeSku()`/`previewSkuMerge()`/`resolveSkuIdByCode()` in
+  `src/lib/skus.ts`. The duplicate SKU row is never deleted, only flagged — its code keeps
+  resolving to the surviving SKU via `resolveSkuIdByCode`, which every SKU-auto-create path now
+  goes through (`importAmazonOrders`, `syncAmazonCatalog`, `receiveStock`, manual order entry) so
+  the same SellerSKU showing up again doesn't spawn a fresh duplicate. Merged-away SKUs are
+  filtered out of `/api/admin/skus`, receiving's picker, and the reports stock table.
 - **Pick/Pack tabs + notifications** — `/picker` and `/packer` are separate routes but present as
   tabs (`.tab-pill` in `TopBar`), each with a red badge dot when work is waiting on the *other*
   tab. `GET /api/packer/work-summary` (packer role) returns `{ pickable, packable }` counts,
   polled every 10s from both pages. Never shows price — see below.
 - **Live auto-refresh** — polling, not push. `/admin` refreshes its orders list every 12s;
-  `/picker`'s "No batches" and `/packer`'s "No orders waiting" screens poll every 8s. All skip
-  the tick when the tab is backgrounded (`document.hidden`). Good enough for this team's volume;
-  if it ever needs to feel more instant, Durable Objects WebSockets is the documented upgrade
-  path (not needed yet).
+  `/packer`'s "No orders waiting" screen polls every 8s. `/picker` polls every 8s continuously
+  (not just while empty, since 2026-09-19 — see "What's built" → the picking entry), but only
+  re-renders when a batch not already on screen shows up, so it doesn't disturb an open panel.
+  All skip the tick when the tab is backgrounded (`document.hidden`). Good enough for this team's
+  volume; if it ever needs to feel more instant, Durable Objects WebSockets is the documented
+  upgrade path (not needed yet).
 - **Inbound receiving** (`/admin/inbound`, `inbound.ts`) — type-ahead product search (title or
   SKU code, results show photo + name + code + price) with a "can't find it, create new SKU"
   fallback. Puts stock directly into a bin, creating the SKU×location `inventory` row if it
@@ -533,6 +953,18 @@ this list.
        signing (avoids a security prompt on every print job) is a paid tier last this was
        discussed, but terms shift, so confirm current pricing on QZ's own site rather than trust
        a number here.
+15. ~~**Partial short-picked items never reach the packing view**~~ — **fixed** 2026-09-19, later
+    the same day. See "Recently done" (the follow-up punch list) and "What's built" → the packing
+    entry.
+16. **No general HTML-escaping audit** (discovered 2026-09-19 while building the notes feature).
+    Every picker/packer/admin screen in this app renders via `innerHTML` template strings rather
+    than building DOM nodes, and — outside of what the notes feature now covers with `escapeHtml()`
+    in `src/lib/ui.ts` — most pre-existing places that drop a user-entered string into one of those
+    templates don't escape it first (e.g. `first_item_name`'s `title` attribute on `/admin`, quoted
+    with a bare `.replace(/"/g, '&quot;')` rather than a full escape). Not a new risk introduced
+    today, and not fixed beyond the notes feature itself — worth a dedicated pass if the user wants
+    one, since the actual exposure (an admin's own free text rendered back to admin/floor-worker
+    screens, not arbitrary public input) is limited but real.
 
 ## Amazon Data Protection Policy questionnaire — what was submitted
 
