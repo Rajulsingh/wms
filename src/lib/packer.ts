@@ -127,28 +127,25 @@ export interface MyPackBatches {
 /**
  * Verifies the station QR/barcode (packing-station equivalent of the rack
  * check, §4/§8), then returns every batch this packer currently has open at
- * this station — auto-claiming one new batch via claimNextPackBatch only
- * when they have none, same "claim-time" pattern picker.ts uses. The
- * packer page renders all of them on one continuous page (no "get next
- * batch" click gate) — see HANDOFF.md.
+ * this station, plus a sweep for anything freshly ready. The packer page
+ * renders all of them on one continuous page (no "get next batch" click
+ * gate) and reuses this same call for its 8s poll — so the sweep below runs
+ * on every poll, not just when the packer has zero batches, otherwise a
+ * batch that finishes picking mid-walk would sit invisible until everything
+ * already open got packed first. claimNextPackBatch already excludes
+ * batches this or any packer already has a pack_session for, so looping it
+ * here is safe to call every tick — it naturally stops once nothing new is
+ * ready. See HANDOFF.md.
  */
 export async function getMyPackBatches(db: D1Database, userId: string, stationQrToken: string, warehouseId: string): Promise<MyPackBatches> {
   const station = await db.prepare(`SELECT id FROM packing_stations WHERE qr_token = ? AND warehouse_id = ?`).bind(stationQrToken, warehouseId).first<{ id: string }>();
   if (!station) throw new PackerFlowError('unknown_station', 'This station QR code is not recognized');
 
-  let batchIds = await getMyActivePackBatchIds(db, station.id, userId);
-  // Unlike picking's claim-time batching (deliberately one auto-swept batch
-  // at a time — see claimNextBatch in picker.ts), packing has no admin-
-  // assignment mechanism to hand out extra batches, so "claim if I have
-  // none" sweeps *every* currently-ready batch at once here, not just one —
-  // otherwise a packer would only ever see one batch until it's finished,
-  // one poll tick apart, instead of everything actually ready right now.
-  if (!batchIds.length) {
-    for (;;) {
-      const claimed = await claimNextPackBatch(db, userId, station.id, warehouseId);
-      if (!claimed) break;
-      batchIds.push(claimed);
-    }
+  const batchIds = await getMyActivePackBatchIds(db, station.id, userId);
+  for (;;) {
+    const claimed = await claimNextPackBatch(db, userId, station.id, warehouseId);
+    if (!claimed) break;
+    batchIds.push(claimed);
   }
 
   const batches: PackBatchState[] = [];

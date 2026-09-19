@@ -3,8 +3,9 @@ import { getDb } from '../../../lib/db';
 import { requireUser, AuthError } from '../../../lib/auth';
 import { getMyBatches } from '../../../lib/picker';
 
-// Returns every batch currently active for this picker (auto-claiming one
-// via claimNextBatch if they have none), not just a single batch — the
+// Returns every batch currently active for this picker, plus a sweep for
+// anything freshly available — not just a single batch, and not gated on
+// having zero already, so this doubles as the continuous-flow poll. The
 // picker page renders all of them on one continuous scrollable page rather
 // than gating on a "get next batch" click. See getMyBatches in lib/picker.ts.
 export const POST: APIRoute = async (context) => {

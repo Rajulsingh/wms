@@ -34,6 +34,19 @@ export async function claimNextBatch(db: D1Database, warehouseId: string, picker
     .first<{ id: string }>();
   if (resumable) return resumable.id;
 
+  return claimAvailableBatch(db, warehouseId, pickerId);
+}
+
+/**
+ * The non-resumable half of claimNextBatch — grabs (or sweeps a fresh one
+ * from) the pending pool regardless of whether this picker already has an
+ * active batch elsewhere. Split out so getMyBatches can call it on every
+ * poll, not just when the picker has zero active batches — otherwise orders
+ * that land (Amazon sync, admin import) while a picker is mid-walk sit
+ * invisible until they finish everything already on their page. See
+ * HANDOFF.md.
+ */
+async function claimAvailableBatch(db: D1Database, warehouseId: string, pickerId: string): Promise<string | null> {
   let candidate = await db
     .prepare(`SELECT id FROM pick_batches WHERE warehouse_id = ? AND status = 'pending' ORDER BY created_at ASC LIMIT 1`)
     .bind(warehouseId)
@@ -415,11 +428,14 @@ export async function getMyActiveBatches(db: D1Database, warehouseId: string, pi
  * already has one (admin assignment is the only way to get a second).
  */
 export async function getMyBatches(db: D1Database, warehouseId: string, pickerId: string): Promise<Array<{ batchId: string; rows: PickListRow[] }>> {
-  let batchIds = await getMyActiveBatches(db, warehouseId, pickerId);
-  if (!batchIds.length) {
-    const claimed = await claimNextBatch(db, warehouseId, pickerId);
-    if (claimed) batchIds = [claimed];
-  }
+  const batchIds = await getMyActiveBatches(db, warehouseId, pickerId);
+  // Always also try to pick up anything freshly available — not gated on
+  // "only when I have none" — so this doubles as the continuous-flow poll:
+  // orders that land mid-walk get swept into a new batch and appended to
+  // the picker's page on the next tick, instead of waiting for them to
+  // finish everything already open. See claimAvailableBatch. HANDOFF.md.
+  const claimed = await claimAvailableBatch(db, warehouseId, pickerId);
+  if (claimed) batchIds.push(claimed);
   const out: Array<{ batchId: string; rows: PickListRow[] }> = [];
   for (const batchId of batchIds) {
     out.push({ batchId, rows: await getPickListView(db, batchId) });

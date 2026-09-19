@@ -371,9 +371,57 @@ verify without that (see below).
   called `listHandoverSlots`, `scheduleEasyShipPackage`, or `createScheduledPackageBulk`** — those
   remain genuinely untested against a live response, same as before this pass (see Open item #13).
 
+## Recently done (2026-09-19, an eighth pass) — continuous flow, and a test-data reset button
+
+The user pushed back on the "one batch at a time" feel that survived even after the seventh pass's
+continuous-scroll rewrite: a picker/packer only ever saw a *new* batch once everything already on
+their page was finished — new orders landing mid-walk (Amazon's 5-minute sync, an admin import) sat
+invisible until then. Root cause: `getMyBatches` (picker.ts) and `getMyPackBatches` (packer.ts) only
+attempted to claim/sweep additional work when the caller had **zero** active batches already —
+correct on the very first load, wrong on every poll after that.
+
+- **Fix**: `claimNextBatch` was split into the "resume my own batch" check plus a new
+  `claimAvailableBatch` (the pending-claim-or-sweep-a-fresh-one logic). `getMyBatches` now calls
+  `claimAvailableBatch` on *every* call, not just when the picker has none — since it's idempotent
+  (returns `null` when nothing new exists), this is safe to run on every 8s poll and it's what makes
+  the poll double as the continuous-flow mechanism. `getMyPackBatches` got the equivalent fix: the
+  `if (!batchIds.length)` gate around the claim-everything-ready loop was removed outright, since
+  `claimNextPackBatch`'s own query already excludes batches already claimed. No frontend changes
+  needed — both pages already reuse the same poll endpoint for their 8s ticks.
+- **Verified live in dev**: claimed a batch as a picker, left it unfinished, inserted a fresh order
+  directly into D1, and confirmed the next 8s poll appended it as a *second* batch on the same page
+  without touching the first. This is the actual behavior the user asked for — orders now show up as
+  soon as they're pulled from Amazon, not after the picker clears their current work.
+- **New admin button: "Reset picking & packing"** (`/admin`, next to "Create pick batch") — for
+  repeatedly retesting the same orders without needing fresh Amazon test orders every time. Backend:
+  `resetPickPackData` in `src/lib/reset.ts`. Reverts every order currently `allocated`/`batched`/
+  `picking`/`picked`/`packing`/`packed`/`partial` back to `pending`, undoing exactly what
+  picking/packing did to inventory (restores on-hand units `confirmPick` consumed, releases any
+  outstanding reservation, un-marks bins `reportDamaged` flagged `damaged`), and deletes the
+  pick_batches/pick_tasks/cart_slots/pack_sessions/packages/shipments/awbs rows so the next batch
+  starts clean. Deliberately **stops at the shipping-label boundary** — orders already
+  `ready_to_ship`/`shipped`, and `cancelled` orders, are left untouched, since a `ready_to_ship`
+  order can carry a real Amazon-scheduled pickup/label (see `applyAwb`'s pre-purchased-label path in
+  `packer.ts`) that resetting would desync us from, not just clear test state. Gated behind
+  `confirmDangerousAction()` like the shipping pages. Verified end-to-end in dev: created a batch,
+  did a partial short pick (3 of 5, reason "Low stock"), hit Reset, and confirmed inventory
+  (on-hand + reserved), order/item status, and the pick_batch/pick_task rows all landed back exactly
+  where they started.
+- **Real bug caught while building the button, fixed before shipping**: the reset button's click
+  handler read `e.currentTarget` *after* `await confirmDangerousAction(...)` to pass to
+  `withLoading`. `Event.currentTarget` goes `null` once the event finishes dispatching — which
+  happens well before that `await` resolves — so `withLoading(null, ...)` threw immediately on
+  `btn.textContent`, and the actual reset API call never fired. Silent failure: the confirm modal
+  closed, an error banner appeared, but nothing in the DB changed. Fixed by capturing `btn` in a
+  `const` *before* the `confirmDangerousAction` call, matching the pattern `ship.astro` and
+  `bulk-ship.astro` already used correctly (`btn.onclick = async () => { const ok = await ...`,
+  closing over the outer `btn`, never reading it off the event afterward). **Lesson for next time**:
+  any `async` click handler that does `await` before touching `e.currentTarget`/`e.target` has this
+  bug — capture the element into a variable first, always.
+
 ## Next steps — a prioritized plan
 
-Rewritten 2026-09-19 (end of a long day, seven passes — see "Recently done" entries above for the
+Rewritten 2026-09-19 (end of a long day, eight passes — see "Recently done" entries above for the
 full story behind each). What's actually not done yet, ordered by what's blocking vs. not. See
 "Open items" below for full detail on each.
 
@@ -419,6 +467,9 @@ full story behind each). What's actually not done yet, ordered by what's blockin
    `.thumb` sizing bug against a real product photo). **Also test image-related UI against a large
    real image, not just small seed placeholders** — the `.thumb` bug specifically hid behind
    160×160 placeholder images all session and only showed up against a real Amazon product photo.
+   **Also: any `async` click handler that reads `e.currentTarget`/`e.target` *after* an `await`
+   has a real bug** (it's `null` by then) — caught this in the eighth pass's reset button; capture
+   the element into a variable before the first `await`, every time.
 
 ## Read this before touching anything
 

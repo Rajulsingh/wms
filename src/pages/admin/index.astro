@@ -13,6 +13,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
   <div class="row">
     <button class="btn btn-primary" id="import-btn" style="width: auto;">Import from Amazon</button>
     <button class="btn" id="batch-btn" style="width: auto;">Create pick batch</button>
+    <button class="btn btn-ghost" id="reset-btn" style="width: auto; margin-left: auto;">Reset picking &amp; packing</button>
   </div>
   <div id="action-result" class="banner" style="display:none;"></div>
 
@@ -25,7 +26,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
   </div>
 
   <script>
-    import { withLoading, escapeHtml } from '../../lib/ui';
+    import { withLoading, escapeHtml, confirmDangerousAction } from '../../lib/ui';
 
     interface OrderRow {
       id: string;
@@ -327,6 +328,31 @@ if (redirectTo) return Astro.redirect(redirectTo);
         } else {
           showResult(`Batch created: ${result.orderCount} orders, ${result.taskCount} pick tasks. <a href="/admin/pick-list?batchId=${result.batchId}">View / print pick list</a>`);
         }
+        await loadOrders();
+      } catch (err) {
+        showResult((err as Error).message, 'danger');
+      }
+    });
+
+    document.getElementById('reset-btn')?.addEventListener('click', async (e) => {
+      // Capture the button before the confirm modal's await — `e.currentTarget`
+      // goes null once the click event finishes dispatching, so reading it
+      // after an `await` (found the hard way: withLoading threw reading
+      // `.textContent` off null, silently skipping the actual reset call).
+      const btn = e.currentTarget as HTMLButtonElement;
+      const ok = await confirmDangerousAction({
+        title: 'Reset picking & packing',
+        message: 'This puts every order currently batched/picking/packing back to "pending" — deleting its pick batch, pick tasks, and pack sessions — and restores the inventory it had reserved or consumed. Orders already ready to ship or shipped are left alone. Use this to retest the same orders from scratch.',
+        continueLabel: 'Reset'
+      });
+      if (!ok) return;
+      try {
+        const result = await withLoading(btn, 'Resetting…', () => api('/api/admin/reset-pick-pack', { warehouseId }));
+        showResult(
+          result.orderCount
+            ? `Reset ${result.orderCount} order${result.orderCount > 1 ? 's' : ''} across ${result.batchCount} batch${result.batchCount > 1 ? 'es' : ''} back to pending.`
+            : 'Nothing to reset — no orders are currently batched/picking/packing.'
+        );
         await loadOrders();
       } catch (err) {
         showResult((err as Error).message, 'danger');

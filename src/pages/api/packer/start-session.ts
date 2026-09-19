@@ -4,8 +4,8 @@ import { requireUser, AuthError } from '../../../lib/auth';
 import { getMyPackBatches, PackerFlowError } from '../../../lib/packer';
 
 // Also used for polling once a station is active, not just the initial tap-in
-// — returns every batch this packer currently has open there, auto-claiming
-// a new one only when they have none. See getMyPackBatches in lib/packer.ts.
+// — returns every batch this packer currently has open there, plus a sweep
+// for anything freshly ready, on every call. See getMyPackBatches in lib/packer.ts.
 export const POST: APIRoute = async (context) => {
   const db = getDb();
   try {

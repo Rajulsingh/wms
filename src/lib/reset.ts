@@ -1,0 +1,107 @@
+import { releaseReservation } from './inventory';
+import { logAudit } from './db';
+
+export interface ResetResult {
+  orderCount: number;
+  batchCount: number;
+}
+
+/**
+ * Admin "start over" button for testing: reverts every order currently
+ * mid-pipeline (batched through partial — anything picking/packing has
+ * touched) back to 'pending', undoes what picking/packing did to inventory
+ * (restores on-hand units confirmPick consumed, releases outstanding
+ * reservations, un-marks bins reportDamaged flagged), and deletes the
+ * pick/pack rows themselves so the next "create batch" / claim starts clean.
+ *
+ * Deliberately stops at the shipping-label boundary: orders already at
+ * 'ready_to_ship' or 'shipped', and 'cancelled' orders, are left untouched.
+ * A ready_to_ship order may carry a REAL Amazon-scheduled pickup/label (see
+ * applyAwb's pre-purchased-label path in packer.ts) — resetting those would
+ * desync us from a commitment Amazon already has, not just clear local test
+ * state. This only clears picking/packing, never shipping. See HANDOFF.md.
+ */
+export async function resetPickPackData(db: D1Database, warehouseId: string, userId: string): Promise<ResetResult> {
+  const targetOrders = await db
+    .prepare(
+      `SELECT id FROM orders WHERE warehouse_id = ? AND status IN ('allocated', 'batched', 'picking', 'picked', 'packing', 'packed', 'partial')`
+    )
+    .bind(warehouseId)
+    .all<{ id: string }>();
+  const orderIds = targetOrders.results.map((r) => r.id);
+  if (!orderIds.length) return { orderCount: 0, batchCount: 0 };
+  const orderPh = orderIds.map(() => '?').join(',');
+
+  const pickTasks = await db
+    .prepare(
+      `SELECT pt.id, pt.pick_batch_id, pt.status, pt.sku_id, pt.location_id, pt.quantity_required, pt.quantity_picked
+       FROM pick_tasks pt JOIN order_items oi ON oi.id = pt.order_item_id
+       WHERE oi.order_id IN (${orderPh})`
+    )
+    .bind(...orderIds)
+    .all<{ id: string; pick_batch_id: string; status: string; sku_id: string; location_id: string; quantity_required: number; quantity_picked: number }>();
+  const batchIds = [...new Set(pickTasks.results.map((t) => t.pick_batch_id))];
+
+  // Undo each pick_task's effect on inventory before deleting it — a
+  // still-open task holds a reservation to release, a resolved 'picked'/
+  // 'short' task consumed real on-hand units to put back, a 'damaged' task
+  // flagged its whole bin unavailable to lift.
+  for (const t of pickTasks.results) {
+    const inv = await db.prepare(`SELECT id FROM inventory WHERE sku_id = ? AND location_id = ?`).bind(t.sku_id, t.location_id).first<{ id: string }>();
+    if (!inv) continue;
+    if (t.status === 'pending' || t.status === 'location_confirmed') {
+      await releaseReservation(db, inv.id, t.quantity_required);
+    } else if ((t.status === 'picked' || t.status === 'short') && t.quantity_picked > 0) {
+      await db
+        .prepare(`UPDATE inventory SET quantity_on_hand = quantity_on_hand + ?, version = version + 1, updated_at = datetime('now') WHERE id = ?`)
+        .bind(t.quantity_picked, inv.id)
+        .run();
+    } else if (t.status === 'damaged') {
+      await db.prepare(`UPDATE inventory SET status = 'available', version = version + 1, updated_at = datetime('now') WHERE id = ?`).bind(inv.id).run();
+    }
+  }
+
+  // Packing rows for these orders — child tables first to satisfy FKs.
+  const packSessions = await db.prepare(`SELECT id FROM pack_sessions WHERE order_id IN (${orderPh})`).bind(...orderIds).all<{ id: string }>();
+  const sessionIds = packSessions.results.map((s) => s.id);
+  if (sessionIds.length) {
+    const sessionPh = sessionIds.map(() => '?').join(',');
+    const packages = await db.prepare(`SELECT id FROM packages WHERE pack_session_id IN (${sessionPh})`).bind(...sessionIds).all<{ id: string }>();
+    const packageIds = packages.results.map((p) => p.id);
+    if (packageIds.length) {
+      const packagePh = packageIds.map(() => '?').join(',');
+      await db.prepare(`DELETE FROM awbs WHERE shipment_id IN (SELECT id FROM shipments WHERE package_id IN (${packagePh}))`).bind(...packageIds).run();
+      await db.prepare(`DELETE FROM shipments WHERE package_id IN (${packagePh})`).bind(...packageIds).run();
+      await db.prepare(`DELETE FROM packages WHERE id IN (${packagePh})`).bind(...packageIds).run();
+    }
+    await db.prepare(`UPDATE exception_events SET pack_session_id = NULL WHERE pack_session_id IN (${sessionPh})`).bind(...sessionIds).run();
+    await db.prepare(`DELETE FROM pack_sessions WHERE id IN (${sessionPh})`).bind(...sessionIds).run();
+  }
+
+  // Picking rows.
+  const taskIds = pickTasks.results.map((t) => t.id);
+  if (taskIds.length) {
+    const taskPh = taskIds.map(() => '?').join(',');
+    await db.prepare(`UPDATE exception_events SET pick_task_id = NULL WHERE pick_task_id IN (${taskPh})`).bind(...taskIds).run();
+    await db.prepare(`DELETE FROM pick_tasks WHERE id IN (${taskPh})`).bind(...taskIds).run();
+  }
+  if (batchIds.length) {
+    const batchPh = batchIds.map(() => '?').join(',');
+    await db.prepare(`DELETE FROM cart_slots WHERE pick_batch_id IN (${batchPh})`).bind(...batchIds).run();
+    await db.prepare(`DELETE FROM pick_batches WHERE id IN (${batchPh})`).bind(...batchIds).run();
+  }
+
+  // Orders/items back to a fresh, batchable state.
+  await db.prepare(`UPDATE order_items SET quantity_picked = 0, quantity_packed = 0, status = 'pending' WHERE order_id IN (${orderPh})`).bind(...orderIds).run();
+  await db.prepare(`UPDATE orders SET status = 'pending' WHERE id IN (${orderPh})`).bind(...orderIds).run();
+
+  await logAudit(db, {
+    userId,
+    action: 'admin.reset_pick_pack',
+    entityType: 'warehouse',
+    entityId: warehouseId,
+    metadata: { orderCount: orderIds.length, batchCount: batchIds.length }
+  });
+
+  return { orderCount: orderIds.length, batchCount: batchIds.length };
+}
