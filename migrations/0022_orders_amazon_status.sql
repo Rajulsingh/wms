@@ -1,0 +1,12 @@
+-- Amazon's own OrderStatus ("Pending", "Unshipped", "PartiallyShipped",
+-- "Shipped", "Canceled"), tracked separately from `orders.status` (this
+-- app's own pipeline stage: pending/allocated/batched/picking/.../shipped).
+-- Needed so reserveOrderForPicking can hold a "Pending" (Amazon hasn't
+-- confirmed it yet — still pending payment/address/fraud check, could still
+-- be cancelled before confirmation) order out of the pick list even when its
+-- ship-by date is today, instead of picking stock for an order that might
+-- not exist by the time a picker gets to it. NULL for anything imported
+-- before this migration; treated as "not Pending" (i.e. reservable) by
+-- reserveOrderForPicking, which only actively holds a KNOWN-Pending order
+-- back, not an unknown one.
+ALTER TABLE orders ADD COLUMN amazon_order_status TEXT;

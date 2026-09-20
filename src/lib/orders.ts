@@ -50,10 +50,18 @@ export async function importAmazonOrders(db: D1Database, warehouseId: string, or
     const orderId = newId();
     await db
       .prepare(
-        `INSERT INTO orders (id, warehouse_id, external_order_id, source, status, ship_by, customer_name, shipping_address)
-         VALUES (?, ?, ?, 'amazon', 'pending', ?, ?, ?)`
+        `INSERT INTO orders (id, warehouse_id, external_order_id, source, status, ship_by, customer_name, shipping_address, amazon_order_status)
+         VALUES (?, ?, ?, 'amazon', 'pending', ?, ?, ?, ?)`
       )
-      .bind(orderId, warehouseId, order.amazonOrderId, order.latestShipDate ?? order.earliestShipDate ?? null, order.buyerName ?? null, order.shippingAddress ?? null)
+      .bind(
+        orderId,
+        warehouseId,
+        order.amazonOrderId,
+        order.latestShipDate ?? order.earliestShipDate ?? null,
+        order.buyerName ?? null,
+        order.shippingAddress ?? null,
+        order.orderStatus
+      )
       .run();
 
     for (const item of order.items) {
@@ -132,6 +140,10 @@ export interface ReserveOrderResult {
   // retryBlockedOrders) don't lump "scheduled for a later day, working as
   // intended" in with genuine stock-shortage "blocked" noise.
   notDueYet?: boolean;
+  // Same idea, for an order Amazon hasn't confirmed yet (see
+  // amazon_order_status below) — held back even if its ship-by date is
+  // today, since Amazon could still cancel it before ever confirming it.
+  stillPending?: boolean;
 }
 
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
@@ -171,6 +183,16 @@ function isDueForPickingToday(shipBy: string | null): boolean {
  * job's retryBlockedOrders, every 5 minutes during warehouse hours) is what
  * naturally picks it up once it's due, with no separate scheduler needed.
  *
+ * Also gated on `amazon_order_status !== 'Pending'` — a user request after
+ * finding a genuinely same-day order still sitting Amazon-side "Pending"
+ * (payment/address/fraud check not yet done, could still be cancelled
+ * outright before Amazon ever confirms it) already batched and in the
+ * active pick list (see HANDOFF.md). `syncOrderStatuses` (amazon-sync.ts)
+ * keeps this column current on every poll and runs right before
+ * retryBlockedOrders in the same cron cycle, so an order held back here
+ * becomes reservable the moment Amazon confirms it (flips to Unshipped/
+ * PartiallyShipped) without any separate scheduler.
+ *
  * Creates exactly one `pick_batches` row per order (no `cart_id`/cart_slots
  * — there's no multi-order sweep to bundle here) rather than removing the
  * pick_batches/pack_sessions machinery outright: every function scoped by
@@ -179,7 +201,13 @@ function isDueForPickingToday(shipBy: string | null): boolean {
  * one order makes all of that correct per order for free. See HANDOFF.md.
  */
 export async function reserveOrderForPicking(db: D1Database, warehouseId: string, orderId: string): Promise<ReserveOrderResult> {
-  const orderRow = await db.prepare(`SELECT ship_by FROM orders WHERE id = ?`).bind(orderId).first<{ ship_by: string | null }>();
+  const orderRow = await db
+    .prepare(`SELECT ship_by, amazon_order_status FROM orders WHERE id = ?`)
+    .bind(orderId)
+    .first<{ ship_by: string | null; amazon_order_status: string | null }>();
+  if (orderRow?.amazon_order_status === 'Pending') {
+    return { reserved: false, taskCount: 0, stillPending: true };
+  }
   if (orderRow && !isDueForPickingToday(orderRow.ship_by)) {
     return { reserved: false, taskCount: 0, notDueYet: true };
   }

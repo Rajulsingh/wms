@@ -30,6 +30,15 @@ export interface SyncResult {
  * (see EASYSHIP_NOT_YET_COLLECTED, amazon.ts), the box is still physically
  * with the seller, so the order is left exactly as our own floor-progress
  * tracking has it, "Shipped" or not.
+ *
+ * Also keeps `orders.amazon_order_status` current on every order checked
+ * (not just ones going shipped/cancelled) — a user request (see HANDOFF.md):
+ * `reserveOrderForPicking` holds a "Pending" order out of the pick list even
+ * on its ship-by day, since Amazon could still cancel it before ever
+ * confirming it. This runs right before `retryBlockedOrders` in the same
+ * cron cycle (see sync-job.ts), so an order that just flipped from Pending
+ * to Unshipped/PartiallyShipped here becomes reservable in the very same
+ * pass, with no separate scheduler needed.
  */
 export async function syncOrderStatuses(db: D1Database, warehouseId: string): Promise<SyncResult> {
   const unresolved = await db
@@ -48,6 +57,8 @@ export async function syncOrderStatuses(db: D1Database, warehouseId: string): Pr
   for (const order of unresolved.results) {
     const amazonStatus = statuses.get(order.external_order_id);
     if (!amazonStatus) continue;
+    await db.prepare(`UPDATE orders SET amazon_order_status = ? WHERE id = ?`).bind(amazonStatus.orderStatus, order.id).run();
+
     const stillWithSeller = amazonStatus.easyShipShipmentStatus && EASYSHIP_NOT_YET_COLLECTED.has(amazonStatus.easyShipShipmentStatus);
 
     if (amazonStatus.orderStatus === 'Shipped' && !stillWithSeller) {

@@ -1664,6 +1664,41 @@ Found three separate, real bugs, all connected to Easy Ship:
   against live Amazon data: `407-0684687-0239548` was the only false positive: every other order was
   genuinely shipped.
 
+**Pending orders held out of the pick list until Amazon confirms them.** Follow-on the same day:
+user reported `404-6655591-3241911`, "Pending" in Seller Central, was already in the pick list
+instead of "Upcoming." Checked live against Amazon before changing anything — its `LatestShipDate`
+genuinely *is* today (IST), so it correctly passed the same-day gate above; this surfaced a real,
+separate policy question the previous same-day fix didn't cover: should a same-day order that Amazon
+hasn't confirmed yet (still "Pending" — payment/address/fraud check not done, could still be
+cancelled before ever being confirmed) get reserved and picked anyway? An earlier pass had
+deliberately decided yes ("Amazon is still the source of truth... reserveOrderForPicking handles a
+Pending order the same as any other" — see fetchUnfulfilledOrders's docs). Asked the user directly
+rather than silently reversing that earlier decision; they chose to hold it back now.
+- New `orders.amazon_order_status` column (`migrations/0022_orders_amazon_status.sql`) — Amazon's own
+  OrderStatus, tracked separately from this app's own pipeline `status` column (which starts
+  `'pending'` regardless of Amazon's confirmation state). Populated at import (`order.orderStatus`,
+  previously fetched but never stored) and kept current by `syncOrderStatuses` on every poll for
+  every order checked, not just ones going shipped/cancelled.
+- `reserveOrderForPicking` now also refuses to reserve while `amazon_order_status === 'Pending'`,
+  regardless of ship-by date — same silent-no-`reason` pattern as `notDueYet` (new `stillPending`
+  flag) so it doesn't pollute `shortOrders` blocked-order messaging. Self-resolves through the exact
+  same existing machinery as the date gate: `syncOrderStatuses` runs immediately before
+  `retryBlockedOrders` in every cron cycle (sync-job.ts), so the moment Amazon confirms an order
+  (Pending → Unshipped/PartiallyShipped) it becomes reservable in that same pass.
+- Verified live end-to-end in local dev (a real second Pending order wasn't available to test against
+  — only one existed, and it was `404-6655591-3241911` itself, already mid-pick in production and
+  deliberately left untouched rather than risk disrupting in-progress floor work sight-unseen):
+  built a controlled test order with `amazon_order_status = 'Pending'` and today's `ship_by` —
+  `reserveOrderForPicking` correctly returned `stillPending: true` with zero pick_tasks; flipping it
+  to `'Unshipped'` and re-calling reserved it normally (`batched`, 1 pick_task). Test data removed
+  after.
+- **Known follow-up, deliberately not done automatically**: `404-6655591-3241911` itself is still
+  batched in production from before this fix (pick_batch status `'in_progress'` — a picker may
+  already be actively working it). This fix only prevents it from happening to new orders going
+  forward; nothing here retroactively un-reserves or pulls back an order already mid-pick, since
+  there's no way to know from the data alone whether it's already been physically picked. Flagged to
+  the user rather than auto-corrected.
+
 ## Next steps — a prioritized plan
 
 Rewritten 2026-09-20 (twenty-one passes across two days — see "Recently done" entries above for the
