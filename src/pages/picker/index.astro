@@ -3,12 +3,20 @@ import Base from '../../layouts/Base.astro';
 import TopBar from '../../components/TopBar.astro';
 import { getDb } from '../../lib/db';
 import { getCurrentUser, toClientUser } from '../../lib/auth';
+import { getMyBatches } from '../../lib/picker';
 
 // Resolved server-side — see toClientUser in lib/auth.ts.
 const db = getDb();
 const user = await getCurrentUser(Astro, db);
 if (!user) return Astro.redirect('/login');
 const serverUser = toClientUser(user);
+
+// Same query the client's boot() used to make over the wire via
+// POST /api/picker/claim-batch, run here instead so the first paint already
+// has real batches — see HANDOFF.md's "tab switch is a full MPA nav" entry.
+// getMyBatches is safe to call repeatedly (the client's own 8s poll already
+// does), so calling it once more here isn't a new side effect.
+const initialBatches = user.role === 'packer' && user.warehouse_id ? await getMyBatches(db, user.warehouse_id, user.id) : null;
 ---
 
 <Base title="Pick list">
@@ -25,8 +33,9 @@ const serverUser = toClientUser(user);
     </div>
   </div>
 
-  <script define:vars={{ serverUser }}>
+  <script define:vars={{ serverUser, initialBatches }}>
     window.__serverUser = serverUser;
+    window.__initialBatches = initialBatches;
   </script>
   <script>
     import { escapeHtml, qtyStepperHtml, wireQtySteppers } from '../../lib/ui';
@@ -110,8 +119,8 @@ const serverUser = toClientUser(user);
       warehouseId = user.warehouseId;
       pollWorkBadge();
 
-      const claimed = await api('/api/picker/claim-batch', { warehouseId });
-      batchList = claimed.batches ?? [];
+      const initial = (window as any).__initialBatches;
+      batchList = initial ?? (await api('/api/picker/claim-batch', { warehouseId })).batches ?? [];
       // A reload resumes past the gate whenever there's real evidence a
       // human already got past it — either rows already picked/short/
       // damaged (mid-walk), or the batch itself is already 'in_progress'

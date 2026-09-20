@@ -1832,6 +1832,41 @@ was left as-is (still cancelled, its exception still open) — this only fixes t
 specific order's state, since the cancellation-after-picking exception flow is intentional and the
 physical putback still needs a human.
 
+## Recently done (2026-09-21) — tab switching (Pick/Pack/Scan/Today) still felt slow after the auth fix
+
+Follow-up to the previous session's auth-round-trip fix. User report: switching tabs still felt
+slow. `wrangler tail` against production again showed nothing wrong server-side (every real
+request, including work-summary/dashboard/admin-orders polling, well under 50ms). The remaining
+cause was the same shape of bug as the auth one, just for each page's actual content instead of
+the user object: `/picker`, `/packer`, `/packer/scan`, `/packer/home`, and `/dashboard` are real
+MPA navigations (`<a href>`, full page reload, not client-side routed) — the auth fix removed one
+round trip from in front of that, but each page's `boot()` still did its own client-side `fetch()`
+for its real data (batches, pack state, scan status, dashboard numbers) *after* the new page had
+already loaded and rendered `<p>Loading…</p>`. On a real mobile connection that's a second
+sequential round trip stacked on top of the navigation itself, every single tab switch.
+Fix: same `define:vars` pattern as the auth fix, extended to each page's primary data load —
+called directly in Astro frontmatter (same request that already resolves the user) instead of
+over the wire after the page mounts:
+- `picker/index.astro` → `getMyBatches` (mirrors `POST /api/picker/claim-batch`)
+- `packer/index.astro` → `getMyPackBatches` (mirrors `POST /api/packer/start-session`)
+- `packer/scan.astro` → `getPendingLabels` + `getTodayScans` (mirrors `GET /api/packer/scan-status`)
+- `packer/home.astro` → `getMyActiveBatches`/`getPickListView`/`getUnbatchedOrderSummary`/
+  `getPackerDailySummary`/`getUnassignedSkuDemand` (mirrors `GET /api/packer/dashboard` +
+  `GET /api/picker/sku-demand`)
+- `dashboard.astro` → `getTodaySummary` (mirrors `GET /api/dashboard/today`)
+Each page's client script now seeds its state from `window.__initial*` when present and only falls
+back to the original `fetch()` if it's missing, so the existing polling/refresh logic (8s/10s/15s
+intervals) is completely unchanged — this only removes the *first* fetch, the one blocking initial
+paint. The batch-claiming functions (`getMyBatches`/`getMyPackBatches`) are safe to call here since
+they're the exact same idempotent "claim what's available" sweep the client's own poll already
+calls repeatedly — calling it once more during SSR isn't a new side effect.
+Verified live in local dev (logged in as the seed `packer` user — local DB's PIN for it is `1234`,
+not the `scripts/seed.sql` comment's `1111`, evidently reset during an earlier session): navigated
+to all 5 pages, confirmed `window.__initial*` populated with real data and
+`performance.getEntriesByType('resource')` showed zero `/api/*` calls on first paint for any of
+them, screenshots confirmed real content rendered immediately (no visible "Loading…" flash).
+Deployed (Version ID `e6add544-463b-41bf-bc65-44e497fcc266`).
+
 ## Next steps — a prioritized plan
 
 Rewritten 2026-09-20 (twenty-one passes across two days — see "Recently done" entries above for the

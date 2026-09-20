@@ -3,6 +3,9 @@ import Base from '../../layouts/Base.astro';
 import TopBar from '../../components/TopBar.astro';
 import { getDb } from '../../lib/db';
 import { getCurrentUser, toClientUser } from '../../lib/auth';
+import { getMyActiveBatches, getPickListView, getUnassignedSkuDemand } from '../../lib/picker';
+import { getUnbatchedOrderSummary } from '../../lib/orders';
+import { getPackerDailySummary } from '../../lib/packer';
 
 // Resolved server-side now instead of the client fetching /api/auth/me after
 // the page loads — see toClientUser in lib/auth.ts for why. Not logged in
@@ -11,6 +14,34 @@ const db = getDb();
 const user = await getCurrentUser(Astro, db);
 if (!user) return Astro.redirect('/login');
 const serverUser = toClientUser(user);
+
+// Same idea, one step further: this page's own boot() used to always fetch
+// /api/packer/dashboard + /api/picker/sku-demand after the page loaded,
+// leaving "Loading…" on screen for a full extra round trip on every tab
+// switch (found live: full-page nav between Pick/Pack/Scan/Today is a real
+// MPA navigation, not a client-side route change, so that round trip stacks
+// on top of the navigation itself). Mirroring the exact queries
+// /api/packer/dashboard and /api/picker/sku-demand run, so the first paint
+// already has real content — the client script still re-fetches on its own
+// poll interval for anything that changes after load.
+let initialData: { myBatches: unknown[]; unbatched: unknown; today: unknown; demand: unknown } | null = null;
+if (user.role === 'packer' && user.warehouse_id) {
+  const myBatchIds = await getMyActiveBatches(db, user.warehouse_id, user.id);
+  const myBatches = [];
+  for (const batchId of myBatchIds) {
+    const rows = await getPickListView(db, batchId);
+    myBatches.push({
+      batchId,
+      orderCount: new Set(rows.map((r) => r.external_order_id)).size,
+      skuCount: new Set(rows.map((r) => r.sku_code)).size,
+      remaining: rows.filter((r) => r.status === 'pending').length
+    });
+  }
+  const unbatched = await getUnbatchedOrderSummary(db, user.warehouse_id);
+  const today = await getPackerDailySummary(db, user.warehouse_id, user.id);
+  const demand = await getUnassignedSkuDemand(db, user.warehouse_id);
+  initialData = { myBatches, unbatched, today, demand };
+}
 ---
 
 <Base title="Dashboard">
@@ -27,8 +58,9 @@ const serverUser = toClientUser(user);
     </div>
   </div>
 
-  <script define:vars={{ serverUser }}>
+  <script define:vars={{ serverUser, initialData }}>
     window.__serverUser = serverUser;
+    window.__initialData = initialData;
   </script>
   <script>
     import { escapeHtml, withLoading } from '../../lib/ui';
@@ -99,10 +131,15 @@ const serverUser = toClientUser(user);
         app.innerHTML = `<p>This account is a "${user.role}" — the packer dashboard needs a packer login.</p>`;
         return;
       }
-      warehouseId = user.warehouseId;
+      warehouseId = user.warehouse_id;
       pollWorkBadge();
 
-      await load();
+      const initial = (window as any).__initialData;
+      if (initial) {
+        render(initial.myBatches ?? [], initial.demand ?? [], initial.unbatched ?? null, initial.today ?? null);
+      } else {
+        await load();
+      }
       setInterval(() => {
         if (!document.hidden) load();
       }, 15000);

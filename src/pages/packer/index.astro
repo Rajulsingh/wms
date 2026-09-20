@@ -3,12 +3,22 @@ import Base from '../../layouts/Base.astro';
 import TopBar from '../../components/TopBar.astro';
 import { getDb } from '../../lib/db';
 import { getCurrentUser, toClientUser } from '../../lib/auth';
+import { getMyPackBatches } from '../../lib/packer';
 
 // Resolved server-side — see toClientUser in lib/auth.ts.
 const db = getDb();
 const user = await getCurrentUser(Astro, db);
 if (!user) return Astro.redirect('/login');
 const serverUser = toClientUser(user);
+
+// Same query the client's boot()/startSession() used to make over the wire
+// via POST /api/packer/start-session, run here instead so the first paint
+// already has real batches — see HANDOFF.md's "tab switch is a full MPA
+// nav" entry. getMyPackBatches is safe to call repeatedly (the client's own
+// 8s poll already does), so calling it once more here isn't a new side
+// effect. Skipped when there's no station — the client shows a different
+// "no station assigned" message for that case and never calls this either.
+const initialBatches = user.role === 'packer' && user.station_id ? (await getMyPackBatches(db, user.id, user.station_id, user.warehouse_id ?? '')).batches : null;
 ---
 
 <Base title="Packer">
@@ -24,8 +34,9 @@ const serverUser = toClientUser(user);
     </div>
   </div>
 
-  <script define:vars={{ serverUser }}>
+  <script define:vars={{ serverUser, initialBatches }}>
     window.__serverUser = serverUser;
+    window.__initialBatches = initialBatches;
   </script>
   <script>
     import { withLoading, escapeHtml, qtyStepperHtml, wireQtySteppers } from '../../lib/ui';
@@ -130,7 +141,14 @@ const serverUser = toClientUser(user);
           </div>`;
         return;
       }
-      await startSession();
+      const initial = (window as any).__initialBatches;
+      if (initial) {
+        batchList = initial.map(toEntry);
+        render();
+        pollTimer = setInterval(pollForMore, 8000);
+      } else {
+        await startSession();
+      }
     }
 
     function toEntry(pack: PackBatchState): BatchEntry {

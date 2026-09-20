@@ -3,6 +3,7 @@ import Base from '../layouts/Base.astro';
 import TopBar from '../components/TopBar.astro';
 import { getDb } from '../lib/db';
 import { getCurrentUser, toClientUser } from '../lib/auth';
+import { getTodaySummary } from '../lib/dashboard';
 
 // Resolved server-side — see toClientUser in lib/auth.ts. No role
 // restriction here (every role can see this page), so unlike the other
@@ -11,6 +12,11 @@ const db = getDb();
 const user = await getCurrentUser(Astro, db);
 if (!user) return Astro.redirect('/login');
 const serverUser = toClientUser(user);
+
+// Same query the client's boot()/load() used to make over the wire via
+// GET /api/dashboard/today, run here instead so the first paint already has
+// real numbers — see HANDOFF.md's "tab switch is a full MPA nav" entry.
+const initialSummary = user.warehouse_id ? await getTodaySummary(db, user.warehouse_id) : null;
 ---
 
 <Base title="Today">
@@ -26,8 +32,9 @@ const serverUser = toClientUser(user);
     </div>
   </div>
 
-  <script define:vars={{ serverUser }}>
+  <script define:vars={{ serverUser, initialSummary }}>
     window.__serverUser = serverUser;
+    window.__initialSummary = initialSummary;
   </script>
   <script>
     interface TodaySummary {
@@ -136,7 +143,9 @@ const serverUser = toClientUser(user);
       const user = (window as any).__serverUser;
       warehouseId = user.warehouseId;
       isAdmin = user.role === 'admin';
-      await load();
+      const initial = (window as any).__initialSummary;
+      if (initial) render(initial);
+      else await load();
       setInterval(() => {
         if (!document.hidden) load();
       }, 15000);

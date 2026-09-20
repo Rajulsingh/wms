@@ -3,12 +3,21 @@ import Base from '../../layouts/Base.astro';
 import TopBar from '../../components/TopBar.astro';
 import { getDb } from '../../lib/db';
 import { getCurrentUser, toClientUser } from '../../lib/auth';
+import { getPendingLabels, getTodayScans } from '../../lib/packer';
 
 // Resolved server-side — see toClientUser in lib/auth.ts.
 const db = getDb();
 const user = await getCurrentUser(Astro, db);
 if (!user) return Astro.redirect('/login');
 const serverUser = toClientUser(user);
+
+// Same queries the client's boot()/refresh() used to make over the wire via
+// GET /api/packer/scan-status, run here instead so the first paint already
+// has real content — see HANDOFF.md's "tab switch is a full MPA nav" entry.
+const initialStatus =
+  user.role === 'packer' && user.warehouse_id
+    ? { pending: await getPendingLabels(db, user.warehouse_id), todayScans: await getTodayScans(db, user.warehouse_id) }
+    : null;
 ---
 
 <Base title="Scan">
@@ -24,8 +33,9 @@ const serverUser = toClientUser(user);
     </div>
   </div>
 
-  <script define:vars={{ serverUser }}>
+  <script define:vars={{ serverUser, initialStatus }}>
     window.__serverUser = serverUser;
+    window.__initialStatus = initialStatus;
   </script>
   <script>
     import { startContinuousScan, stopScanning } from '../../lib/scanner-client';
@@ -88,7 +98,13 @@ const serverUser = toClientUser(user);
       }
       warehouseId = user.warehouseId;
       pollWorkBadge();
-      await refresh();
+      const initial = (window as any).__initialStatus;
+      if (initial) {
+        pending = initial.pending ?? [];
+        scans = initial.todayScans ?? [];
+      } else {
+        await refresh();
+      }
       renderFull();
       // Keeps "waiting" and the table current even while not actively
       // scanning — another packer's scans, or freshly finished packing,
