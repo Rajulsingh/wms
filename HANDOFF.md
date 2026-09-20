@@ -1808,6 +1808,30 @@ stacked in front of every page's actual content, on every single navigation.
   (`performance.getEntriesByType('resource')` confirmed empty for all of them post-fix), and the
   wrong-role message still renders correctly for an admin session on `/packer/home`.
 
+## Recently done (2026-09-21) — a cancelled-but-already-packed order kept showing as ready to ship
+
+User report: order `404-6655591-3241911` showed `status: 'cancelled'` (Amazon cancelled it,
+confirmed live: `amazon_order_status: 'Canceled'`) but was still showing up in the packer page's
+packed section. Root cause: `cancelOrderFromSync` (amazon-sync.ts) *deliberately* leaves an
+already-packed order's `pack_sessions` row and `order_items` alone when Amazon cancels it — no way
+to know which physical unit is where, so it logs an `order_cancelled` exception for a human to do
+the putback instead of silently touching inventory (this part is correct and unchanged). But two
+packer-facing queries in `packer.ts` only checked `pack_sessions.status`, never `orders.status`, so
+a cancelled order stayed indistinguishable from a normal completed pack:
+- `getPendingLabels` (the "waiting to be scanned" list on `/packer/scan`) — this was the actually
+  dangerous one: this specific order had `pack_sessions.status = 'completed'` and no `packages` row
+  yet (verified live via D1), meaning it was sitting there ready for a packer to scan an AWB and
+  ship it — a cancelled order Amazon no longer wants shipped.
+- `getPackerDailySummary` (the "Today — what you've packed" list on `/packer/home`) — same missing
+  check, cosmetic by comparison but still contradicted the order's own cancelled status shown
+  elsewhere (e.g. admin orders page).
+Fix: both queries now add `AND o.status != 'cancelled'`. Verified live against production D1: the
+exact same query with the added filter returns zero rows for this order (previously returned one).
+Deployed (Version ID `7124485e-95cc-4477-bc50-479b4e7250ac`). Order `404-6655591-3241911` itself
+was left as-is (still cancelled, its exception still open) — this only fixes the query, not that
+specific order's state, since the cancellation-after-picking exception flow is intentional and the
+physical putback still needs a human.
+
 ## Next steps — a prioritized plan
 
 Rewritten 2026-09-20 (twenty-one passes across two days — see "Recently done" entries above for the

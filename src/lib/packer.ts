@@ -330,6 +330,15 @@ export interface PendingLabelOrder {
  * labeled" = no `packages` row references this pack_session yet, which is
  * exactly what a scan sets the moment it's applied, whether linking a
  * pre-purchased label or creating a fresh one.
+ *
+ * Excludes `o.status = 'cancelled'` — amazon-sync.ts's cancelOrderFromSync
+ * deliberately leaves an already-packed order's pack_session/items alone
+ * (see its docstring: no way to know which physical unit is where, so it
+ * logs an exception for a human instead of touching inventory). Without
+ * this filter, a box Amazon cancelled after packing but before scanning
+ * would still show up here as ready to label and ship — a real shipping
+ * risk, not just a display glitch (found live: order 404-6655591-3241911
+ * showed cancelled but still appeared packed/ready in the packer UI).
  */
 export async function getPendingLabels(db: D1Database, warehouseId: string): Promise<PendingLabelOrder[]> {
   const rows = await db
@@ -341,7 +350,7 @@ export async function getPendingLabels(db: D1Database, warehouseId: string): Pro
               (SELECT COALESCE(SUM(oi.quantity_packed), 0) FROM order_items oi WHERE oi.order_id = ps.order_id) AS unit_count
        FROM pack_sessions ps
        JOIN orders o ON o.id = ps.order_id
-       WHERE o.warehouse_id = ? AND ps.status IN ('completed', 'partial')
+       WHERE o.warehouse_id = ? AND ps.status IN ('completed', 'partial') AND o.status != 'cancelled'
          AND NOT EXISTS (SELECT 1 FROM packages p WHERE p.pack_session_id = ps.id)
        ORDER BY ps.completed_at ASC`
     )
@@ -395,6 +404,13 @@ export interface PackerDailySummary {
  * there was reading several million rows/day off a growing table). This
  * endpoint is polled every 15s by every packer's dashboard, so keeping it
  * indexable matters here too even though pack_sessions is small today.
+ *
+ * Excludes `o.status = 'cancelled'` — same reasoning as getPendingLabels
+ * above: Amazon can cancel an order after it's already been packed, and
+ * cancelOrderFromSync (amazon-sync.ts) deliberately doesn't touch the
+ * pack_session for that. Without this filter a cancelled order kept
+ * showing here as if it were a normal completed pack, contradicting its
+ * own "cancelled" status shown elsewhere (found live: 404-6655591-3241911).
  */
 export async function getPackerDailySummary(db: D1Database, warehouseId: string, packerId: string): Promise<PackerDailySummary> {
   const rows = await db
@@ -403,7 +419,7 @@ export async function getPackerDailySummary(db: D1Database, warehouseId: string,
               (SELECT COALESCE(SUM(oi.quantity_packed), 0) FROM order_items oi WHERE oi.order_id = ps.order_id) AS units_packed,
               (SELECT sk.image_url FROM order_items oi JOIN skus sk ON sk.id = oi.sku_id WHERE oi.order_id = ps.order_id ORDER BY oi.id LIMIT 1) AS image_url
        FROM pack_sessions ps JOIN orders o ON o.id = ps.order_id
-       WHERE ps.packer_id = ? AND o.warehouse_id = ? AND ps.status IN ('completed', 'partial')
+       WHERE ps.packer_id = ? AND o.warehouse_id = ? AND ps.status IN ('completed', 'partial') AND o.status != 'cancelled'
          AND ps.completed_at >= date('now') AND ps.completed_at < date('now', '+1 day')
        ORDER BY ps.completed_at DESC`
     )
