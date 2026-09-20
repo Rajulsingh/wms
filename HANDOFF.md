@@ -1585,6 +1585,36 @@ a shorter list — they chose combining.
   still very much alive, called from `assignSkusToPacker` (pick-assign.astro's "Assign by SKU" bulk
   flow), which is the real, still-used tool for routing not-yet-claimed work to a specific packer.
 
+**AWB scanning matched against real data instead of blind FIFO.** User reported the actual real-world
+consequence of the nineteenth pass's deliberate FIFO-only design (see that entry above): "whatever
+AWB is scanned matches to whatever order is at [the front of the queue] and not to its real order
+ID." Investigated whether the system already has any way to know an AWB's *real* order rather than
+guessing, before proposing anything — it does: `purchaseLabelForOrder` and
+`scheduleEasyShipForOrder`/`scheduleEasyShipBulk` (shipping.ts) already insert the real,
+Amazon-assigned tracking id into `awbs` (linked to that exact order's shipment) the moment a label is
+purchased/scheduled — well before packing, let alone scanning. `applyAwbByScan` just wasn't using
+that as its primary lookup; it went FIFO-first and only checked for a pre-existing package *after*
+already committing to the FIFO-selected order, and a blanket `SELECT id FROM awbs WHERE awb_code = ?`
+dupe check ahead of that meant scanning a real pre-purchased label's own code for the *first* time
+would likely have hit "already scanned for another order" — a probable existing bug, never exercised
+because FIFO had already claimed a different order by the time that check ran.
+- `applyAwbByScan` now looks the scanned code up in `awbs`/`shipments`/`packages` *first*. If it
+  matches a package still `pack_session_id IS NULL` (purchased/scheduled but never yet resolved by a
+  scan), it resolves straight to that package's real order — regardless of FIFO position — then
+  checks whether *that* order has actually finished packing (an entry in `getPendingLabels`); if not,
+  a specific error naming the real order tells the packer to pack it first rather than silently
+  matching something else. `pack_session_id IS NOT NULL` means this exact code already went through
+  this resolution once — a genuine duplicate, not confused with a fresh pre-purchased label. A code
+  with no `awbs` record at all (manual/external courier label, no Amazon-side data to look up) still
+  falls back to plain FIFO exactly as before — this doesn't reintroduce the pre-select-and-compare
+  verification step the nineteenth pass deliberately removed; it's a lookup against data the system
+  already has, not a "does it match what we expected" check.
+- Verified live: built a two-order scenario (order-1 older/FIFO-head with no pre-purchased label,
+  order-2 newer with a fake pre-registered AWB `TEST-AWB-REAL-001`). Scanning that code resolved to
+  order-2 (the real match), not order-1 (the FIFO head) — order-1's `packages` stayed untouched.
+  Re-scanning the same code correctly hit `duplicate_awb`. Scanning an unrecognized code
+  (`MANUAL-COURIER-CODE-999`) correctly fell back to FIFO and landed on order-1.
+
 ## Next steps — a prioritized plan
 
 Rewritten 2026-09-20 (twenty-one passes across two days — see "Recently done" entries above for the

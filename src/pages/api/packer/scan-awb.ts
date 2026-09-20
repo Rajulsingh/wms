@@ -3,8 +3,8 @@ import { getDb } from '../../../lib/db';
 import { requireUser, AuthError } from '../../../lib/auth';
 import { applyAwbByScan, PackerFlowError } from '../../../lib/packer';
 
-// Pure record-keeping, FIFO-matched — see applyAwbByScan in lib/packer.ts
-// for why there's no order pre-selection or code-matching verification here.
+// Matched against Amazon's own known AWB-to-order data first, FIFO only as a
+// fallback — see applyAwbByScan in lib/packer.ts.
 export const POST: APIRoute = async (context) => {
   const db = getDb();
   try {

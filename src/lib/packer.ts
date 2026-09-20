@@ -435,55 +435,72 @@ export interface ScanResult extends AwbResult {
 }
 
 /**
- * Pure record-keeping, matched by FIFO — not verification. The scanned code
- * is applied to whichever order has been sitting in the pending-label pool
- * the longest (`getPendingLabels`, warehouse-wide), no matter what the code
- * actually is; the scan itself *is* the record that a box got labeled and
- * is going out. There's deliberately no "does this code match what we
- * expected" check — see HANDOFF.md for why (this used to require a packer
- * to pre-select which specific order they were scanning, which made no
- * sense as a floor workflow).
- *
- * One exception, not a verification step: if admin already purchased a real
- * Amazon shipping label for the FIFO-matched order before packing (a
- * `packages` row already exists for it with `pack_session_id` still NULL —
- * see the "admin picks box size" flow), the scan links to *that* existing
- * row instead of creating a second one, so the real purchased label doesn't
- * end up orphaned. This is a lookup by order id, not by comparing codes.
+ * Matched by real AWB data first, FIFO only as a fallback. Amazon (both
+ * `purchaseLabelForOrder` and `scheduleEasyShipForOrder`/`scheduleEasyShipBulk`
+ * in shipping.ts) already tells this system exactly which order a tracking
+ * id/AWB belongs to the moment a label is purchased or scheduled — well
+ * before anyone packs the box, let alone scans it — and inserts that code
+ * into `awbs` right then. A packer's later physical scan of the exact same
+ * code printed on that label is therefore not a guess: this looks the code
+ * up first, and if Amazon already told us its real order, that's what it's
+ * applied to, regardless of which order happens to be oldest in the pending
+ * pool. FIFO (`getPendingLabels`, warehouse-wide — any packer's completed
+ * order) only kicks in for a code this system has no other way to identify
+ * (a manual/external courier label with no Amazon-side record) — same
+ * "just for record keeping" behavior as before for that case. See
+ * `applyAwb(packSessionId, awbCode)`, the older pre-select-and-compare flow
+ * this replaced (HANDOFF.md) — that verification step is intentionally not
+ * coming back; this is a real lookup against data the system already has,
+ * not a re-introduced "does it match what we expected" check.
  */
 export async function applyAwbByScan(db: D1Database, userId: string, warehouseId: string, awbCode: string): Promise<ScanResult> {
-  const pending = await getPendingLabels(db, warehouseId);
-  const next = pending[0];
-  if (!next) throw new PackerFlowError('nothing_pending', 'Nothing is waiting to be scanned right now.');
+  // A package's pack_session_id is NULL only between the moment a label is
+  // purchased/scheduled and the moment some scan (this function, on a first
+  // or later call) resolves it — a reliable "known, real link, not yet
+  // confirmed on the floor" signal. Non-NULL means this exact code already
+  // went through this resolution once before — a genuine duplicate, not a
+  // pre-purchased label waiting for its first scan.
+  const known = await db
+    .prepare(
+      `SELECT p.id as package_id, p.order_id, p.pack_session_id, s.id as shipment_id
+       FROM awbs a JOIN shipments s ON s.id = a.shipment_id JOIN packages p ON p.id = s.package_id
+       WHERE a.awb_code = ?`
+    )
+    .bind(awbCode)
+    .first<{ package_id: string; order_id: string; pack_session_id: string | null; shipment_id: string }>();
 
-  const dupe = await db.prepare(`SELECT id FROM awbs WHERE awb_code = ?`).bind(awbCode).first<{ id: string }>();
-  if (dupe) {
-    await logException(db, { type: 'duplicate_awb', orderId: next.orderId, userId, notes: `AWB ${awbCode} already applied to another package` });
+  if (known && known.pack_session_id !== null) {
+    await logException(db, { type: 'duplicate_awb', orderId: known.order_id, userId, notes: `AWB ${awbCode} already applied to another order` });
     throw new PackerFlowError('duplicate_awb', 'This AWB has already been scanned for another order.');
   }
 
-  const existing = await db
-    .prepare(
-      `SELECT p.id as package_id, s.id as shipment_id
-       FROM packages p JOIN shipments s ON s.package_id = p.id
-       WHERE p.order_id = ? AND p.pack_session_id IS NULL
-       ORDER BY p.created_at DESC LIMIT 1`
-    )
-    .bind(next.orderId)
-    .first<{ package_id: string; shipment_id: string }>();
+  const pending = await getPendingLabels(db, warehouseId);
+
+  let target: PendingLabelOrder | undefined;
+  if (known) {
+    // This code is definitively for known.order_id — find its own entry in
+    // the pending pool rather than trusting FIFO position at all.
+    target = pending.find((p) => p.orderId === known.order_id);
+    if (!target) {
+      const order = await db.prepare(`SELECT external_order_id FROM orders WHERE id = ?`).bind(known.order_id).first<{ external_order_id: string }>();
+      throw new PackerFlowError(
+        'not_ready',
+        `This AWB belongs to order ${order?.external_order_id ?? known.order_id}, but it hasn't finished packing yet — pack it first, then scan.`
+      );
+    }
+  } else {
+    target = pending[0];
+  }
+  if (!target) throw new PackerFlowError('nothing_pending', 'Nothing is waiting to be scanned right now.');
 
   let shipmentId: string;
-  if (existing) {
-    await db.prepare(`UPDATE packages SET pack_session_id = ?, status = 'labeled' WHERE id = ?`).bind(next.packSessionId, existing.package_id).run();
-    await db.prepare(`UPDATE shipments SET status = 'ready_to_ship' WHERE id = ?`).bind(existing.shipment_id).run();
-    await db
-      .prepare(`INSERT INTO awbs (id, shipment_id, awb_code, scanned_at, verified) VALUES (?, ?, ?, datetime('now'), 1)`)
-      .bind(newId(), existing.shipment_id, awbCode)
-      .run();
-    shipmentId = existing.shipment_id;
+  if (known) {
+    await db.prepare(`UPDATE packages SET pack_session_id = ?, status = 'labeled' WHERE id = ?`).bind(target.packSessionId, known.package_id).run();
+    await db.prepare(`UPDATE shipments SET status = 'ready_to_ship' WHERE id = ?`).bind(known.shipment_id).run();
+    shipmentId = known.shipment_id;
   } else {
     const packageId = newId();
-    await db.prepare(`INSERT INTO packages (id, order_id, pack_session_id, status) VALUES (?, ?, ?, 'labeled')`).bind(packageId, next.orderId, next.packSessionId).run();
+    await db.prepare(`INSERT INTO packages (id, order_id, pack_session_id, status) VALUES (?, ?, ?, 'labeled')`).bind(packageId, target.orderId, target.packSessionId).run();
     shipmentId = newId();
     await db.prepare(`INSERT INTO shipments (id, package_id, status) VALUES (?, ?, 'ready_to_ship')`).bind(shipmentId, packageId).run();
     await db
@@ -492,14 +509,14 @@ export async function applyAwbByScan(db: D1Database, userId: string, warehouseId
       .run();
   }
 
-  await db.prepare(`UPDATE orders SET status = 'ready_to_ship' WHERE id = ? AND status IN ('packed', 'partial')`).bind(next.orderId).run();
+  await db.prepare(`UPDATE orders SET status = 'ready_to_ship' WHERE id = ? AND status IN ('packed', 'partial')`).bind(target.orderId).run();
   await db
     .prepare(`INSERT INTO awb_scans (id, warehouse_id, awb_code, order_id, shipment_id, scanned_by) VALUES (?, ?, ?, ?, ?, ?)`)
-    .bind(newId(), warehouseId, awbCode, next.orderId, shipmentId, userId)
+    .bind(newId(), warehouseId, awbCode, target.orderId, shipmentId, userId)
     .run();
-  await logAudit(db, { userId, action: 'scan.awb', entityType: 'shipment', entityId: shipmentId, metadata: { awbCode, orderId: next.orderId, prePurchased: !!existing } });
+  await logAudit(db, { userId, action: 'scan.awb', entityType: 'shipment', entityId: shipmentId, metadata: { awbCode, orderId: target.orderId, prePurchased: !!known } });
 
-  return { shipmentId, awbCode, orderId: next.orderId, externalOrderId: next.externalOrderId, skuSummary: next.skuSummary, unitCount: next.unitCount };
+  return { shipmentId, awbCode, orderId: target.orderId, externalOrderId: target.externalOrderId, skuSummary: target.skuSummary, unitCount: target.unitCount };
 }
 
 export interface ScanLogRow {
