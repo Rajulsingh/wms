@@ -111,6 +111,13 @@ export interface AmazonOrder {
   orderStatus: string;
   fulfillmentChannel: 'MFN' | 'AFN';
   earliestShipDate?: string;
+  // The real "must ship by" deadline — orders.ts stores this as `ship_by`
+  // (falling back to earliestShipDate only if Amazon didn't send this one).
+  // Confirmed against a real order (see HANDOFF.md) that earliestShipDate is
+  // NOT the same thing despite the column's name having been populated from
+  // it previously — for a same-day ship window they can coincide, but
+  // earliestShipDate is when Amazon first allows shipping, not the deadline.
+  latestShipDate?: string;
   buyerName?: string;
   shippingAddress?: string;
   items: AmazonOrderItem[];
@@ -131,40 +138,80 @@ export async function fetchUnfulfilledOrders(since: Date): Promise<AmazonOrder[]
   const env = getEnv();
   const accessToken = await getAccessToken(env);
   const isSandbox = env.AMAZON_SPAPI_SANDBOX === 'true';
-  const url = new URL(`${baseUrl(env)}/orders/v0/orders`);
-  url.searchParams.set('MarketplaceIds', env.AMAZON_MARKETPLACE_ID);
 
-  if (isSandbox) {
-    url.searchParams.set('CreatedAfter', 'TEST_CASE_200');
-  } else {
-    url.searchParams.set('LastUpdatedAfter', since.toISOString());
-    url.searchParams.set('FulfillmentChannels', 'MFN');
-    // Pending included alongside Unshipped/PartiallyShipped — an order can
-    // sit as Pending overnight (payment/COD confirmation) and be released
-    // for fulfillment by morning; excluding it meant it never entered our
-    // system at all until its status happened to flip before the next sync,
-    // which isn't guaranteed. Amazon is still the source of truth for
-    // whether it's actually ready — reserveOrderForPicking (orders.ts)
-    // handles a Pending order the same as any other; if Amazon later
-    // cancels it, syncOrderStatuses (amazon-sync.ts) catches that.
-    url.searchParams.set('OrderStatuses', 'Pending,Unshipped,PartiallyShipped');
-  }
+  // Paginated — a real gap found while investigating orders going missing
+  // from sync entirely (see HANDOFF.md): this used to fetch exactly one page
+  // (Amazon defaults to ~100 orders/page) and silently dropped everything
+  // past it, with no error and no sign anything was missing. An account with
+  // more than a page's worth of matching orders in the lookback window (easy
+  // to hit — includes Pending/Unshipped/PartiallyShipped/Shipped-but-really-
+  // Easy-Ship-pending-pickup, not just genuinely brand-new orders) could
+  // permanently lose visibility into anything beyond page 1. Capped at 50
+  // pages as a sane ceiling, matching fetchAllListings's own cap below.
+  const rawOrders: Array<Record<string, unknown>> = [];
+  let pageToken: string | undefined;
+  let pages = 0;
+  do {
+    const url = new URL(`${baseUrl(env)}/orders/v0/orders`);
+    url.searchParams.set('MarketplaceIds', env.AMAZON_MARKETPLACE_ID);
 
-  const res = await fetch(url, { headers: { 'x-amz-access-token': accessToken } });
-  if (!res.ok) {
-    const detail = await res.text();
-    const hint = isSandbox
-      ? ' (sandbox only recognizes its own canned test orders — this is expected to return Amazon\'s fixed sample data, not your real orders)'
-      : '';
-    throw new Error(`SP-API GetOrders failed: ${res.status} ${detail}${hint}`);
-  }
-  const data = (await res.json()) as {
-    payload: { Orders: Array<Record<string, unknown>> };
-  };
+    if (isSandbox) {
+      url.searchParams.set('CreatedAfter', 'TEST_CASE_200');
+    } else if (pageToken) {
+      // Amazon's documented pagination contract for this endpoint: once a
+      // NextToken is used, only it (plus MarketplaceIds) should be sent —
+      // the original filters aren't required or re-checked on later pages.
+      url.searchParams.set('NextToken', pageToken);
+    } else {
+      url.searchParams.set('LastUpdatedAfter', since.toISOString());
+      url.searchParams.set('FulfillmentChannels', 'MFN');
+      // Pending included alongside Unshipped/PartiallyShipped — an order can
+      // sit as Pending overnight (payment/COD confirmation) and be released
+      // for fulfillment by morning; excluding it meant it never entered our
+      // system at all until its status happened to flip before the next sync,
+      // which isn't guaranteed. Amazon is still the source of truth for
+      // whether it's actually ready — reserveOrderForPicking (orders.ts)
+      // handles a Pending order the same as any other; if Amazon later
+      // cancels it, syncOrderStatuses (amazon-sync.ts) catches that.
+      //
+      // Shipped is ALSO included — a real order (see HANDOFF.md) confirmed
+      // Amazon flips OrderStatus to "Shipped" for an Easy Ship order the
+      // moment a pickup is scheduled, sometimes many days before its actual
+      // ship-by date, well before the courier collects anything. Without this,
+      // such an order never enters this system at all — it's filtered out
+      // client-side below unless it's still genuinely sitting with the seller
+      // (EASYSHIP_NOT_YET_COLLECTED), so this doesn't flood imports with every
+      // truly-completed order.
+      url.searchParams.set('OrderStatuses', 'Pending,Unshipped,PartiallyShipped,Shipped');
+    }
+
+    const res = await fetch(url, { headers: { 'x-amz-access-token': accessToken } });
+    if (!res.ok) {
+      const detail = await res.text();
+      const hint = isSandbox
+        ? ' (sandbox only recognizes its own canned test orders — this is expected to return Amazon\'s fixed sample data, not your real orders)'
+        : '';
+      throw new Error(`SP-API GetOrders failed: ${res.status} ${detail}${hint}`);
+    }
+    const data = (await res.json()) as { payload?: { Orders?: Array<Record<string, unknown>>; NextToken?: string } };
+    rawOrders.push(...(data.payload?.Orders ?? []));
+    pageToken = isSandbox ? undefined : data.payload?.NextToken;
+    pages++;
+  } while (pageToken && pages < 50);
 
   // Sandbox ignores the FulfillmentChannels filter entirely (see above), so
   // enforce merchant-fulfilled-only here regardless of what the server did.
-  const mfnOrders = (data.payload?.Orders ?? []).filter((raw) => raw.FulfillmentChannel === 'MFN');
+  // A "Shipped" order (only pulled in to catch Easy Ship's premature status
+  // flip, see OrderStatuses above) is kept only while EasyShipShipmentStatus
+  // says it's still physically with the seller — otherwise this would pull
+  // in every genuinely-completed order on every sync.
+  const mfnOrders = rawOrders.filter((raw) => {
+    if (raw.FulfillmentChannel !== 'MFN') return false;
+    if (raw.OrderStatus === 'Shipped') {
+      return typeof raw.EasyShipShipmentStatus === 'string' && EASYSHIP_NOT_YET_COLLECTED.has(raw.EasyShipShipmentStatus);
+    }
+    return true;
+  });
 
   // GetOrderItems is one call per order with no bulk equivalent — fetched
   // with bounded concurrency instead of one at a time, which used to mean a
@@ -195,6 +242,7 @@ export async function fetchUnfulfilledOrders(since: Date): Promise<AmazonOrder[]
         orderStatus: raw.OrderStatus as string,
         fulfillmentChannel: raw.FulfillmentChannel as 'MFN' | 'AFN',
         earliestShipDate: raw.EarliestShipDate as string | undefined,
+        latestShipDate: raw.LatestShipDate as string | undefined,
         buyerName: (raw.BuyerInfo as Record<string, unknown> | undefined)?.BuyerName as string | undefined,
         shippingAddress: raw.ShippingAddress ? JSON.stringify(raw.ShippingAddress) : undefined,
         items: (itemsData.payload?.OrderItems ?? []).map((item) => ({
@@ -215,6 +263,16 @@ export async function fetchUnfulfilledOrders(since: Date): Promise<AmazonOrder[]
   return withItems.filter((o): o is AmazonOrder => o !== null);
 }
 
+export interface AmazonOrderStatus {
+  orderStatus: string;
+  // Only present for Easy Ship orders. Confirmed against a real live order
+  // (see HANDOFF.md): Amazon flips the coarse `OrderStatus` to "Shipped" the
+  // moment a pickup is *scheduled*, not when the courier actually collects
+  // the package — `EasyShipShipmentStatus` ("PendingPickUp" etc.) is the
+  // only field that reflects whether it's physically left the seller yet.
+  easyShipShipmentStatus?: string;
+}
+
 /**
  * Checks Amazon's *current* OrderStatus for a specific set of orders we
  * already have locally — used by the sync job to catch orders that changed
@@ -226,10 +284,10 @@ export async function fetchUnfulfilledOrders(since: Date): Promise<AmazonOrder[]
  * `AmazonOrderIds` accepts at most 50 ids per call (documented SP-API
  * limit), so this chunks.
  */
-export async function fetchOrderStatuses(amazonOrderIds: string[]): Promise<Map<string, string>> {
+export async function fetchOrderStatuses(amazonOrderIds: string[]): Promise<Map<string, AmazonOrderStatus>> {
   const env = getEnv();
   const accessToken = await getAccessToken(env);
-  const result = new Map<string, string>();
+  const result = new Map<string, AmazonOrderStatus>();
 
   for (let i = 0; i < amazonOrderIds.length; i += 50) {
     const chunk = amazonOrderIds.slice(i, i + 50);
@@ -239,13 +297,21 @@ export async function fetchOrderStatuses(amazonOrderIds: string[]): Promise<Map<
 
     const res = await fetch(url, { headers: { 'x-amz-access-token': accessToken } });
     if (!res.ok) throw new Error(`SP-API GetOrders (status check) failed: ${res.status} ${await res.text()}`);
-    const data = (await res.json()) as { payload?: { Orders?: Array<{ AmazonOrderId: string; OrderStatus: string }> } };
+    const data = (await res.json()) as { payload?: { Orders?: Array<{ AmazonOrderId: string; OrderStatus: string; EasyShipShipmentStatus?: string }> } };
     for (const o of data.payload?.Orders ?? []) {
-      result.set(o.AmazonOrderId, o.OrderStatus);
+      result.set(o.AmazonOrderId, { orderStatus: o.OrderStatus, easyShipShipmentStatus: o.EasyShipShipmentStatus });
     }
   }
   return result;
 }
+
+// Amazon flips `OrderStatus` to "Shipped" for an Easy Ship order as soon as a
+// pickup is scheduled — these `EasyShipShipmentStatus` values mean the box is
+// still physically with the seller despite that, confirmed against a real
+// order (see HANDOFF.md, `syncOrderStatuses` in amazon-sync.ts). Everything
+// else (PickedUp, DroppedOff, AtOriginFC, OutForDelivery, Delivered, …) means
+// a courier has actually taken possession, so "Shipped" is trusted as-is.
+export const EASYSHIP_NOT_YET_COLLECTED = new Set(['PendingSchedule', 'PendingPickUp', 'PendingDropOff']);
 
 export interface CatalogItemDetails {
   title: string | null;

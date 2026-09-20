@@ -1,4 +1,4 @@
-import { fetchOrderStatuses } from './amazon';
+import { fetchOrderStatuses, EASYSHIP_NOT_YET_COLLECTED } from './amazon';
 import { releaseReservation } from './inventory';
 import { logAudit, logException } from './db';
 
@@ -18,6 +18,18 @@ export interface SyncResult {
  * actually reaches `'shipped'` — nothing in the pick/pack/ship flow set it
  * directly before this existed, since "shipped" is a real-world carrier
  * event, not something we can claim ourselves.
+ *
+ * `OrderStatus: "Shipped"` alone is NOT trusted for an Easy Ship order — a
+ * real production bug (see HANDOFF.md): Amazon flips it the moment a pickup
+ * is *scheduled*, not when the courier actually collects the package, so an
+ * order could sit fully picked but never packed in this system while Amazon
+ * had already told us it was "Shipped," silently pulling it out of the
+ * active pick/pack pipeline days before the box actually left the building.
+ * `EasyShipShipmentStatus` (only present for Easy Ship orders) is checked
+ * first — while it's still `PendingSchedule`/`PendingPickUp`/`PendingDropOff`
+ * (see EASYSHIP_NOT_YET_COLLECTED, amazon.ts), the box is still physically
+ * with the seller, so the order is left exactly as our own floor-progress
+ * tracking has it, "Shipped" or not.
  */
 export async function syncOrderStatuses(db: D1Database, warehouseId: string): Promise<SyncResult> {
   const unresolved = await db
@@ -35,11 +47,14 @@ export async function syncOrderStatuses(db: D1Database, warehouseId: string): Pr
 
   for (const order of unresolved.results) {
     const amazonStatus = statuses.get(order.external_order_id);
-    if (amazonStatus === 'Shipped') {
+    if (!amazonStatus) continue;
+    const stillWithSeller = amazonStatus.easyShipShipmentStatus && EASYSHIP_NOT_YET_COLLECTED.has(amazonStatus.easyShipShipmentStatus);
+
+    if (amazonStatus.orderStatus === 'Shipped' && !stillWithSeller) {
       await db.prepare(`UPDATE orders SET status = 'shipped' WHERE id = ?`).bind(order.id).run();
       await logAudit(db, { userId: null, action: 'order.shipped_sync', entityType: 'order', entityId: order.id, metadata: { source: 'amazon_status_sync' } });
       shipped++;
-    } else if (amazonStatus === 'Canceled') {
+    } else if (amazonStatus.orderStatus === 'Canceled') {
       await cancelOrderFromSync(db, order.id);
       cancelled++;
     }

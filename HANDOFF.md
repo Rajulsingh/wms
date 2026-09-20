@@ -1615,6 +1615,55 @@ because FIFO had already claimed a different order by the time that check ran.
   Re-scanning the same code correctly hit `duplicate_awb`. Scanning an unrecognized code
   (`MANUAL-COURIER-CODE-999`) correctly fell back to FIFO and landed on order-1.
 
+**Easy Ship's premature "Shipped" status, missing orders, and same-day-only pick lists.** User
+reported a real order (`407-0684687-0239548`) showing "Waiting for pickup" in Seller Central but
+absent from the pick list, Pending orders not showing in packer's "Upcoming," and a future-dated
+order (`405-8730967-2581100`, Ship by Sun 27 Sep) apparently already active. Investigated each
+against the real Amazon account (not guessed) before touching anything, via `wrangler d1 execute
+--remote` against production plus temporary debug routes (deleted after) hitting the live SP-API.
+Found three separate, real bugs, all connected to Easy Ship:
+1. **The root cause**: Amazon flips the coarse `OrderStatus` to `"Shipped"` the instant an Easy Ship
+   pickup is *scheduled* — not when the courier actually collects the box. The real, granular signal
+   is a separate field, `EasyShipShipmentStatus` (e.g. `"PendingPickUp"`), which this app never read.
+   Confirmed directly against both example orders: both showed `OrderStatus: "Shipped"` +
+   `EasyShipShipmentStatus: "PendingPickUp"` in the live API response. `syncOrderStatuses`
+   (amazon-sync.ts) trusted `OrderStatus` alone, so `407-0684687-0239548` — fully picked in this
+   system (`pick_batches`/`pick_tasks` confirmed it), but never packed — got marked `'shipped'` and
+   silently pulled out of the active pipeline while the box was still physically sitting in the
+   warehouse. New `EASYSHIP_NOT_YET_COLLECTED` set (amazon.ts) of "still with seller" statuses
+   (`PendingSchedule`/`PendingPickUp`/`PendingDropOff`) gates the "Shipped" transition now —
+   `fetchOrderStatuses`'s return type changed from `Map<string, string>` to
+   `Map<string, AmazonOrderStatus>` to carry both fields.
+2. **Same bug, import side**: `fetchUnfulfilledOrders` filtered `OrderStatuses=Pending,Unshipped,
+   PartiallyShipped` — an order Amazon had already flipped to "Shipped" (even one, like
+   `405-8730967-2581100`, scheduled 11+ days before its real ship-by date) never entered this system
+   at all. Now also requests `Shipped` and filters client-side with the same
+   `EASYSHIP_NOT_YET_COLLECTED` check, so a prematurely-flipped order is pulled in while a genuinely
+   completed one still isn't (avoids flooding every sync with the account's entire shipped history).
+3. **A real, unrelated bug found along the way**: `fetchUnfulfilledOrders` never paginated —
+   `payload.NextToken` was silently discarded, so any lookback window with more than one page's worth
+   of matching orders (~100, confirmed live: a 10-day window returned exactly 100 with
+   `hasNextToken: true`) permanently lost visibility into everything past page 1. Now loops via
+   `NextToken` (capped at 50 pages, matching `fetchAllListings`'s existing cap) — per Amazon's
+   documented contract, a page beyond the first sends only `MarketplaceIds` + `NextToken`, not the
+   original filters again.
+4. **New feature, not a bug**: pick-list assignment scoped to same-IST-calendar-day orders only —
+   `reserveOrderForPicking` (orders.ts) now checks a new `isDueForPickingToday(shipBy)` gate before
+   reserving stock or creating a `pick_batches` row at all; a future-dated order stays `'pending'`
+   with zero pick_tasks (verified live: `405-8730967-2581100` imported cleanly with `pick_tasks: 0`)
+   and is naturally picked up once due by the same retry machinery that already re-attempts
+   stock-blocked orders (`retryBlockedOrders`, run every 5 minutes by the cron job) — no new scheduler
+   needed. Also fixed the column feeding this: `ship_by` was being populated from Amazon's
+   `EarliestShipDate` (when shipping is first *allowed*), not `LatestShipDate` (the actual deadline,
+   what Seller Central labels "Ship by date" and what the user quoted) — now prefers
+   `LatestShipDate`, falling back to `EarliestShipDate` only if Amazon omits it. The new "not due yet"
+   result is deliberately silent (`notDueYet: true`, no `reason` string) so it doesn't get lumped into
+   `shortOrders`/blocked-order messaging the way a real stock shortage does.
+- Corrected the one already-corrupted production order back to `'picked'` (its real state — fully
+  picked, never packed) after auditing all 59 orders currently marked `'shipped'` in production
+  against live Amazon data: `407-0684687-0239548` was the only false positive: every other order was
+  genuinely shipped.
+
 ## Next steps — a prioritized plan
 
 Rewritten 2026-09-20 (twenty-one passes across two days — see "Recently done" entries above for the

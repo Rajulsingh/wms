@@ -53,7 +53,7 @@ export async function importAmazonOrders(db: D1Database, warehouseId: string, or
         `INSERT INTO orders (id, warehouse_id, external_order_id, source, status, ship_by, customer_name, shipping_address)
          VALUES (?, ?, ?, 'amazon', 'pending', ?, ?, ?)`
       )
-      .bind(orderId, warehouseId, order.amazonOrderId, order.earliestShipDate ?? null, order.buyerName ?? null, order.shippingAddress ?? null)
+      .bind(orderId, warehouseId, order.amazonOrderId, order.latestShipDate ?? order.earliestShipDate ?? null, order.buyerName ?? null, order.shippingAddress ?? null)
       .run();
 
     for (const item of order.items) {
@@ -126,6 +126,34 @@ export interface ReserveOrderResult {
   batchId?: string;
   taskCount: number;
   reason?: string;
+  // Set (never alongside `reason`) when the only thing blocking reservation
+  // is that the order isn't due to ship yet — see isDueForPickingToday
+  // below. Distinguished from `reason` so callers (importAmazonOrders,
+  // retryBlockedOrders) don't lump "scheduled for a later day, working as
+  // intended" in with genuine stock-shortage "blocked" noise.
+  notDueYet?: boolean;
+}
+
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+
+/**
+ * A pick list should only ever contain orders actually going out today — a
+ * user request after finding a same-day-scheduled Easy Ship order already
+ * sitting in the active pick pool days before its real ship-by date (see
+ * HANDOFF.md). `shipBy` is UTC (Amazon's `LatestShipDate`/`EarliestShipDate`,
+ * see amazon.ts); this seller's warehouse is India-based (same assumption
+ * the cron trigger already hardcodes), so "today" means the IST calendar
+ * day, not the UTC one — shifting both timestamps by the same fixed offset
+ * before comparing dates is enough to get that right without a timezone
+ * library. `null` (manual/CSV orders with no known ship-by date) is always
+ * due — there's no date to defer to, so gating it would just leave it
+ * stuck forever.
+ */
+function isDueForPickingToday(shipBy: string | null): boolean {
+  if (!shipBy) return true;
+  const shipByIstDate = new Date(new Date(shipBy).getTime() + IST_OFFSET_MS).toISOString().slice(0, 10);
+  const todayIstDate = new Date(Date.now() + IST_OFFSET_MS).toISOString().slice(0, 10);
+  return shipByIstDate <= todayIstDate;
 }
 
 /**
@@ -137,6 +165,12 @@ export interface ReserveOrderResult {
  * it's left `'pending'` untouched, to be retried later (see the retry hook
  * in inbound.ts's receiveStock, and picker.ts's self-healing fallback).
  *
+ * Also gated on `isDueForPickingToday` — an order isn't reserved (no stock
+ * locked, no pick_batch created) until its ship-by day actually arrives, so
+ * the same retry machinery that re-attempts a stock-blocked order (the cron
+ * job's retryBlockedOrders, every 5 minutes during warehouse hours) is what
+ * naturally picks it up once it's due, with no separate scheduler needed.
+ *
  * Creates exactly one `pick_batches` row per order (no `cart_id`/cart_slots
  * — there's no multi-order sweep to bundle here) rather than removing the
  * pick_batches/pack_sessions machinery outright: every function scoped by
@@ -145,6 +179,11 @@ export interface ReserveOrderResult {
  * one order makes all of that correct per order for free. See HANDOFF.md.
  */
 export async function reserveOrderForPicking(db: D1Database, warehouseId: string, orderId: string): Promise<ReserveOrderResult> {
+  const orderRow = await db.prepare(`SELECT ship_by FROM orders WHERE id = ?`).bind(orderId).first<{ ship_by: string | null }>();
+  if (orderRow && !isDueForPickingToday(orderRow.ship_by)) {
+    return { reserved: false, taskCount: 0, notDueYet: true };
+  }
+
   const items = await db
     .prepare(`SELECT id, sku_id, quantity_ordered FROM order_items WHERE order_id = ? AND status = 'pending'`)
     .bind(orderId)
