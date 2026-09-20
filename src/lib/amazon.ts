@@ -284,6 +284,62 @@ export interface AmazonOrderStatus {
  * `AmazonOrderIds` accepts at most 50 ids per call (documented SP-API
  * limit), so this chunks.
  */
+/**
+ * Fetches one order by Amazon order id, full details + items, in the exact
+ * `AmazonOrder` shape `importAmazonOrders` (orders.ts) expects — used by the
+ * admin "Import order by ID" tool (api/admin/import-order.ts) to backfill an
+ * order that fell outside every sync window's `LastUpdatedAfter` lookback.
+ * Real incident (see HANDOFF.md): an order Amazon hasn't touched more
+ * recently than the sync window — because it's just sitting
+ * scheduled/PendingPickUp with nothing new happening — is invisible to
+ * `fetchUnfulfilledOrders` forever, since that only ever looks at recent
+ * activity, never a specific known order id. This is the direct-lookup
+ * escape hatch for exactly that gap. Rejects non-MFN orders the same way
+ * `fetchUnfulfilledOrders` silently filters them — an admin pasting in an
+ * FBA order id by mistake should get a clear error, not have it quietly
+ * enter this warehouse's pick/pack pipeline.
+ */
+export async function fetchOrderById(amazonOrderId: string): Promise<AmazonOrder> {
+  const env = getEnv();
+  const accessToken = await getAccessToken(env);
+
+  const url = new URL(`${baseUrl(env)}/orders/v0/orders`);
+  url.searchParams.set('MarketplaceIds', env.AMAZON_MARKETPLACE_ID);
+  url.searchParams.set('AmazonOrderIds', amazonOrderId);
+  const res = await fetch(url, { headers: { 'x-amz-access-token': accessToken } });
+  if (!res.ok) throw new Error(`GetOrders failed: ${res.status} ${await res.text()}`);
+  const data = (await res.json()) as { payload?: { Orders?: Array<Record<string, unknown>> } };
+  const raw = data.payload?.Orders?.[0];
+  if (!raw) throw new Error(`Amazon has no order with id "${amazonOrderId}" in this marketplace.`);
+  if (raw.FulfillmentChannel !== 'MFN') {
+    throw new Error(`Order ${amazonOrderId} is fulfilled by Amazon (${raw.FulfillmentChannel}), not merchant-fulfilled — this warehouse doesn't pick/pack FBA orders.`);
+  }
+
+  const itemsRes = await fetch(`${baseUrl(env)}/orders/v0/orders/${amazonOrderId}/orderItems`, {
+    headers: { 'x-amz-access-token': accessToken }
+  });
+  if (!itemsRes.ok) throw new Error(`GetOrderItems failed: ${itemsRes.status} ${await itemsRes.text()}`);
+  const itemsData = (await itemsRes.json()) as { payload?: { OrderItems?: Array<Record<string, unknown>> } };
+
+  return {
+    amazonOrderId,
+    purchaseDate: raw.PurchaseDate as string,
+    orderStatus: raw.OrderStatus as string,
+    fulfillmentChannel: 'MFN',
+    earliestShipDate: raw.EarliestShipDate as string | undefined,
+    latestShipDate: raw.LatestShipDate as string | undefined,
+    buyerName: (raw.BuyerInfo as Record<string, unknown> | undefined)?.BuyerName as string | undefined,
+    shippingAddress: raw.ShippingAddress ? JSON.stringify(raw.ShippingAddress) : undefined,
+    items: (itemsData.payload?.OrderItems ?? []).map((item) => ({
+      orderItemId: item.OrderItemId as string,
+      sellerSku: item.SellerSKU as string,
+      asin: item.ASIN as string,
+      title: item.Title as string,
+      quantityOrdered: Number(item.QuantityOrdered ?? 0)
+    }))
+  };
+}
+
 export async function fetchOrderStatuses(amazonOrderIds: string[]): Promise<Map<string, AmazonOrderStatus>> {
   const env = getEnv();
   const accessToken = await getAccessToken(env);

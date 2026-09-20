@@ -23,6 +23,12 @@ if (redirectTo) return Astro.redirect(redirectTo);
   </div>
   <div id="action-result" class="banner" style="display:none;"></div>
 
+  <div class="row" style="flex-wrap: wrap; align-items: center; gap: 8px;">
+    <input type="text" id="import-order-id" placeholder="Amazon order ID (e.g. 405-1234567-1234567)" style="width: auto; min-width: 260px; min-height: 38px;" />
+    <button type="button" class="btn" id="import-order-btn" style="width: auto; min-height: 38px;">Import order by ID</button>
+    <span style="font-size: 0.78rem; color: var(--muted);">For an order stuck outside the normal sync window — see HANDOFF.md.</span>
+  </div>
+
   <div class="stat-grid" id="stat-grid"></div>
 
   <div class="card stack">
@@ -555,6 +561,39 @@ if (redirectTo) return Astro.redirect(redirectTo);
         await loadOrders();
       } catch (err) {
         showResult((err as Error).message, 'danger');
+      }
+    });
+
+    // Escape hatch for an order stuck outside every sync's LastUpdatedAfter
+    // window (see fetchOrderById in amazon.ts, and HANDOFF.md) — a real
+    // incident found live: an order sitting untouched on Amazon's side for
+    // longer than the sync lookback is otherwise invisible to this app
+    // forever, with nothing that ever revisits it.
+    document.getElementById('import-order-btn')?.addEventListener('click', async (e) => {
+      const btn = e.currentTarget as HTMLButtonElement;
+      const input = document.getElementById('import-order-id') as HTMLInputElement;
+      const amazonOrderId = input.value.trim();
+      if (!amazonOrderId) {
+        showResult('Enter an Amazon order ID first.', 'danger');
+        return;
+      }
+      try {
+        const result = await withLoading(btn, 'Importing…', () => api('/api/admin/import-order', { warehouseId, amazonOrderId }));
+        if (result.imported > 0) {
+          showResult(`Imported ${amazonOrderId}${result.newSkusCreated.length ? ` (${result.newSkusCreated.length} new SKU${result.newSkusCreated.length > 1 ? 's' : ''} pulled from Amazon's catalog)` : ''}.`);
+          input.value = '';
+        } else {
+          showResult(`${amazonOrderId} was already in the system — nothing to import.`, 'danger');
+        }
+        await loadOrders();
+      } catch (err) {
+        showResult((err as Error).message, 'danger');
+      }
+    });
+    document.getElementById('import-order-id')?.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        document.getElementById('import-order-btn')?.dispatchEvent(new MouseEvent('click'));
       }
     });
 

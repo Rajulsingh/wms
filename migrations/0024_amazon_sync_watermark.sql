@@ -1,0 +1,16 @@
+-- Replaces the sync job's fixed rolling-window lookback (cron: 24h, manual
+-- "Sync with Amazon": 72h — see sync-job.ts) with a persisted per-warehouse
+-- high-water mark. Real incident (see HANDOFF.md): an order that goes quiet
+-- on Amazon's side (scheduled once, then genuinely just sits with no further
+-- status change) for longer than the fixed window falls out of
+-- fetchUnfulfilledOrders's LastUpdatedAfter reach *permanently* — nothing
+-- ever re-checks further back, no matter how long it keeps sitting there.
+-- A watermark self-heals instead: each successful sync advances this to the
+-- timestamp captured just before that sync's own GetOrders call, and the
+-- *next* sync starts from there — so a gap (cron down for a day, a week of
+-- no admin logins) is caught in full on the next successful run, however
+-- long it's been, without ever needing an ever-wider fixed window. NULL
+-- means "never successfully synced" — the bootstrap case, which still falls
+-- back to a generous fixed window (see sync-job.ts) since there's no
+-- watermark yet to resume from.
+ALTER TABLE warehouses ADD COLUMN amazon_orders_synced_through TEXT;

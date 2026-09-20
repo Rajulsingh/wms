@@ -46,21 +46,42 @@ export interface SyncJobResult {
  * the pull, one warehouse, 72h lookback) and a "sync" concept that also did
  * the status-check/retry — which genuinely did overlap (both pulled new
  * orders) and confused more than they helped. Now there's exactly one
- * import path, this one; `sinceHours` defaults to the cron's own tight 24h
- * window (it runs every ~5min so that's plenty) but a manual trigger (see
- * api/admin/sync-now.ts, api/picker/sync-now.ts) passes a wider one, since a
- * human clicking a button by hand wants a generous catch-up, not the
- * assumption that the last automatic tick was recent.
+ * import path, this one; `sinceHours` is only ever a *fallback*, used solely
+ * when a warehouse has no persisted watermark yet (see below) — the cron
+ * passes its own tight 24h fallback, a manual trigger (api/admin/sync-now.ts,
+ * api/picker/sync-now.ts) passes a wider 72h one, since a human clicking a
+ * button by hand wants a generous first catch-up, not the assumption that
+ * the last automatic tick was recent.
+ *
+ * The lookback itself is a persisted per-warehouse high-water mark
+ * (`warehouses.amazon_orders_synced_through`, migration 0024), not a fixed
+ * rolling window from `sinceHours` — real incident (see HANDOFF.md): an
+ * order that goes quiet on Amazon's side (scheduled once, then genuinely
+ * just sits with no further status change) for longer than a fixed window
+ * falls out of `fetchUnfulfilledOrders`'s `LastUpdatedAfter` reach
+ * *permanently*, since nothing ever re-checks further back regardless of how
+ * long it keeps sitting there. The watermark self-heals instead: captured
+ * just *before* this run's own GetOrders call (not after — an order updated
+ * mid-run must still be caught by the *next* run, not skipped because the
+ * watermark already moved past it), and only advanced once the fetch+import
+ * for this warehouse actually succeeds. A gap (cron down for a day, nobody
+ * logging in for a week) is caught in full on the next successful run,
+ * however long it's been, with no ever-wider fixed window needed. One
+ * warehouse's failure leaves its watermark untouched, so it naturally
+ * retries the same range next time — safe, since `importAmazonOrders`
+ * dedupes by external order id regardless.
  */
 export async function runAmazonSyncJob(db: D1Database, sinceHours = 24): Promise<SyncJobResult[]> {
-  const warehouses = await db.prepare(`SELECT id FROM warehouses`).all<{ id: string }>();
+  const warehouses = await db.prepare(`SELECT id, amazon_orders_synced_through FROM warehouses`).all<{ id: string; amazon_orders_synced_through: string | null }>();
   const results: SyncJobResult[] = [];
 
   for (const wh of warehouses.results) {
+    const runStartedAt = new Date();
     try {
-      const since = new Date(Date.now() - sinceHours * 60 * 60 * 1000);
+      const since = wh.amazon_orders_synced_through ? new Date(wh.amazon_orders_synced_through) : new Date(Date.now() - sinceHours * 60 * 60 * 1000);
       const amazonOrders = await fetchUnfulfilledOrders(since);
       const importSummary = await importAmazonOrders(db, wh.id, amazonOrders);
+      await db.prepare(`UPDATE warehouses SET amazon_orders_synced_through = ? WHERE id = ?`).bind(runStartedAt.toISOString(), wh.id).run();
       const statusResult = await syncOrderStatuses(db, wh.id);
       const retryResult = await retryBlockedOrders(db, wh.id);
 
