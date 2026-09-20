@@ -192,6 +192,14 @@ function toCandidate(r: DupRow): DuplicateSkuCandidate {
  *                   ASIN, which same_asin alone would miss
  *   3. same_title — last resort, only for SKUs with neither ASIN nor photo
  *                   on file (never synced, or an inactive Amazon listing)
+ * Excludes `is_parent_asin` rows entirely — a variation-family "parent"
+ * SellerSKU (Amazon's own grouping construct, holds no inventory and can
+ * never be ordered — see catalog-sync.ts) frequently shares its title/photo
+ * with one of its own children, which used to produce exactly the kind of
+ * false "these are the same product" match this whole function exists to
+ * avoid. A parent still keeps whatever real inventory/order history it had
+ * from before it became one (see catalog-sync.ts) — this only removes it
+ * from being a duplicate-scan *candidate*, nothing else.
  * `suggestedKeepId` prefers whichever candidate already has stock, then
  * whichever has more order history, then whichever is older — it's only a
  * suggestion; admin picks the actual pair to merge.
@@ -203,7 +211,7 @@ export async function findDuplicateSkus(db: D1Database): Promise<DuplicateSkuGro
               COALESCE((SELECT SUM(quantity_on_hand) FROM inventory WHERE sku_id = s.id), 0) AS inventory_units,
               (SELECT COUNT(*) FROM order_items WHERE sku_id = s.id) AS order_item_count
        FROM skus s
-       WHERE s.merged_into_id IS NULL`
+       WHERE s.merged_into_id IS NULL AND s.is_parent_asin = 0`
     )
     .all<DupRow>();
 

@@ -1411,6 +1411,55 @@ Deleted `api/admin/import-amazon-orders.ts` and its button entirely — one acti
 Amazon" on `/admin`, does pull + status-check + retry together. Verified live against the real
 account again post-merge.
 
+## Recently done (2026-09-21, a thirty-first pass) — parent SKUs excluded from duplicate-scan, sync sped up
+
+**Parent SKU fix.** User reported the duplicate scanner was flagging Amazon variation-family
+*parent* SellerSKUs — a parent is Amazon's own grouping construct for a "choose a style/color"
+listing family, holds no real inventory, and can never actually be ordered; only its children can.
+Investigated live against the real Listings API (`includedData=summaries,relationships,attributes`
+on a sample) rather than guessing at field names, and found the reliable signal already present in
+data this app already fetches: a parent's `summaries[].status` never includes `"BUYABLE"` — every
+real, sellable child does. Confirmed against this seller's actual catalog: **58 of 227 listings are
+parent-only** (e.g. `HOG-4AA`, a "style" family with 12 children including `DOG-BKM-5` and
+`1L-OOVK-UP4B` — explains why those two kept looking like plausible near-duplicates in earlier
+passes even though they're genuinely different sellable products).
+- New `skus.is_parent_asin` column (`migrations/0019_skus_is_parent.sql`, default 0). `ListingSummary`
+  (amazon.ts) gained `buyable: boolean`. `syncAmazonCatalog` now: skips creating a row at all for a
+  brand-new parent SellerSKU; for one that's already a row, sets `is_parent_asin = 1` **without**
+  touching its name/image/asin (a parent's own title/photo describe the whole family, not
+  specifically whatever this row's history is about) and reports the count as `skippedParent`.
+  `findDuplicateSkus` excludes `is_parent_asin = 1` from being a candidate at all.
+- **Real edge case found and handled carefully, not glossed over**: 3 of the 58 (`KTN4`, `KTN-3W`,
+  `RKH-CMB-6`) already had real inventory/order/pick-task history in this system — Amazon
+  apparently reclassified a previously-standalone product into a parent *after* it had already been
+  sold/stocked here. `KTN4` specifically has 17 units on hand and one currently-open pick task.
+  Checked this before writing anything — a naive "delete every non-buyable SKU" pass would have
+  broken a live in-flight order. These three keep functioning exactly as before (inventory, picking,
+  receiving all untouched) and are simply excluded from future duplicate-scan candidacy; nothing
+  about their existing data changes.
+- Verified live in local dev against the real Amazon account: sync reported "58 parent listings
+  ignored"; `KTN4`/`KTN-3W`/`HOG-4AA` confirmed `is_parent_asin=1` with names/images unchanged;
+  duplicate-scan group count dropped from 54 to 29 and none of the three appear anywhere in results.
+
+**Order sync/import speed.** Two real sequential bottlenecks fixed with a new bounded-concurrency
+helper (`lib/concurrency.ts`, a small worker-pool `mapWithConcurrency`, not a new dependency):
+1. `fetchUnfulfilledOrders` (amazon.ts) was calling Amazon's `GetOrderItems` once per order, fully
+   sequentially — a sync pulling 20+ orders paid 20+ round trips back to back. Now fetched 5 at a
+   time (comfortably under Amazon's documented GetOrderItems burst allowance of 30), each still
+   wrapped in its own try/catch exactly as before (one order's failure doesn't cost the others).
+2. `importAmazonOrders` (orders.ts) processed orders one at a time; now also 5 at a time, since
+   orders are independent of each other. The one real hazard this introduces — two orders both
+   containing the *same* brand-new SellerSKU racing to create its `skus` row — is handled with
+   `INSERT ... ON CONFLICT (sku_code) DO NOTHING` + re-resolve rather than a bare INSERT, so the
+   loser of that race reuses the winner's row instead of hitting the sku_code UNIQUE constraint.
+   `reserveOrderForPicking`'s inventory claims already use optimistic (version-column) concurrency,
+   so two orders genuinely competing for the same scarce SKU still resolve correctly.
+- **Deliberately left `retryBlockedOrders`/`retryBlockedOrdersForSku` sequential** — unlike import,
+  these explicitly `ORDER BY priority DESC, created_at ASC` to guarantee older/higher-priority
+  blocked orders get scarce stock first when it arrives; parallelizing would turn that fairness
+  guarantee into a race. They're also typically a much smaller list than a fresh order pull, so the
+  speed upside would have been marginal against a real behavioral risk.
+
 ## Next steps — a prioritized plan
 
 Rewritten 2026-09-20 (twenty-one passes across two days — see "Recently done" entries above for the

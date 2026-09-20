@@ -4,6 +4,7 @@ import { fetchAllListings } from './amazon';
 export interface CatalogSyncResult {
   created: number;
   updated: number;
+  skippedParent: number;
   total: number;
 }
 
@@ -46,10 +47,26 @@ export interface CatalogSyncProgress {
  * `onProgress` fires after each page of listings is fetched *and* written,
  * not just fetched — so a caller streaming this to a progress bar reports
  * what's actually been persisted, not just downloaded.
+ *
+ * Parent (variation-family) listings are never treated as ordinary products:
+ * Amazon never marks one BUYABLE (see ListingSummary.buyable in amazon.ts,
+ * confirmed against this seller's real catalog — 58 of 227 listings were
+ * parent-only) since only its children can actually be ordered or hold
+ * inventory. A brand-new parent SellerSKU is skipped entirely — there is
+ * nothing useful to create a `skus` row for. One that's already a row here
+ * (some carry real inventory/order history from *before* the seller turned
+ * them into a parent of a new variation family — confirmed: `KTN4` and
+ * `KTN-3W` both still have real stock and, for KTN4, an open pick task) is
+ * left alone functionally — its name/image/asin are never touched, since a
+ * parent listing's own title/photo describe the whole family, not
+ * specifically the product this row's history is about — but is flagged
+ * `is_parent_asin` so duplicate-scan (skus.ts) can exclude it from being
+ * treated as a fresh candidate without touching anything it's already doing.
  */
 export async function syncAmazonCatalog(db: D1Database, onProgress?: (p: CatalogSyncProgress) => void | Promise<void>): Promise<CatalogSyncResult> {
   let created = 0;
   let updated = 0;
+  let skippedParent = 0;
   let processed = 0;
 
   const listings = await fetchAllListings(async (pageItems) => {
@@ -57,6 +74,14 @@ export async function syncAmazonCatalog(db: D1Database, onProgress?: (p: Catalog
       if (!listing.title) continue; // nothing useful to store yet
 
       const existing = await db.prepare(`SELECT id FROM skus WHERE sku_code = ?`).bind(listing.sku).first<{ id: string }>();
+
+      if (!listing.buyable) {
+        if (existing) {
+          await db.prepare(`UPDATE skus SET is_parent_asin = 1 WHERE id = ? AND is_parent_asin = 0`).bind(existing.id).run();
+        }
+        skippedParent++;
+        continue;
+      }
 
       if (!existing) {
         await db
@@ -66,7 +91,7 @@ export async function syncAmazonCatalog(db: D1Database, onProgress?: (p: Catalog
         created++;
       } else {
         await db
-          .prepare(`UPDATE skus SET name = ?, image_url = ?, asin = COALESCE(?, asin) WHERE id = ?`)
+          .prepare(`UPDATE skus SET name = ?, image_url = ?, asin = COALESCE(?, asin), is_parent_asin = 0 WHERE id = ?`)
           .bind(listing.title, listing.imageUrl, listing.asin, existing.id)
           .run();
         updated++;
@@ -76,5 +101,5 @@ export async function syncAmazonCatalog(db: D1Database, onProgress?: (p: Catalog
     if (onProgress) await onProgress({ processed, total: null });
   });
 
-  return { created, updated, total: listings.length };
+  return { created, updated, skippedParent, total: listings.length };
 }

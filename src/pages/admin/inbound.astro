@@ -319,7 +319,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
               progressFill.style.width = '100%';
               progressLabel.textContent = `Done — ${msg.total} listings.`;
               resultEl.className = 'banner banner-success';
-              resultEl.textContent = `Synced ${msg.total} listings from Amazon (${msg.created} new, ${msg.updated} updated).`;
+              resultEl.textContent = `Synced ${msg.total} listings from Amazon (${msg.created} new, ${msg.updated} updated, ${msg.skippedParent} parent listings ignored).`;
               resultEl.style.display = 'block';
             } else if (msg.type === 'error') {
               throw new Error(msg.error ?? 'Sync failed');

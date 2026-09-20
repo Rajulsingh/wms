@@ -1,4 +1,5 @@
 import { env as workerEnv } from 'cloudflare:workers';
+import { mapWithConcurrency } from './concurrency';
 
 /**
  * Amazon Selling Partner API client — order pull only (§9 of the doc / the
@@ -161,55 +162,57 @@ export async function fetchUnfulfilledOrders(since: Date): Promise<AmazonOrder[]
     payload: { Orders: Array<Record<string, unknown>> };
   };
 
-  const orders: AmazonOrder[] = [];
-  for (const raw of data.payload?.Orders ?? []) {
-    // Sandbox ignores the FulfillmentChannels filter entirely (see above), so
-    // enforce merchant-fulfilled-only here regardless of what the server did.
-    if (raw.FulfillmentChannel !== 'MFN') continue;
+  // Sandbox ignores the FulfillmentChannels filter entirely (see above), so
+  // enforce merchant-fulfilled-only here regardless of what the server did.
+  const mfnOrders = (data.payload?.Orders ?? []).filter((raw) => raw.FulfillmentChannel === 'MFN');
+
+  // GetOrderItems is one call per order with no bulk equivalent — fetched
+  // with bounded concurrency instead of one at a time, which used to mean a
+  // sync with 30 new orders paid 30 sequential network round trips back to
+  // back. 5 at a time is well under Amazon's documented GetOrderItems burst
+  // allowance (30) while still being a real speedup; the worker-pool shape
+  // of mapWithConcurrency means it naturally throttles rather than firing
+  // everything at once. Each fetch keeps its own try/catch exactly as the
+  // old sequential loop did — one order's failure (a transient rate-limit or
+  // 500, common here) must not cost every other order already fetched in
+  // this same call; it returns null and is filtered out below, to be
+  // retried on the next sync since `since` always looks back over the sync
+  // job's own configurable window.
+  const withItems = await mapWithConcurrency(mfnOrders, 5, async (raw) => {
     const orderId = raw.AmazonOrderId as string;
     // Sandbox's getOrderItems only recognizes the literal path "TEST_CASE_200"
     // — the real order id it just handed us in the GetOrders response 400s.
     const itemsOrderId = isSandbox ? 'TEST_CASE_200' : orderId;
-
-    // One order's item-fetch failing (a transient SP-API rate limit or
-    // 500 is common here — GetOrderItems has a tight per-second limit and
-    // this loop calls it once per order with no throttling) must not throw
-    // away every other order already fetched in this same call. Previously
-    // it did: the whole function threw, so the caller (importAmazonOrders)
-    // got zero orders back for the entire sync tick, silently — "not
-    // fetching all the orders" traced back to exactly this. Skip just the
-    // failing order and keep going; it's still in Amazon's system and will
-    // be retried on the next sync since `since` always looks back 24h.
-    let itemsData: { payload?: { OrderItems?: Array<Record<string, unknown>> } };
     try {
       const itemsRes = await fetch(`${baseUrl(env)}/orders/v0/orders/${itemsOrderId}/orderItems`, {
         headers: { 'x-amz-access-token': accessToken }
       });
       if (!itemsRes.ok) throw new Error(`${itemsRes.status} ${await itemsRes.text()}`);
-      itemsData = (await itemsRes.json()) as { payload: { OrderItems: Array<Record<string, unknown>> } };
+      const itemsData = (await itemsRes.json()) as { payload?: { OrderItems?: Array<Record<string, unknown>> } };
+      const order: AmazonOrder = {
+        amazonOrderId: orderId,
+        purchaseDate: raw.PurchaseDate as string,
+        orderStatus: raw.OrderStatus as string,
+        fulfillmentChannel: raw.FulfillmentChannel as 'MFN' | 'AFN',
+        earliestShipDate: raw.EarliestShipDate as string | undefined,
+        buyerName: (raw.BuyerInfo as Record<string, unknown> | undefined)?.BuyerName as string | undefined,
+        shippingAddress: raw.ShippingAddress ? JSON.stringify(raw.ShippingAddress) : undefined,
+        items: (itemsData.payload?.OrderItems ?? []).map((item) => ({
+          orderItemId: item.OrderItemId as string,
+          sellerSku: item.SellerSKU as string,
+          asin: item.ASIN as string,
+          title: item.Title as string,
+          quantityOrdered: Number(item.QuantityOrdered ?? 0)
+        }))
+      };
+      return order;
     } catch (err) {
       console.error(`SP-API GetOrderItems failed for ${orderId}, skipping this order for now:`, err);
-      continue;
+      return null;
     }
+  });
 
-    orders.push({
-      amazonOrderId: orderId,
-      purchaseDate: raw.PurchaseDate as string,
-      orderStatus: raw.OrderStatus as string,
-      fulfillmentChannel: raw.FulfillmentChannel as 'MFN' | 'AFN',
-      earliestShipDate: raw.EarliestShipDate as string | undefined,
-      buyerName: (raw.BuyerInfo as Record<string, unknown> | undefined)?.BuyerName as string | undefined,
-      shippingAddress: raw.ShippingAddress ? JSON.stringify(raw.ShippingAddress) : undefined,
-      items: (itemsData.payload?.OrderItems ?? []).map((item) => ({
-        orderItemId: item.OrderItemId as string,
-        sellerSku: item.SellerSKU as string,
-        asin: item.ASIN as string,
-        title: item.Title as string,
-        quantityOrdered: Number(item.QuantityOrdered ?? 0)
-      }))
-    });
-  }
-  return orders;
+  return withItems.filter((o): o is AmazonOrder => o !== null);
 }
 
 /**
@@ -286,6 +289,13 @@ export interface ListingSummary {
   asin: string | null;
   title: string | null;
   imageUrl: string | null;
+  // False for a variation-family "parent" listing — Amazon never marks one
+  // BUYABLE since it can't actually be ordered (only its children can), and
+  // confirmed against this seller's real catalog as the reliable signal for
+  // it (see migrations/0019_skus_is_parent.sql). Defaults true when the
+  // summary is missing a status array at all, to fail open rather than
+  // accidentally treating a real product as unsellable on incomplete data.
+  buyable: boolean;
 }
 
 /**
@@ -332,7 +342,7 @@ export async function fetchAllListings(onPage?: (pageItems: ListingSummary[]) =>
     const data = (await res.json()) as {
       items?: Array<{
         sku: string;
-        summaries?: Array<{ marketplaceId?: string; asin?: string; itemName?: string; mainImage?: { link?: string } }>;
+        summaries?: Array<{ marketplaceId?: string; asin?: string; itemName?: string; mainImage?: { link?: string }; status?: string[] }>;
       }>;
       pagination?: { nextToken?: string };
     };
@@ -347,7 +357,8 @@ export async function fetchAllListings(onPage?: (pageItems: ListingSummary[]) =>
         sku: item.sku,
         asin: summary?.asin ?? null,
         title: summary?.itemName ?? null,
-        imageUrl: summary?.mainImage?.link ?? null
+        imageUrl: summary?.mainImage?.link ?? null,
+        buyable: summary?.status ? summary.status.includes('BUYABLE') : true
       });
     }
     results.push(...pageItems);

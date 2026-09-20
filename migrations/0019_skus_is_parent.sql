@@ -1,0 +1,18 @@
+-- Amazon's Listings API marks a variation-family "parent" listing distinctly
+-- from its sellable children — a parent never carries the BUYABLE status
+-- (see summaries[].status; confirmed against this seller's real catalog: 58
+-- of 227 listings are parent-only), can never hold real inventory, and can
+-- never actually be ordered. Historically the sync treated every listing
+-- the same, so parents leaked into `skus` and — worse — got treated as
+-- ordinary duplicate-scan candidates, where a parent's title/photo
+-- resembling one of its own children produced false "these are the same
+-- product" matches (the exact failure mode several real merge incidents
+-- this session trace back to).
+--
+-- Default 0 (not a parent) for every existing row — safe, since the
+-- alternative (defaulting to 1/parent) would hide real products from
+-- duplicate-scan/receiving-search until the next sync corrects it, whereas
+-- defaulting to 0 only means a genuine parent might still show up once more
+-- before catalog-sync marks it. syncAmazonCatalog sets this going forward;
+-- see lib/catalog-sync.ts.
+ALTER TABLE skus ADD COLUMN is_parent_asin INTEGER NOT NULL DEFAULT 0;

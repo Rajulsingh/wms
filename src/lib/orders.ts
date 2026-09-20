@@ -2,6 +2,7 @@ import { newId } from './db';
 import { reserveInventory, releaseReservation, InsufficientStockError } from './inventory';
 import { fetchCatalogItemDetails, type AmazonOrder } from './amazon';
 import { resolveSkuIdByCode } from './skus';
+import { mapWithConcurrency } from './concurrency';
 
 export interface ImportSummary {
   imported: number;
@@ -19,18 +20,31 @@ export interface ImportSummary {
  * catalog data (real title + main image via Catalog Items, not a placeholder)
  * rather than silently dropping the line item — it just starts with zero
  * inventory until receiving/admin records real stock for it.
+ *
+ * Orders are independent of each other (this order's rows never depend on
+ * that one's), so they're processed with bounded concurrency instead of one
+ * at a time — a sync pulling in 20+ new orders used to pay each one's full
+ * DB round-trip latency back to back. The one place two orders *can*
+ * genuinely collide is both containing the very same brand-new SellerSKU —
+ * handled with `ON CONFLICT ... DO NOTHING` + re-resolve rather than a bare
+ * INSERT, so whichever order loses that race reuses the SKU row the other
+ * one just created instead of erroring on the sku_code UNIQUE constraint.
+ * `reserveOrderForPicking`'s own inventory claims already use optimistic
+ * (version-column) concurrency control, so two orders competing for the
+ * same SKU's stock resolve correctly (one wins, the other gets a real
+ * insufficient-stock result) rather than double-booking.
  */
 export async function importAmazonOrders(db: D1Database, warehouseId: string, orders: AmazonOrder[]): Promise<ImportSummary> {
   const summary: ImportSummary = { imported: 0, skipped: 0, newSkusCreated: [], shortOrders: [] };
 
-  for (const order of orders) {
+  await mapWithConcurrency(orders, 5, async (order) => {
     const existing = await db
       .prepare(`SELECT id FROM orders WHERE warehouse_id = ? AND source = 'amazon' AND external_order_id = ?`)
       .bind(warehouseId, order.amazonOrderId)
       .first<{ id: string }>();
     if (existing) {
       summary.skipped++;
-      continue;
+      return;
     }
 
     const orderId = newId();
@@ -50,12 +64,17 @@ export async function importAmazonOrders(db: D1Database, warehouseId: string, or
       let skuId = await resolveSkuIdByCode(db, item.sellerSku);
       if (!skuId) {
         const catalog = item.asin ? await fetchCatalogItemDetails(item.asin) : { title: null, imageUrl: null };
-        skuId = newId();
+        const candidateId = newId();
         await db
-          .prepare(`INSERT INTO skus (id, sku_code, name, image_url, asin) VALUES (?, ?, ?, ?, ?)`)
-          .bind(skuId, item.sellerSku, catalog.title ?? item.title ?? item.sellerSku, catalog.imageUrl, item.asin ?? null)
+          .prepare(`INSERT INTO skus (id, sku_code, name, image_url, asin) VALUES (?, ?, ?, ?, ?) ON CONFLICT (sku_code) DO NOTHING`)
+          .bind(candidateId, item.sellerSku, catalog.title ?? item.title ?? item.sellerSku, catalog.imageUrl, item.asin ?? null)
           .run();
-        summary.newSkusCreated.push(item.sellerSku);
+        // Re-resolve regardless of who won — a concurrently-processed order
+        // with the same brand-new SellerSKU may have created it first, in
+        // which case the INSERT above was a no-op and this returns *their*
+        // id, not candidateId.
+        skuId = await resolveSkuIdByCode(db, item.sellerSku);
+        if (skuId === candidateId) summary.newSkusCreated.push(item.sellerSku);
       }
       await db
         .prepare(`INSERT INTO order_items (id, order_id, sku_id, quantity_ordered, amazon_order_item_id) VALUES (?, ?, ?, ?, ?)`)
@@ -66,7 +85,7 @@ export async function importAmazonOrders(db: D1Database, warehouseId: string, or
     summary.imported++;
     const reserved = await reserveOrderForPicking(db, warehouseId, orderId);
     if (!reserved.reserved && reserved.reason) summary.shortOrders.push({ orderId, reason: reserved.reason });
-  }
+  });
 
   return summary;
 }
