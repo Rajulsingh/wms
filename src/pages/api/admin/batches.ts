@@ -26,6 +26,16 @@ export const POST: APIRoute = async (context) => {
   }
 };
 
+// Only batches a picker has actually activated (see activateBatches in
+// lib/picker.ts) show up here — a pick_batch is created automatically, one
+// per order, the moment it's reserved (reserveOrderForPicking), long before
+// any human looks at it. Listing every one of those here (as this used to)
+// meant this page was mostly unclaimed/unclaimed-looking reservation
+// tickets rather than actual work in flight. 'in_progress' means a picker
+// tapped Activate (or started picking one of its tasks — see
+// markBatchStarted); 'completed' keeps it visible afterward. Once a batch
+// reaches 'in_progress' it can never fall back out of this filter —
+// assignBatchToPacker already refuses to touch anything past 'assigned'.
 export const GET: APIRoute = async (context) => {
   const db = getDb();
   try {
@@ -35,7 +45,8 @@ export const GET: APIRoute = async (context) => {
       .prepare(
         `SELECT pb.*, u.name AS assigned_picker_name
          FROM pick_batches pb LEFT JOIN users u ON u.id = pb.assigned_picker_id
-         WHERE pb.warehouse_id = ? ORDER BY pb.created_at DESC LIMIT 50`
+         WHERE pb.warehouse_id = ? AND pb.status IN ('in_progress', 'completed')
+         ORDER BY pb.created_at DESC LIMIT 50`
       )
       .bind(warehouseId)
       .all();

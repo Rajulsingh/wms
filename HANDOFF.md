@@ -1512,6 +1512,43 @@ all the way through rather than stopping at the first plausible answer):
   alone — every one of them already had a `document.hidden` guard, so the real problem was
   per-query cost, not polling frequency itself.
 
+**Pick list activation now actually persists.** User reported two related bugs on the picker's
+"Activate pick list" gate (picker/index.astro): (1) reloading the page after activating but before
+the first pick dropped the picker straight back to the Activate button, as if nothing had happened;
+(2) admin's "Pick lists" page (pick-list.astro, backed by `/api/admin/batches`) listed *every*
+pick_batch ever auto-created — one gets created per order the instant it's reserved
+(`reserveOrderForPicking`), long before any human looks at it — so the page was mostly noise, not
+actual work in flight. Root cause of both: "activation" only ever existed as an in-memory `stage`
+variable in the browser. `pick_batches.status` never left `'assigned'` through this newer scan-free
+picker flow (a stale comment in getMyBatches even documented the *intent* for status to carry this
+signal, but nothing wired it up — the older QR-confirm flow's `in_progress` transition was never
+reachable from here).
+- New `activateBatches` (lib/picker.ts) + `POST /api/picker/activate-batches`: the real, DB-persisted
+  effect of tapping "Activate pick list" — `UPDATE pick_batches SET status = 'in_progress' WHERE
+  warehouse_id = ? AND assigned_picker_id = ? AND status = 'assigned'`. picker/index.astro's
+  `activate()` now calls this before re-fetching; `boot()` now resumes to `'ready'` (not `'gate'`) on
+  reload whenever any claimed batch is already `in_progress`/`completed`, not only when a pick has
+  already happened.
+- Self-healing twin `markBatchStarted`, called from `confirmQuantity`/`reportDamaged`: a batch swept
+  into an *already*-activated picker's queue mid-walk (new order lands while they're still working)
+  never gets its own explicit Activate tap — picking any of its tasks is itself proof a human is on
+  it, so that's what bumps it to `in_progress` instead. No-op once already past `'assigned'`.
+- `/api/admin/batches` GET now filters `WHERE pb.status IN ('in_progress', 'completed')` — a batch
+  only shows up here once a human has actually committed to it, not the moment it's auto-created.
+  "Once activated can't be deactivated" falls out for free: `assignBatchToPacker` already refused to
+  (re)assign/unassign anything past `'assigned'` (pre-existing guard, was just unreachable before
+  since nothing ever left `'assigned'`) — nothing in this codebase ever moves status backward out of
+  `in_progress`.
+- Deliberately left the assign/unassign UI on pick-list.astro as-is even though its `pending`/
+  `assigned` branch can no longer render (the fetched list never contains those statuses anymore) —
+  removing it wasn't asked for, it's harmless, and pick-assign.astro is the actual dedicated tool for
+  routing not-yet-claimed work to a specific packer, so no capability is lost.
+- Verified live in local dev: activated 13 real batches for the `packer` test user (confirmed
+  `status = 'in_progress'` in D1, 1 already `completed`), reloaded `/picker` — resumed straight to
+  "Pick list activated / Start picking" instead of re-showing the gate. Admin's
+  `/api/admin/batches` then returned exactly those 14 (`in_progress`/`completed`), zero `pending`/
+  `assigned` noise.
+
 ## Next steps — a prioritized plan
 
 Rewritten 2026-09-20 (twenty-one passes across two days — see "Recently done" entries above for the

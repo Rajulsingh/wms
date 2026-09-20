@@ -105,14 +105,16 @@ import TopBar from '../../components/TopBar.astro';
 
       const claimed = await api('/api/picker/claim-batch', { warehouseId });
       batchList = claimed.batches ?? [];
-      // A reload mid-walk (some rows already picked/short/damaged) resumes
-      // straight into the list — the gate is for "here's new work," not a
-      // hoop to jump back through for work already underway. Batch status
-      // itself can't tell us this: nothing in this scan-free list UI ever
-      // moves a pick_batch to 'in_progress' (that only happens through the
-      // older QR-confirm flow this page doesn't use), so task-level progress
-      // is the real signal.
-      stage = hasStartedWork(batchList) ? 'working' : 'gate';
+      // A reload resumes past the gate whenever there's real evidence a
+      // human already got past it — either rows already picked/short/
+      // damaged (mid-walk), or the batch itself is already 'in_progress'
+      // (activated but not yet started — see activate() below and
+      // activateBatches in lib/picker.ts). Without the status check, a
+      // reload right after activating but before the first pick used to
+      // drop the picker straight back to "Activate pick list" as if nothing
+      // had happened, since a freshly-claimed batch never leaves 'assigned'
+      // any other way.
+      stage = hasStartedWork(batchList) ? 'working' : isActivated(batchList) ? 'ready' : 'gate';
       renderStage();
 
       // Batches keep arriving — admin assigning one directly, or a fresh
@@ -129,6 +131,10 @@ import TopBar from '../../components/TopBar.astro';
 
     function hasStartedWork(batches: BatchEntry[]): boolean {
       return batches.some((b) => b.rows.some((r) => r.status !== 'pending'));
+    }
+
+    function isActivated(batches: BatchEntry[]): boolean {
+      return batches.some((b) => b.status === 'in_progress' || b.status === 'completed');
     }
 
     async function pollForMore() {
@@ -215,10 +221,16 @@ import TopBar from '../../components/TopBar.astro';
     // getMyBatches (lib/picker.ts) fetches every batch's rows in one query
     // instead of looping per batch, so this stays fast even with a full cart
     // of small orders — no artificial delay added on top of it.
+    //
+    // The actual persistence happens server-side (activate-batches, before
+    // the re-fetch) — this is what makes activation survive a reload instead
+    // of living only in this file's `stage` variable. See activateBatches in
+    // lib/picker.ts.
     async function activate() {
       stage = 'activating';
       renderActivating();
       try {
+        await api('/api/picker/activate-batches', { warehouseId });
         const data = await api('/api/picker/claim-batch', { warehouseId });
         batchList = data.batches ?? [];
         lastError = '';

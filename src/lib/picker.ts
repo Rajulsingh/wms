@@ -78,6 +78,38 @@ async function claimAvailableBatch(db: D1Database, warehouseId: string, pickerId
   return result.meta.changes === 1 ? candidate.id : null;
 }
 
+/**
+ * The real, persisted record of a human tapping "Activate pick list" (see
+ * picker/index.astro) — before this, activation existed only as an
+ * in-memory `stage` variable in the browser, so a page reload had no way to
+ * tell "already activated, just waiting to start" from "brand new, never
+ * looked at" and always fell back to showing the Activate button again.
+ * Moving a batch from 'assigned' to 'in_progress' here is what admin's pick
+ * list view (see api/admin/batches.ts) now filters on to show only batches
+ * a human has actually committed to, not every auto-created reservation
+ * ticket. It's also effectively permanent: `assignBatchToPacker` already
+ * refuses to touch anything past 'assigned', so nothing in this codebase
+ * ever moves a batch back out of 'in_progress'.
+ */
+export async function activateBatches(db: D1Database, warehouseId: string, pickerId: string): Promise<void> {
+  await db
+    .prepare(`UPDATE pick_batches SET status = 'in_progress' WHERE warehouse_id = ? AND assigned_picker_id = ? AND status = 'assigned'`)
+    .bind(warehouseId, pickerId)
+    .run();
+}
+
+/**
+ * Self-healing twin of `activateBatches` for a batch that was swept into an
+ * already-activated picker's queue mid-walk (see getMyBatches) — the picker
+ * never sees a second gate for it, so nothing else ever calls the explicit
+ * activate step for it. Picking (or damage-reporting) any of its tasks is
+ * itself unambiguous proof a human is working it, so that's what bumps it
+ * here instead. A no-op once already past 'assigned'.
+ */
+async function markBatchStarted(db: D1Database, pickBatchId: string): Promise<void> {
+  await db.prepare(`UPDATE pick_batches SET status = 'in_progress' WHERE id = ? AND status = 'assigned'`).bind(pickBatchId).run();
+}
+
 export interface BatchState {
   batchId: string;
   status: string;
@@ -258,6 +290,8 @@ export async function confirmQuantity(db: D1Database, userId: string, pickTaskId
     .first<{ id: string }>();
   if (!inventory) throw new PickerFlowError('inventory_missing', 'No inventory row for this SKU/location — data integrity issue');
 
+  await markBatchStarted(db, task.pick_batch_id);
+
   if (quantity > 0) await confirmPick(db, inventory.id, quantity);
   const shortfall = task.quantity_required - quantity;
   if (shortfall > 0) await releaseReservation(db, inventory.id, shortfall);
@@ -407,6 +441,8 @@ export async function reportDamaged(db: D1Database, userId: string, pickTaskId: 
     .bind(pickTaskId)
     .first<{ id: string; pick_batch_id: string; order_item_id: string; sku_id: string; location_id: string; quantity_required: number }>();
   if (!task) throw new PickerFlowError('not_found', 'Pick task not found');
+
+  await markBatchStarted(db, task.pick_batch_id);
 
   const inventory = await db
     .prepare(`SELECT id FROM inventory WHERE sku_id = ? AND location_id = ?`)
