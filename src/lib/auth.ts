@@ -117,3 +117,28 @@ export async function requireAdminPage(context: APIContext, db: D1Database): Pro
   if (user.role !== 'admin') return '/picker';
   return null;
 }
+
+export interface ClientUser {
+  id: string;
+  name: string;
+  role: UserRole;
+  warehouseId: string | null;
+  stationId: string | null;
+}
+
+/**
+ * The exact shape `/api/auth/me` returns, shared so a page's own frontmatter
+ * (server-side) and that endpoint (client-side) never drift apart. Used to
+ * resolve the session once during the initial server render — every
+ * packer/picker/dashboard page used to *only* find out who's logged in by
+ * having the browser call `/api/auth/me` after the page had already loaded,
+ * paying a full extra network round trip (DNS/TLS already done, but still a
+ * real RTT) before it could even start fetching the page's actual data.
+ * Confirmed against live production traffic (a real user on mobile data,
+ * ~100ms RTT) that every individual request was fast server-side — the
+ * "too slow to load" the user reported was this compounding page-load
+ * waterfall, not a backend or logging performance issue. See HANDOFF.md.
+ */
+export function toClientUser(user: User): ClientUser {
+  return { id: user.id, name: user.name, role: user.role, warehouseId: user.warehouse_id, stationId: user.station_id };
+}

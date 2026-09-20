@@ -1,6 +1,16 @@
 ---
 import Base from '../../layouts/Base.astro';
 import TopBar from '../../components/TopBar.astro';
+import { getDb } from '../../lib/db';
+import { getCurrentUser, toClientUser } from '../../lib/auth';
+
+// Resolved server-side now instead of the client fetching /api/auth/me after
+// the page loads — see toClientUser in lib/auth.ts for why. Not logged in
+// still redirects the same way requireAdminPage does for /admin pages.
+const db = getDb();
+const user = await getCurrentUser(Astro, db);
+if (!user) return Astro.redirect('/login');
+const serverUser = toClientUser(user);
 ---
 
 <Base title="Dashboard">
@@ -17,6 +27,9 @@ import TopBar from '../../components/TopBar.astro';
     </div>
   </div>
 
+  <script define:vars={{ serverUser }}>
+    window.__serverUser = serverUser;
+  </script>
   <script>
     import { escapeHtml, withLoading } from '../../lib/ui';
 
@@ -81,16 +94,12 @@ import TopBar from '../../components/TopBar.astro';
     }
 
     async function boot() {
-      const me = await api('/api/auth/me');
-      if (!me.user) {
-        window.location.href = '/login';
+      const user = (window as any).__serverUser;
+      if (user.role !== 'packer') {
+        app.innerHTML = `<p>This account is a "${user.role}" — the packer dashboard needs a packer login.</p>`;
         return;
       }
-      if (me.user.role !== 'packer') {
-        app.innerHTML = `<p>This account is a "${me.user.role}" — the packer dashboard needs a packer login.</p>`;
-        return;
-      }
-      warehouseId = me.user.warehouseId;
+      warehouseId = user.warehouseId;
       pollWorkBadge();
 
       await load();

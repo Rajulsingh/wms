@@ -1,6 +1,14 @@
 ---
 import Base from '../../layouts/Base.astro';
 import TopBar from '../../components/TopBar.astro';
+import { getDb } from '../../lib/db';
+import { getCurrentUser, toClientUser } from '../../lib/auth';
+
+// Resolved server-side — see toClientUser in lib/auth.ts.
+const db = getDb();
+const user = await getCurrentUser(Astro, db);
+if (!user) return Astro.redirect('/login');
+const serverUser = toClientUser(user);
 ---
 
 <Base title="Packer">
@@ -16,6 +24,9 @@ import TopBar from '../../components/TopBar.astro';
     </div>
   </div>
 
+  <script define:vars={{ serverUser }}>
+    window.__serverUser = serverUser;
+  </script>
   <script>
     import { withLoading, escapeHtml, qtyStepperHtml, wireQtySteppers } from '../../lib/ui';
 
@@ -103,19 +114,15 @@ import TopBar from '../../components/TopBar.astro';
     }
 
     async function boot() {
-      const me = await api('/api/auth/me');
-      if (!me.user) {
-        window.location.href = '/login';
+      const user = (window as any).__serverUser;
+      if (user.role !== 'packer') {
+        app.innerHTML = `<p>This account is a "${user.role}", not a packer.</p>`;
         return;
       }
-      if (me.user.role !== 'packer') {
-        app.innerHTML = `<p>This account is a "${me.user.role}", not a packer.</p>`;
-        return;
-      }
-      warehouseId = me.user.warehouseId;
+      warehouseId = user.warehouseId;
       pollWorkBadge();
 
-      if (!me.user.stationId) {
+      if (!user.stationId) {
         app.innerHTML = `
           <div class="stack" style="flex:1; justify-content:center; text-align:center;">
             <p>No packing station is assigned to your account yet — ask an admin to assign one in

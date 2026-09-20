@@ -1766,6 +1766,48 @@ certainly doesn't for anything requiring an actual DB read).
   of its tasks have actually been picked, that needs the user's input before undoing anything, same
   reasoning as before.
 
+**Update**: the D1 free-tier quota exhaustion above got resolved the same session — the user
+purchased a paid D1/Workers plan, confirmed lifted by re-running the same query that had been
+rejected. Re-checked `404-6655591-3241911` immediately after: it had moved to `status: 'packing'`
+(picked *and* packing already started) and Amazon's `OrderStatus` is still genuinely `"Pending"`
+right now — so a picker and packer both worked it before the new gate existed to stop them, and it's
+now too far along to safely pull back automatically (would mean asking someone to unpack a
+potentially-already-sealed box). Left untouched, flagged to the user rather than auto-corrected —
+same reasoning as before, just confirmed with fresh data instead of stale.
+
+**Eliminated a redundant `/api/auth/me` round trip from every packer/picker/dashboard page load.**
+User reported every page felt slow to load. Investigated with live production traffic (`wrangler
+tail`) rather than guessing — captured real requests from an actual user on mobile data in Bhopal:
+every single one (`claim-batch`, `packer/dashboard`, `admin/orders`, `work-summary`, `sku-demand`,
+login) completed in under 100ms server-side, most under 50ms, zero exceptions. So it wasn't the
+backend, and specifically wasn't the audit-log writes the user first suspected (`logAudit` is a
+single plain INSERT — checked and ruled out). The real cause: every one of
+`packer/home.astro`/`packer/index.astro`/`packer/scan.astro`/`picker/index.astro`/`dashboard.astro`
+had **zero server-side auth resolution** — unlike every `/admin/*` page (which already uses
+`requireAdminPage` in its frontmatter), these relied entirely on the client fetching
+`/api/auth/me` *after* the page had already loaded, before it could even start fetching the page's
+real data. On a mobile connection (~100ms RTT observed), that's a full extra sequential round trip
+stacked in front of every page's actual content, on every single navigation.
+- New `toClientUser`/`ClientUser` in lib/auth.ts — the exact shape `/api/auth/me` already returned
+  (`id, name, role, warehouseId, stationId`), now shared so the endpoint and every page's own
+  frontmatter build it identically. `/api/auth/me` itself refactored to use it (no behavior change,
+  just de-duplicated).
+- All 5 pages now resolve the user server-side in frontmatter (`getCurrentUser` — same helper
+  `requireAdminPage` already uses) and redirect to `/login` immediately if not logged in, with zero
+  client-side JS needed for that case at all (verified live: logged out, navigated to
+  `/packer/home`, landed on `/login` directly, no flash of the packer shell first). The resolved user
+  is handed to the client script via `<script define:vars={{ serverUser }}>window.__serverUser =
+  serverUser;</script>` — a pattern new to this codebase, verified live before rolling out to all 5
+  (piloted on packer/home.astro first, confirmed `window.__serverUser` populated correctly and zero
+  `auth/me` network calls, only then applied the same diff to the other four).
+- Each page's own "wrong role" message (e.g. "This account is a 'admin' — the packer dashboard needs
+  a packer login") is preserved exactly as before — only the data source changed (`window.__serverUser`
+  instead of an awaited fetch), not the branching logic or copy. `dashboard.astro` has no role
+  restriction (by design, every role can see it) so its frontmatter only checks login, not role.
+  Verified live: all 5 pages render correct content with zero `/api/auth/me` calls
+  (`performance.getEntriesByType('resource')` confirmed empty for all of them post-fix), and the
+  wrong-role message still renders correctly for an admin session on `/packer/home`.
+
 ## Next steps — a prioritized plan
 
 Rewritten 2026-09-20 (twenty-one passes across two days — see "Recently done" entries above for the

@@ -1,6 +1,16 @@
 ---
 import Base from '../layouts/Base.astro';
 import TopBar from '../components/TopBar.astro';
+import { getDb } from '../lib/db';
+import { getCurrentUser, toClientUser } from '../lib/auth';
+
+// Resolved server-side — see toClientUser in lib/auth.ts. No role
+// restriction here (every role can see this page), so unlike the other
+// packer/picker pages this only needs the logged-in check, not a role check.
+const db = getDb();
+const user = await getCurrentUser(Astro, db);
+if (!user) return Astro.redirect('/login');
+const serverUser = toClientUser(user);
 ---
 
 <Base title="Today">
@@ -16,6 +26,9 @@ import TopBar from '../components/TopBar.astro';
     </div>
   </div>
 
+  <script define:vars={{ serverUser }}>
+    window.__serverUser = serverUser;
+  </script>
   <script>
     interface TodaySummary {
       statusCounts: Record<string, number>;
@@ -120,13 +133,9 @@ import TopBar from '../components/TopBar.astro';
     }
 
     async function boot() {
-      const me = await api('/api/auth/me');
-      if (!me.user) {
-        window.location.href = '/login';
-        return;
-      }
-      warehouseId = me.user.warehouseId;
-      isAdmin = me.user.role === 'admin';
+      const user = (window as any).__serverUser;
+      warehouseId = user.warehouseId;
+      isAdmin = user.role === 'admin';
       await load();
       setInterval(() => {
         if (!document.hidden) load();
