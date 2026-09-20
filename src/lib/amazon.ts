@@ -813,6 +813,14 @@ export async function checkEasyShipReport(reportId: string): Promise<ReportCheck
   return { status: 'DONE', labelBase64: btoa(binary), labelFileType: 'application/pdf' };
 }
 
+// A temp debugFetchGeneralOrdersReport export lived here briefly to check
+// whether GET_FLAT_FILE_ALL_ORDERS_DATA_BY_LAST_UPDATE_GENERAL carries a
+// tracking/AWB column, for the deferred AWB-scan-mismatch item (see
+// HANDOFF.md). Confirmed live it does not — 33 columns, order/item/price/
+// address fields only, no tracking/carrier field at all — so that report is
+// not a viable path to the fix. Removed after answering rather than left as
+// dead code.
+
 // ---- Bulk scheduling — the better fit for "schedule several orders at
 // once". Confirmed against the SDK's generated Go types (a more reliable
 // source than prose docs for exact field names — developer-docs' HTML

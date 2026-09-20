@@ -663,6 +663,24 @@ a.brand {
   color: var(--accent);
 }
 
+/* Site-wide build-stage marker — see TopBar.astro, AdminSidebar.astro, and
+   login.astro, the three places the brand lockup renders. Not a status-pill
+   (no dot, deliberately quieter) since this isn't reporting live state. */
+.pre-alpha-tag {
+  display: inline-flex;
+  align-items: center;
+  font-size: 0.62rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: var(--warning-bg);
+  color: var(--warning-fg);
+  border: 1px solid var(--warning-border);
+  white-space: nowrap;
+}
+
 .auth-shell {
   min-height: 100dvh;
   display: flex;

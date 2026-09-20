@@ -1925,6 +1925,36 @@ seeded data; spot-checked the new tab-count/list/tracking-search queries directl
 the D1 quota this session already had one incident with. Deployed (Version ID
 `6001a9fe-5a5d-4cfb-b854-719eec9b26a0`).
 
+## Recently done (2026-09-21) — pre-alpha tag, and the AWB Reports-API fallback ruled out
+
+Two quick items. **Pre-Alpha tag**: added a small `.pre-alpha-tag` pill next to the "ecomglider"
+brand name (new CSS in global.css) in the three places the brand lockup renders —
+`TopBar.astro` (packer/picker/dashboard), `AdminSidebar.astro`, and `login.astro`. Verified live at
+desktop and mobile widths, both logged-in and on the sign-in screen.
+
+**AWB Reports-API fallback — tested live, ruled out.** Continuing the item deferred in the last
+"Recently done" entry above: does `GET_FLAT_FILE_ALL_ORDERS_DATA_BY_LAST_UPDATE_GENERAL` (the report
+type with no permission blocker) actually carry a tracking/AWB column? Added a temp
+`debugFetchGeneralOrdersReport` export to amazon.ts (create-report → poll → download, same pattern
+as `checkEasyShipReport`) plus a temp debug route, ran it live against production for the last 14
+days. Result: **no** — the report's 33 columns are order-id/item/price/address/status fields only
+(`amazon-order-id`, `merchant-order-id`, `purchase-date`, `order-status`, `fulfillment-channel`,
+`sku`, `asin`, `item-price`, `ship-city`/`ship-state`/`ship-postal-code`, etc.) — nothing resembling
+a tracking number or carrier. Matches Amazon's own doc description ("does not include customer-
+identifying information," not a shipping report) — now confirmed empirically rather than just
+theoretically. Temp function and route both deleted after answering.
+**Status of the AWB-scan-mismatch item now**: both routes with no permission blocker have been
+tried and ruled out (the general report above; the earlier FIFO-fallback fix that turned out to
+have zero real-world effect since every shipment's `carrier` is NULL — 100% scheduled directly on
+Seller Central). The only remaining paths are: (1) the user pursues Amazon's restricted
+"Direct to Consumer Shipping" role (needs Amazon's own security review, not just a checkbox — see
+the deferred entry above for what was found in the Solution Provider Portal), or (2) stop trying to
+read Amazon's own AWB back and instead have this app be the one that assigns/schedules it (either
+schedule Easy Ship pickups through this app instead of Seller Central directly, so the AWB this app
+already generates is the real one — the scheduling code already exists, see `scheduleEasyShipPackage`/
+`createScheduledPackageBulk` in amazon.ts — or fall back to a manual "type in the tracking number
+you see on the label" admin field). No code changed for this item this pass — investigation only.
+
 ## Next steps — a prioritized plan
 
 Rewritten 2026-09-20 (twenty-one passes across two days — see "Recently done" entries above for the
