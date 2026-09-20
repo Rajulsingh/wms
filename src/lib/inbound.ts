@@ -1,5 +1,5 @@
 import { newId, logAudit } from './db';
-import { resolveSkuIdByCode, setEfnsku, SkuMergeError } from './skus';
+import { resolveSkuIdByCode, setMsku, SkuMergeError } from './skus';
 import { retryBlockedOrdersForSku } from './orders';
 
 export class InboundError extends Error {
@@ -12,9 +12,9 @@ export interface ReceiveLine {
   skuId?: string;
   newSku?: { skuCode: string; name: string };
   // Only meaningful when the SKU (new or existing) doesn't already have one
-  // — see setEfnsku in lib/skus.ts. Optional so existing callers/tests that
-  // predate EFNSKU keep working unchanged.
-  efnsku?: string;
+  // — see setMsku in lib/skus.ts. Optional so existing callers/tests that
+  // predate MSKU keep working unchanged.
+  msku?: string;
   locationId: string;
   quantity: number;
 }
@@ -57,12 +57,12 @@ export async function receiveStock(
 
     let skuId = line.skuId;
     let skuCode: string;
-    let alreadyHasEfnsku = false;
+    let alreadyHasMsku = false;
     if (skuId) {
-      const sku = await db.prepare(`SELECT sku_code, efnsku FROM skus WHERE id = ?`).bind(skuId).first<{ sku_code: string; efnsku: string | null }>();
+      const sku = await db.prepare(`SELECT sku_code, msku FROM skus WHERE id = ?`).bind(skuId).first<{ sku_code: string; msku: string | null }>();
       if (!sku) throw new InboundError('sku_not_found', 'SKU not found');
       skuCode = sku.sku_code;
-      alreadyHasEfnsku = sku.efnsku != null;
+      alreadyHasMsku = sku.msku != null;
     } else {
       if (!line.newSku?.skuCode?.trim() || !line.newSku?.name?.trim()) {
         throw new InboundError('sku_required', 'Pick an existing SKU or provide a code and name for a new one');
@@ -74,8 +74,8 @@ export async function receiveStock(
       const resolvedId = await resolveSkuIdByCode(db, code);
       if (resolvedId) {
         skuId = resolvedId;
-        const existing = await db.prepare(`SELECT efnsku FROM skus WHERE id = ?`).bind(resolvedId).first<{ efnsku: string | null }>();
-        alreadyHasEfnsku = existing?.efnsku != null;
+        const existing = await db.prepare(`SELECT msku FROM skus WHERE id = ?`).bind(resolvedId).first<{ msku: string | null }>();
+        alreadyHasMsku = existing?.msku != null;
       } else {
         skuId = newId();
         await db.prepare(`INSERT INTO skus (id, sku_code, name) VALUES (?, ?, ?)`).bind(skuId, code, line.newSku.name.trim()).run();
@@ -83,14 +83,14 @@ export async function receiveStock(
       skuCode = code;
     }
 
-    // Assigning (or recognizing) the EFNSKU is what actually determines the
+    // Assigning (or recognizing) the MSKU is what actually determines the
     // final SKU for this line — if the value typed in already belongs to
-    // another SKU, setEfnsku merges this one into it (see lib/skus.ts), so
+    // another SKU, setMsku merges this one into it (see lib/skus.ts), so
     // the resolved id has to be re-read afterward rather than assumed to
     // still be `skuId`.
-    if (line.efnsku?.trim() && !alreadyHasEfnsku) {
+    if (line.msku?.trim() && !alreadyHasMsku) {
       try {
-        await setEfnsku(db, userId, skuCode, line.efnsku);
+        await setMsku(db, userId, skuCode, line.msku);
       } catch (err) {
         if (err instanceof SkuMergeError) throw new InboundError(err.code, err.message);
         throw err;
