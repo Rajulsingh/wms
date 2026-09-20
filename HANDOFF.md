@@ -1277,6 +1277,40 @@ would be exactly as much a guess as the original wrong merge. If real stock/orde
 gun holder case), that still needs the same manual, evidence-based check (cross-reference Amazon's own order
 records) done in this pass — not something a generic "unmerge" button can safely automate.
 
+## Recently done (2026-09-20, a twenty-ninth pass) — duplicate detection rebuilt around ASIN/photo instead of title
+
+Direct follow-up to the previous pass. The user's point: most products have one unique ASIN, but a real
+minority genuinely have more than one (relisted after suppression, etc.) with the same photo, and separately
+some SKU codes share the exact same ASIN outright (unambiguously the same listing) — the old exact-title-match
+scan couldn't use either signal, so it both missed real duplicates and (per the previous pass) mistook real
+color/size variations for duplicates just because their generic titles matched.
+
+- **`findDuplicateSkus`** (`skus.ts`) rewritten as a three-tier confidence system, each SKU claimed by the
+  strongest tier it matches (never re-flagged by a weaker one):
+  1. `same_asin` — two+ SKU codes share the identical ASIN. Certain: ASIN *is* Amazon's product identity.
+  2. `same_image` — different (or unknown) ASINs but the exact same product photo. Very strong — a real
+     product photo isn't reused by coincidence — and catches a listing relisted under a new ASIN, which
+     ASIN-matching alone would miss.
+  3. `same_title` — last-resort fallback, only for SKUs with no ASIN/photo to compare (never synced, or an
+     inactive listing). The only tier where a real variation can still slip through, and now labeled as such.
+  Each group carries a `matchType` + `hasAsinMismatch`, rendered on `/admin/inventory` as a confidence pill
+  ("Certain — same ASIN" / "Likely — same photo" / "Weak — title only") with tier-appropriate copy — a
+  same_title group's note no longer implies "no data," since (confirmed live) a same-title pair can have two
+  known ASINs that simply disagree, which is a different, more informative fact than missing data.
+- **Real bug found and fixed in `catalog-sync.ts`**: the previous pass's fix (don't let a merged-away code's
+  listing overwrite the *target's* data) had gone one step too far and skipped writing to the merged-away
+  row's *own* fields too — meaning a merged SKU's own ASIN could never be backfilled by sync, permanently.
+  Confirmed in production: 33 of 35 merged SKUs had no ASIN, vs. only 4 of 195 non-merged ones. Fixed: the
+  lookup is always by `sku_code` directly (never resolved through a merge redirect), so `existing.id` is
+  always that exact row's own id regardless of merge status — updating it is always safe. Re-running "Sync
+  Amazon catalog" now backfills ASIN/photo on merged rows too, which matters for exactly this scan (an
+  unmerged sibling can't be ASIN/photo-matched against a merged one that has neither on file).
+- Verified live in dev: scan against the real synced catalog found 54 groups — 30 certain (same ASIN), 23
+  likely (same photo, different ASIN — the "relisted" case the user described), 1 weak (title only, and
+  confirmed that one has two known-but-disagreeing ASINs, not missing data).
+- **Note for the user**: production's 33 merged SKUs still won't show a backfilled ASIN until "Sync Amazon
+  catalog" is clicked again on `/admin/inbound` — I can't trigger it myself (needs a live admin session).
+
 ## Next steps — a prioritized plan
 
 Rewritten 2026-09-20 (twenty-one passes across two days — see "Recently done" entries above for the

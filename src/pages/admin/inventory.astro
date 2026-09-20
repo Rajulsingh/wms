@@ -43,7 +43,13 @@ if (redirectTo) return Astro.redirect(redirectTo);
 
   <div class="card stack">
     <h2>Possible duplicate SKUs</h2>
-    <p>Finds SKUs with an exactly matching product name — almost always the same physical item Amazon sent under more than one SellerSKU. Only exact name matches are flagged; a small title difference won't show up here, so this isn't exhaustive. An identical title doesn't always mean identical product — compare the photos (and the ASIN, when shown) before merging.</p>
+    <p>
+      Matches on ASIN and product photo first — the same Amazon product identity, or the same real photo, is far
+      more reliable than title text, which can look identical for two genuinely different colors or sizes. Title
+      is only used as a last resort for SKUs with no ASIN or photo on file yet (try "Sync Amazon catalog" on
+      <a href="/admin/inbound">Receiving</a> first to fill those in). Same title alone is not proof of a
+      duplicate — check the group's confidence label and the photos before merging.
+    </p>
     <button class="btn" id="scan-duplicates-btn" style="width: auto;">Scan for duplicates</button>
     <div id="scan-progress" class="progress-bar indeterminate"><div class="progress-bar-fill"></div></div>
     <div id="duplicates-result"></div>
@@ -283,12 +289,29 @@ if (redirectTo) return Astro.redirect(redirectTo);
       orderItemCount: number;
       createdAt: string;
     }
+    type DuplicateMatchType = 'same_asin' | 'same_image' | 'same_title';
     interface DuplicateGroup {
+      matchType: DuplicateMatchType;
+      matchValue: string;
       name: string;
       candidates: DuplicateCandidate[];
       suggestedKeepId: string;
       hasAsinMismatch: boolean;
     }
+
+    const MATCH_TYPE_LABEL: Record<DuplicateMatchType, { pill: string; pillClass: string; note: string | null }> = {
+      same_asin: { pill: 'Certain — same ASIN', pillClass: 'status-success', note: null },
+      same_image: {
+        pill: 'Likely — same photo',
+        pillClass: 'status-progress',
+        note: 'Different ASINs but the exact same product photo — usually the same listing relisted under a new ASIN, but confirm before merging.'
+      },
+      same_title: {
+        pill: 'Weak — title only',
+        pillClass: 'status-warning',
+        note: 'Matched on title text only — their ASIN and/or photo are either missing or disagree with each other, so there\'s no stronger signal confirming these are the same product. Compare manually before merging.'
+      }
+    };
 
     const duplicatesResult = document.getElementById('duplicates-result')!;
     const scanProgress = document.getElementById('scan-progress')!;
@@ -321,25 +344,37 @@ if (redirectTo) return Astro.redirect(redirectTo);
       try {
         const groups: DuplicateGroup[] = await withLoading(btn, 'Scanning…', () => api('/api/admin/sku-duplicates'));
         if (!groups.length) {
-          duplicatesResult.innerHTML = `<p>No exact-name duplicates found.</p>`;
+          duplicatesResult.innerHTML = `<p>No possible duplicates found.</p>`;
           return;
         }
+        const counts = groups.reduce(
+          (acc, g) => ({ ...acc, [g.matchType]: (acc[g.matchType as DuplicateMatchType] ?? 0) + 1 }),
+          {} as Record<DuplicateMatchType, number>
+        );
         duplicatesResult.innerHTML = `
-          <p style="margin-top: 10px;">${groups.length} possible duplicate group${groups.length === 1 ? '' : 's'} found.</p>
+          <p style="margin-top: 10px;">
+            ${groups.length} possible duplicate group${groups.length === 1 ? '' : 's'} found —
+            ${counts.same_asin ?? 0} certain (same ASIN), ${counts.same_image ?? 0} likely (same photo), ${counts.same_title ?? 0} weak (title only).
+          </p>
           <div class="stack" id="duplicate-groups" style="gap: 10px;"></div>`;
         const list = document.getElementById('duplicate-groups')!;
         for (const g of groups) {
           const keep = g.candidates.find((c) => c.id === g.suggestedKeepId)!;
           const others = g.candidates.filter((c) => c.id !== g.suggestedKeepId);
+          const label = MATCH_TYPE_LABEL[g.matchType];
           const row = document.createElement('div');
           row.className = 'card';
           row.innerHTML = `
+            <div class="row" style="justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 8px;">
+              <span class="truncate-cell" style="max-width: 100%; font-weight: 600;" title="${escapeHtml(g.name)}">${escapeHtml(g.name)}</span>
+              <span class="status-pill ${label.pillClass}" style="flex-shrink: 0;">${label.pill}</span>
+            </div>
+            ${label.note ? `<p style="margin: 6px 0 0; font-size: 0.8rem; color: var(--muted);">${escapeHtml(label.note)}</p>` : ''}
             ${
               g.hasAsinMismatch
-                ? `<div class="banner banner-danger" style="margin-bottom: 10px;">⚠ Same title, different Amazon ASINs — these may be different products or variations, not duplicates. Check the photos before merging.</div>`
+                ? `<div class="banner banner-warning" style="margin-top: 8px;">⚠ These candidates carry different Amazon ASINs — could be a genuine color/size variation you intentionally treat as one SKU, or could be a real mismatch. Check the photos below before deciding.</div>`
                 : ''
             }
-            <span class="truncate-cell" style="max-width: 100%; font-weight: 600;" title="${escapeHtml(g.name)}">${escapeHtml(g.name)}</span>
             <div class="row" style="flex-wrap: wrap; gap: 16px; align-items: flex-start; margin-top: 10px;">
               ${candidateCardHtml(keep, true)}
               ${others.map((c) => candidateCardHtml(c, false)).join('')}

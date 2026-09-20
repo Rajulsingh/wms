@@ -95,34 +95,88 @@ export interface DuplicateSkuCandidate {
   createdAt: string;
 }
 
+export type DuplicateMatchType = 'same_asin' | 'same_image' | 'same_title';
+
 export interface DuplicateSkuGroup {
+  // 'same_asin' — two+ SKU codes share the exact same ASIN. Definitional:
+  //   Amazon's ASIN *is* the product identity, so this is certain, not a
+  //   guess (the user's "same ASIN have different SKU codes... product is
+  //   also same" case).
+  // 'same_image' — different (or unknown) ASINs, but the exact same product
+  //   photo. Also very strong (real Amazon photos aren't reused by
+  //   coincidence across different products), covers the "multiple ASINs
+  //   but same images and product" case — e.g. a listing that got
+  //   relisted under a new ASIN after suppression.
+  // 'same_title' — last-resort fallback for SKUs with no ASIN and no photo
+  //   to compare (never synced, or an inactive/removed Amazon listing) —
+  //   the only case where a real color/size variation can slip in
+  //   undetected, since title text alone can't rule that out.
+  matchType: DuplicateMatchType;
+  matchValue: string;
   name: string;
   candidates: DuplicateSkuCandidate[];
   suggestedKeepId: string;
-  // True when candidates in this group carry two or more distinct known
-  // ASINs — the group was formed purely on an identical product title, and
-  // a title match alone can't tell a real duplicate apart from a
-  // same-title variation (see mergeSku's doc comment and HANDOFF.md: two
-  // already-merged SKU pairs in production had matching titles but
-  // different photos). Doesn't mean "don't merge" — just "look closer."
+  // True when candidates carry two or more distinct known ASINs — only
+  // possible on a 'same_image' or 'same_title' group (a 'same_asin' group
+  // is that ASIN by construction). Doesn't mean "don't merge" — a seller can
+  // legitimately treat real color/size siblings as one fungible warehouse
+  // SKU (confirmed against this catalog: see HANDOFF.md) — just "look closer
+  // and decide deliberately," since it's also exactly how the exact-title
+  // scan mistook a real gun holder variation for a duplicate previously.
   hasAsinMismatch: boolean;
+}
+
+interface DupRow {
+  id: string;
+  sku_code: string;
+  name: string;
+  image_url: string | null;
+  asin: string | null;
+  created_at: string;
+  inventory_units: number;
+  order_item_count: number;
+}
+
+function pickSuggestedKeep(candidates: DuplicateSkuCandidate[]): string {
+  return candidates.reduce((a, b) => {
+    if (a.inventoryUnits !== b.inventoryUnits) return a.inventoryUnits > b.inventoryUnits ? a : b;
+    if (a.orderItemCount !== b.orderItemCount) return a.orderItemCount > b.orderItemCount ? a : b;
+    return a.createdAt <= b.createdAt ? a : b;
+  }).id;
+}
+
+function toCandidate(r: DupRow): DuplicateSkuCandidate {
+  return {
+    id: r.id,
+    code: r.sku_code,
+    imageUrl: r.image_url,
+    asin: r.asin,
+    inventoryUnits: r.inventory_units,
+    orderItemCount: r.order_item_count,
+    createdAt: r.created_at
+  };
 }
 
 /**
  * Finds SKUs that are almost certainly the same physical product listed
- * under more than one code — the same failure mode that caused the incident
- * this tool was built for (see HANDOFF.md, "a real production bug"), just
- * discovered proactively instead of one stock-out error at a time. Groups
- * by exact, case/whitespace-normalized product name — deliberately not a
- * fuzzy/similarity match, since a false positive here means merging two
- * SKUs that turn out to be genuinely different products, which is a real
- * mutation. Amazon listing titles are precise enough that two unrelated
- * products sharing byte-identical text is effectively impossible in
- * practice, whereas a small title variation (e.g. one has a "(Classic)"
- * suffix) is common for true duplicates too — those won't be caught here,
- * only exact matches. `suggestedKeepId` prefers whichever candidate already
- * has stock, then whichever has more order history, then whichever is
- * older — but it's only a suggestion; admin picks the actual pair to merge.
+ * under more than one code — the same failure mode that caused the
+ * incidents this tool was built for (see HANDOFF.md). ASIN and product
+ * photo are the primary signals now, not title: a title match alone can't
+ * tell a real duplicate apart from a real color/size variation that
+ * happens to share the same generic listing title (confirmed against this
+ * catalog — several genuine variations were nearly merged on title alone
+ * before ASIN/photo comparison caught it). Checked in order of confidence,
+ * and a SKU already placed in a stronger group is never re-flagged by a
+ * weaker one:
+ *   1. same_asin  — certain (ASIN is Amazon's own product identity)
+ *   2. same_image — very strong (real product photos aren't reused by
+ *                   coincidence); catches a product relisted under a new
+ *                   ASIN, which same_asin alone would miss
+ *   3. same_title — last resort, only for SKUs with neither ASIN nor photo
+ *                   on file (never synced, or an inactive Amazon listing)
+ * `suggestedKeepId` prefers whichever candidate already has stock, then
+ * whichever has more order history, then whichever is older — it's only a
+ * suggestion; admin picks the actual pair to merge.
  */
 export async function findDuplicateSkus(db: D1Database): Promise<DuplicateSkuGroup[]> {
   const rows = await db
@@ -131,52 +185,44 @@ export async function findDuplicateSkus(db: D1Database): Promise<DuplicateSkuGro
               COALESCE((SELECT SUM(quantity_on_hand) FROM inventory WHERE sku_id = s.id), 0) AS inventory_units,
               (SELECT COUNT(*) FROM order_items WHERE sku_id = s.id) AS order_item_count
        FROM skus s
-       WHERE s.merged_into_id IS NULL
-         AND TRIM(LOWER(s.name)) IN (
-           SELECT TRIM(LOWER(name)) FROM skus WHERE merged_into_id IS NULL GROUP BY TRIM(LOWER(name)) HAVING COUNT(*) > 1
-         )
-       ORDER BY TRIM(LOWER(s.name)), s.created_at ASC`
+       WHERE s.merged_into_id IS NULL`
     )
-    .all<{
-      id: string;
-      sku_code: string;
-      name: string;
-      image_url: string | null;
-      asin: string | null;
-      created_at: string;
-      inventory_units: number;
-      order_item_count: number;
-    }>();
+    .all<DupRow>();
 
-  const groups = new Map<string, DuplicateSkuGroup>();
-  for (const r of rows.results) {
-    const key = r.name.trim().toLowerCase();
-    let g = groups.get(key);
-    if (!g) {
-      g = { name: r.name, candidates: [], suggestedKeepId: '', hasAsinMismatch: false };
-      groups.set(key, g);
+  const placed = new Set<string>();
+  const groups: DuplicateSkuGroup[] = [];
+
+  function groupBy(source: DupRow[], keyOf: (r: DupRow) => string | null, matchType: DuplicateMatchType) {
+    const byKey = new Map<string, DupRow[]>();
+    for (const r of source) {
+      if (placed.has(r.id)) continue;
+      const key = keyOf(r);
+      if (!key) continue;
+      const list = byKey.get(key) ?? [];
+      list.push(r);
+      byKey.set(key, list);
     }
-    g.candidates.push({
-      id: r.id,
-      code: r.sku_code,
-      imageUrl: r.image_url,
-      asin: r.asin,
-      inventoryUnits: r.inventory_units,
-      orderItemCount: r.order_item_count,
-      createdAt: r.created_at
-    });
+    for (const [key, members] of byKey) {
+      if (members.length < 2) continue;
+      const candidates = members.map(toCandidate);
+      const knownAsins = new Set(candidates.map((c) => c.asin).filter((a): a is string => Boolean(a)));
+      groups.push({
+        matchType,
+        matchValue: key,
+        name: members[0].name,
+        candidates,
+        suggestedKeepId: pickSuggestedKeep(candidates),
+        hasAsinMismatch: knownAsins.size > 1
+      });
+      for (const m of members) placed.add(m.id);
+    }
   }
-  for (const g of groups.values()) {
-    const best = g.candidates.reduce((a, b) => {
-      if (a.inventoryUnits !== b.inventoryUnits) return a.inventoryUnits > b.inventoryUnits ? a : b;
-      if (a.orderItemCount !== b.orderItemCount) return a.orderItemCount > b.orderItemCount ? a : b;
-      return a.createdAt <= b.createdAt ? a : b;
-    });
-    g.suggestedKeepId = best.id;
-    const knownAsins = new Set(g.candidates.map((c) => c.asin).filter((a): a is string => Boolean(a)));
-    g.hasAsinMismatch = knownAsins.size > 1;
-  }
-  return Array.from(groups.values());
+
+  groupBy(rows.results, (r) => r.asin, 'same_asin');
+  groupBy(rows.results, (r) => r.image_url, 'same_image');
+  groupBy(rows.results, (r) => r.name.trim().toLowerCase(), 'same_title');
+
+  return groups;
 }
 
 export interface SkuMergeResult {

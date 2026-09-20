@@ -4,7 +4,6 @@ import { fetchAllListings } from './amazon';
 export interface CatalogSyncResult {
   created: number;
   updated: number;
-  skippedMerged: number;
   total: number;
 }
 
@@ -34,11 +33,15 @@ export interface CatalogSyncProgress {
  * (or vice versa, depending on pagination order that run) — corrupting
  * whichever one happened to sync last. A merged-away code's own listing data
  * describes a different product/variation than the survivor now represents,
- * so it must never be written onto the survivor's row. Instead: only write
- * name/image/asin to a SKU when `listing.sku` is that exact row's own,
- * current, non-merged code; a listing whose code has been merged away is
- * counted in `skippedMerged` and otherwise ignored (not recreated either —
- * that's still resolveSkuIdByCode's job, just not used for the write here).
+ * so it must never be written onto the survivor's row. The lookup below is
+ * always by `sku_code = listing.sku` directly (never resolved through a
+ * merge redirect), so `existing.id` is always that exact row's own id —
+ * writing to it is always safe and correct regardless of whether that row
+ * happens to be merged into something else. Keeping a merged-away row's own
+ * name/image/asin fresh (rather than skipping it) matters: it's the only way
+ * that row's data stays trustworthy for later duplicate-detection/ASIN
+ * comparisons (skus.ts) instead of going permanently stale the moment it's
+ * merged.
  *
  * `onProgress` fires after each page of listings is fetched *and* written,
  * not just fetched — so a caller streaming this to a progress bar reports
@@ -47,17 +50,13 @@ export interface CatalogSyncProgress {
 export async function syncAmazonCatalog(db: D1Database, onProgress?: (p: CatalogSyncProgress) => void | Promise<void>): Promise<CatalogSyncResult> {
   let created = 0;
   let updated = 0;
-  let skippedMerged = 0;
   let processed = 0;
 
   const listings = await fetchAllListings(async (pageItems) => {
     for (const listing of pageItems) {
       if (!listing.title) continue; // nothing useful to store yet
 
-      const existing = await db
-        .prepare(`SELECT id, merged_into_id FROM skus WHERE sku_code = ?`)
-        .bind(listing.sku)
-        .first<{ id: string; merged_into_id: string | null }>();
+      const existing = await db.prepare(`SELECT id FROM skus WHERE sku_code = ?`).bind(listing.sku).first<{ id: string }>();
 
       if (!existing) {
         await db
@@ -65,8 +64,6 @@ export async function syncAmazonCatalog(db: D1Database, onProgress?: (p: Catalog
           .bind(newId(), listing.sku, listing.title, listing.imageUrl, listing.asin)
           .run();
         created++;
-      } else if (existing.merged_into_id) {
-        skippedMerged++;
       } else {
         await db
           .prepare(`UPDATE skus SET name = ?, image_url = ?, asin = COALESCE(?, asin) WHERE id = ?`)
@@ -79,5 +76,5 @@ export async function syncAmazonCatalog(db: D1Database, onProgress?: (p: Catalog
     if (onProgress) await onProgress({ processed, total: null });
   });
 
-  return { created, updated, skippedMerged, total: listings.length };
+  return { created, updated, total: listings.length };
 }
