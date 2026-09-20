@@ -1213,6 +1213,18 @@ using title text alone. That's the real bug: not a sync/matching defect (checked
   found while investigating — that's a data decision for the user now that they can actually see the
   photos, not something to silently correct. Worth pointing out to them directly.
 
+**Update, same day**: user asked to fix the 2 suspect pairs. Confirmed both were losslessly
+reversible before touching anything — `inventory`/`order_items`/`pick_tasks` all showed zero rows
+ever attached to either source SKU (`K4-WYCE-N7SH`, `TANKEY`), and the original merge log entries
+for both recorded 0 units/lines/tasks moved. So "unmerging" needed no data reconstruction, just
+`UPDATE skus SET merged_into_id = NULL WHERE id IN (...)` on the two source rows, run directly
+against production after explicit user confirmation. Logged as `sku.unmerge` in `audit_log` (not a
+code path yet — there's no "Unmerge" button in the UI, this was a one-off manual fix). Their sibling
+merges under the same targets (`RZBH-WT` → `RZBH-B`, `6R-4S62-STFM` → `TANKEY-W`) were checked too
+and confirmed genuine — same photo as the target both times — so those were left merged.
+`K4-WYCE-N7SH` and `TANKEY` now sit as independent, zero-stock SKUs again; if the user has real
+physical stock of either variant, it still needs to be received in separately under those codes.
+
 ## Next steps — a prioritized plan
 
 Rewritten 2026-09-20 (twenty-one passes across two days — see "Recently done" entries above for the
