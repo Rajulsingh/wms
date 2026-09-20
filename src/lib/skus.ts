@@ -248,3 +248,79 @@ export async function mergeSku(db: D1Database, userId: string, sourceCode: strin
 
   return result;
 }
+
+export interface SkuUnmergePreview {
+  source: { id: string; code: string; name: string; imageUrl: string | null; asin: string | null };
+  target: { id: string; code: string; name: string; imageUrl: string | null; asin: string | null };
+  // What currently sits under the target's own id — NOT what would move back.
+  // Unmerging never moves inventory/orders automatically (see unmergeSku):
+  // once merged, a target's own pre-existing data and anything genuinely
+  // moved from the source are indistinguishable from each other, so this is
+  // shown only as context for the admin to judge, not a promise of what
+  // unmerging will change.
+  targetInventoryLines: number;
+  targetInventoryUnits: number;
+  targetOrderItemCount: number;
+}
+
+async function loadUnmergeable(db: D1Database, sourceCode: string): Promise<{ source: SkuRef; target: SkuRef }> {
+  const source = await db.prepare(`SELECT id, sku_code, name, image_url, asin, merged_into_id FROM skus WHERE sku_code = ?`).bind(sourceCode).first<SkuRef>();
+  if (!source) throw new SkuMergeError('not_found', `No SKU found with code "${sourceCode}"`);
+  if (!source.merged_into_id) throw new SkuMergeError('not_merged', `"${sourceCode}" isn't currently merged into anything`);
+  const target = await db.prepare(`SELECT id, sku_code, name, image_url, asin, merged_into_id FROM skus WHERE id = ?`).bind(source.merged_into_id).first<SkuRef>();
+  if (!target) throw new SkuMergeError('not_found', `"${sourceCode}"'s merge target no longer exists`);
+  return { source, target };
+}
+
+/** Read-only — shows what a SKU is currently merged into, plus context on the target, before committing to unmerge. */
+export async function previewSkuUnmerge(db: D1Database, sourceCode: string): Promise<SkuUnmergePreview> {
+  const { source, target } = await loadUnmergeable(db, sourceCode);
+
+  const [inv, oi] = await Promise.all([
+    db.prepare(`SELECT COUNT(*) AS lines, COALESCE(SUM(quantity_on_hand), 0) AS units FROM inventory WHERE sku_id = ?`).bind(target.id).first<{ lines: number; units: number }>(),
+    db.prepare(`SELECT COUNT(*) AS c FROM order_items WHERE sku_id = ?`).bind(target.id).first<{ c: number }>()
+  ]);
+
+  return {
+    source: { id: source.id, code: source.sku_code, name: source.name, imageUrl: source.image_url, asin: source.asin },
+    target: { id: target.id, code: target.sku_code, name: target.name, imageUrl: target.image_url, asin: target.asin },
+    targetInventoryLines: inv?.lines ?? 0,
+    targetInventoryUnits: inv?.units ?? 0,
+    targetOrderItemCount: oi?.c ?? 0
+  };
+}
+
+export interface SkuUnmergeResult {
+  sourceCode: string;
+  wasTargetCode: string;
+}
+
+/**
+ * Reverses a merge by clearing `merged_into_id` — nothing else. Deliberately
+ * does NOT try to move any inventory/order_items/pick_tasks back to the
+ * source: once merged, there is no reliable way to tell which of the
+ * target's current rows were always its own vs. genuinely moved from the
+ * source (mergeSku sums same-location inventory into the target's existing
+ * row and deletes the source's, and order_items/pick_tasks are simply
+ * repointed with no marker of where they came from) — a blind "move it all
+ * back" would be just as much a guess as the original wrong merge, only in
+ * the other direction. If real inventory or orders need to be separated back
+ * out, that takes the same manual, evidence-based check done for the
+ * production incidents this was built from (see HANDOFF.md): cross-reference
+ * against Amazon's own order records before moving anything.
+ */
+export async function unmergeSku(db: D1Database, userId: string, sourceCode: string): Promise<SkuUnmergeResult> {
+  const { source, target } = await loadUnmergeable(db, sourceCode);
+
+  await db.prepare(`UPDATE skus SET merged_into_id = NULL WHERE id = ?`).bind(source.id).run();
+
+  await logAudit(db, {
+    userId,
+    action: 'sku.unmerge',
+    entityType: 'sku',
+    entityId: source.id,
+    metadata: { sourceCode: source.sku_code, wasTargetCode: target.sku_code }
+  });
+
+  return { sourceCode: source.sku_code, wasTargetCode: target.sku_code };
+}

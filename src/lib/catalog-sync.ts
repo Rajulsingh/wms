@@ -1,10 +1,10 @@
 import { newId } from './db';
 import { fetchAllListings } from './amazon';
-import { resolveSkuIdByCode } from './skus';
 
 export interface CatalogSyncResult {
   created: number;
   updated: number;
+  skippedMerged: number;
   total: number;
 }
 
@@ -26,6 +26,20 @@ export interface CatalogSyncProgress {
  * products or variations, which the exact-name duplicate scan (skus.ts)
  * can't tell apart from title alone.
  *
+ * Deliberately does NOT follow a merge redirect the way order import's
+ * `resolveSkuIdByCode` does — found via a real production incident (see
+ * HANDOFF.md): if `listing.sku` is a code that's been merged away, its Amazon
+ * listing usually didn't disappear, and every sync would silently overwrite
+ * the *surviving* SKU's real name/image/asin with the *retired* code's data
+ * (or vice versa, depending on pagination order that run) — corrupting
+ * whichever one happened to sync last. A merged-away code's own listing data
+ * describes a different product/variation than the survivor now represents,
+ * so it must never be written onto the survivor's row. Instead: only write
+ * name/image/asin to a SKU when `listing.sku` is that exact row's own,
+ * current, non-merged code; a listing whose code has been merged away is
+ * counted in `skippedMerged` and otherwise ignored (not recreated either —
+ * that's still resolveSkuIdByCode's job, just not used for the write here).
+ *
  * `onProgress` fires after each page of listings is fetched *and* written,
  * not just fetched — so a caller streaming this to a progress bar reports
  * what's actually been persisted, not just downloaded.
@@ -33,33 +47,37 @@ export interface CatalogSyncProgress {
 export async function syncAmazonCatalog(db: D1Database, onProgress?: (p: CatalogSyncProgress) => void | Promise<void>): Promise<CatalogSyncResult> {
   let created = 0;
   let updated = 0;
+  let skippedMerged = 0;
   let processed = 0;
 
   const listings = await fetchAllListings(async (pageItems) => {
     for (const listing of pageItems) {
       if (!listing.title) continue; // nothing useful to store yet
 
-      // Follows a merge redirect — if this SellerSKU is a duplicate that's
-      // since been merged into another SKU, the catalog's name/image update
-      // applies to the surviving SKU, not the dead one. See lib/skus.ts.
-      const resolvedId = await resolveSkuIdByCode(db, listing.sku);
-      if (resolvedId) {
-        await db
-          .prepare(`UPDATE skus SET name = ?, image_url = ?, asin = COALESCE(?, asin) WHERE id = ?`)
-          .bind(listing.title, listing.imageUrl, listing.asin, resolvedId)
-          .run();
-        updated++;
-      } else {
+      const existing = await db
+        .prepare(`SELECT id, merged_into_id FROM skus WHERE sku_code = ?`)
+        .bind(listing.sku)
+        .first<{ id: string; merged_into_id: string | null }>();
+
+      if (!existing) {
         await db
           .prepare(`INSERT INTO skus (id, sku_code, name, image_url, asin) VALUES (?, ?, ?, ?, ?)`)
           .bind(newId(), listing.sku, listing.title, listing.imageUrl, listing.asin)
           .run();
         created++;
+      } else if (existing.merged_into_id) {
+        skippedMerged++;
+      } else {
+        await db
+          .prepare(`UPDATE skus SET name = ?, image_url = ?, asin = COALESCE(?, asin) WHERE id = ?`)
+          .bind(listing.title, listing.imageUrl, listing.asin, existing.id)
+          .run();
+        updated++;
       }
     }
     processed += pageItems.length;
     if (onProgress) await onProgress({ processed, total: null });
   });
 
-  return { created, updated, total: listings.length };
+  return { created, updated, skippedMerged, total: listings.length };
 }

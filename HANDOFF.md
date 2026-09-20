@@ -1225,6 +1225,58 @@ and confirmed genuine — same photo as the target both times — so those were 
 `K4-WYCE-N7SH` and `TANKEY` now sit as independent, zero-stock SKUs again; if the user has real
 physical stock of either variant, it still needs to be received in separately under those codes.
 
+## Recently done (2026-09-20, a twenty-eighth pass) — the gun holder was a real fulfillment bug, and the catalog-sync corruption was systemic
+
+The user reported one specific mismatch (`GN-HLDR` showing the wrong photo) that turned into finding and
+fixing a real, systemic production bug, plus a genuine mistake of my own that had to be caught and reversed.
+
+**The gun holder (`GN-HLDR` / `U8-9OI6-L4OE`) — a real fulfillment bug, not just a display issue.**
+Checked live against Amazon's own Orders API (not just catalog data): all 4 order lines currently attached
+to `GN-HLDR` had actually been placed by customers under SellerSKU `U8-9OI6-L4OE` (the "(Classic)" variant,
+ASIN `B0H42JFR5F` vs `GN-HLDR`'s real `B0GK34S8G9`) — a manual merge from an earlier incident had silently
+redirected them. 3 were still unfulfilled and past their ship-by date; none had reached picking yet (verified
+before touching anything). Fixed: moved the 4 order lines back to `U8-9OI6-L4OE`, un-merged it, corrected
+`GN-HLDR`'s photo/ASIN to its own real listing data.
+
+**Root cause, found while investigating a second reported mismatch (`DOG-BKM-5`): `syncAmazonCatalog` was
+systemic, not a one-off.** `resolveSkuIdByCode` (correctly used for order import, so a merged code's future
+orders still route to the survivor) was *also* being used for catalog sync's name/image/asin **write** —
+meaning every sync silently let a merged-away code's live Amazon listing overwrite the survivor's real
+photo/title/asin, whichever pagination order processed last. Fixed in `catalog-sync.ts`: the write now only
+ever applies via a SKU's own, current, non-merged `sku_code` — a merged-away code's listing is now counted
+in a new `skippedMerged` field and otherwise ignored, never written onto another row. Surfaced in the
+"Sync Amazon catalog" success message on `inbound.astro` when non-zero.
+
+**Full production sweep, and a real mistake caught mid-course.** Cross-referenced all 41 remaining merged
+pairs directly against live Amazon Listings API data (not stored DB values, which can't be trusted once
+this bug existed). Initially flagged `K4-WYCE-N7SH`→`RZBH-B` and `TANKEY`→`TANKEY-W` as *also* wrong back
+in the same-day pass before this one — **that was a mistake**: their comparison was against `RZBH-B`'s and
+`TANKEY-W`'s *stored* photos, which were themselves already corrupted by a different, genuinely-wrong
+source (`RZBH-WT`, `6R-4S62-STFM`). Checked directly against live data: `K4-WYCE-N7SH`/`RZBH-B` share the
+exact same photo, and `TANKEY`/`TANKEY-W` share the exact same ASIN — both genuine duplicates. Re-merged
+both back. The user also corrected an over-broad assumption on my part: a differing photo/ASIN does not by
+itself mean "wrong merge" — a seller can deliberately treat real color/variant siblings as one fungible
+warehouse SKU. Confirmed with the user pair-by-pair before acting; final state:
+- **Unmerged** (confirmed genuinely different products, zero inventory/orders ever attached, so lossless):
+  `1L-OOVK-UP4B` (dog bookmark), `GUNM-2` (gun holder, a *second* wrong source into `GN-HLDR`),
+  `B6-DH0K-QILV` (controller stand), `AR-Z9YP-S4HN` (LEGO baseplate), `RZBH-WT` (razor holder),
+  `SKRA-1` (bookmark), `6R-4S62-STFM` (keychain), `RAKHI-2` (rakhi thread).
+- **Re-merged** (genuine duplicates, wrongly separated by my own earlier mistake): `K4-WYCE-N7SH` → `RZBH-B`,
+  `TANKEY` → `TANKEY-W`.
+- **Corrected photo/ASIN** on 10 targets total (the 8 unmerge targets + `8-BIT-BLK`/`CAT-SCR-CAC`, which were
+  genuine duplicates with only a stale ASIN) back to each one's own live Amazon data.
+- All logged to `audit_log` (`sku.unmerge`, `sku.merge_sweep`).
+
+**New: an "Unmerge a SKU" card on `/admin/inventory`** (`previewSkuUnmerge`/`unmergeSku` in `skus.ts`,
+`api/admin/sku-unmerge.ts`) — the user asked for this directly after watching several of these fixes happen
+only via me running raw SQL. Enter a merged (retired) code, see what it's merged into (photo/ASIN/name) plus
+the target's current inventory/order-line counts *for context only*, then confirm. Deliberately does **not**
+attempt to move inventory/orders back automatically — once merged, there's no reliable way to tell which of
+the target's current rows were always its own vs. genuinely moved from the source, so a blind auto-reversal
+would be exactly as much a guess as the original wrong merge. If real stock/orders need separating (like the
+gun holder case), that still needs the same manual, evidence-based check (cross-reference Amazon's own order
+records) done in this pass — not something a generic "unmerge" button can safely automate.
+
 ## Next steps — a prioritized plan
 
 Rewritten 2026-09-20 (twenty-one passes across two days — see "Recently done" entries above for the

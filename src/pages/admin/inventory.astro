@@ -26,6 +26,22 @@ if (redirectTo) return Astro.redirect(redirectTo);
   </div>
 
   <div class="card stack">
+    <h2>Unmerge a SKU</h2>
+    <p>
+      If two SKUs turn out to be genuinely different products (or variants you want to track separately)
+      after all, undo a merge here. This only stops the retired code from redirecting to the other SKU going
+      forward — it does <strong>not</strong> automatically move any inventory or orders back, since once merged
+      there's no reliable way to tell which of the surviving SKU's inventory or orders were always its own vs.
+      genuinely came from the retired code. If real stock or orders need separating out, check them manually first.
+    </p>
+    <div class="row" style="flex-wrap: wrap; gap: 10px;">
+      <input type="text" id="unmerge-source" placeholder="Merged (retired) SKU code to restore" style="flex: 1; min-width: 220px;" />
+      <button class="btn" id="unmerge-preview-btn" style="width: auto;">Look up</button>
+    </div>
+    <div id="unmerge-result"></div>
+  </div>
+
+  <div class="card stack">
     <h2>Possible duplicate SKUs</h2>
     <p>Finds SKUs with an exactly matching product name — almost always the same physical item Amazon sent under more than one SellerSKU. Only exact name matches are flagged; a small title difference won't show up here, so this isn't exhaustive. An identical title doesn't always mean identical product — compare the photos (and the ASIN, when shown) before merging.</p>
     <button class="btn" id="scan-duplicates-btn" style="width: auto;">Scan for duplicates</button>
@@ -198,6 +214,63 @@ if (redirectTo) return Astro.redirect(redirectTo);
         mergeResult.innerHTML = `<p style="color: var(--danger); margin-top: 10px;">${escapeHtml((err as Error).message)}</p>`;
       } finally {
         mergeProgress.classList.remove('active');
+      }
+    });
+
+    interface UnmergePreview {
+      source: MergeSide;
+      target: MergeSide;
+      targetInventoryLines: number;
+      targetInventoryUnits: number;
+      targetOrderItemCount: number;
+    }
+
+    const unmergeResult = document.getElementById('unmerge-result')!;
+    const unmergeSourceInput = document.getElementById('unmerge-source') as HTMLInputElement;
+
+    document.getElementById('unmerge-preview-btn')?.addEventListener('click', async (e) => {
+      const sourceCode = unmergeSourceInput.value.trim();
+      unmergeResult.innerHTML = '';
+      if (!sourceCode) {
+        unmergeResult.innerHTML = `<p style="color: var(--danger);">Enter a SKU code.</p>`;
+        return;
+      }
+      const btn = e.currentTarget as HTMLButtonElement;
+      try {
+        const preview: UnmergePreview = await withLoading(btn, 'Checking…', () =>
+          api(`/api/admin/sku-unmerge?sourceCode=${encodeURIComponent(sourceCode)}`)
+        );
+        unmergeResult.innerHTML = `
+          <div class="banner banner-warning" style="margin-top: 10px;">
+            <p style="margin: 0 0 10px;">
+              <strong>${escapeHtml(preview.source.code)}</strong> is currently merged into
+              <strong>${escapeHtml(preview.target.code)}</strong>.
+            </p>
+            <div class="row" style="gap: 12px; align-items: flex-start; flex-wrap: wrap; margin-bottom: 10px;">
+              ${mergeSideCardHtml('Currently merged (' + preview.source.code + ')', preview.source)}
+              <div style="align-self: center; font-size: 1.2rem; color: var(--muted);">→</div>
+              ${mergeSideCardHtml('Merged into', preview.target)}
+            </div>
+            <p style="margin: 0 0 8px; font-size: 0.85rem;">
+              ${escapeHtml(preview.target.code)} currently has ${preview.targetInventoryLines} inventory location${preview.targetInventoryLines === 1 ? '' : 's'}
+              (${preview.targetInventoryUnits} unit${preview.targetInventoryUnits === 1 ? '' : 's'}) and ${preview.targetOrderItemCount} order line${preview.targetOrderItemCount === 1 ? '' : 's'} —
+              shown for context only. Unmerging won't move any of it; if some of it genuinely belongs to
+              ${escapeHtml(preview.source.code)}, that needs checking and moving manually.
+            </p>
+            <button class="btn btn-primary" id="unmerge-confirm-btn" style="width: auto;">Confirm unmerge</button>
+          </div>`;
+        document.getElementById('unmerge-confirm-btn')?.addEventListener('click', async (ce) => {
+          const confirmBtn = ce.currentTarget as HTMLButtonElement;
+          try {
+            await withLoading(confirmBtn, 'Unmerging…', () => api('/api/admin/sku-unmerge', { sourceCode }, 'POST'));
+            unmergeResult.innerHTML = `<div class="banner banner-success" style="margin-top: 10px;">Unmerged — "${escapeHtml(sourceCode)}" is independent again.</div>`;
+            unmergeSourceInput.value = '';
+          } catch (err) {
+            unmergeResult.innerHTML = `<p style="color: var(--danger); margin-top: 10px;">${escapeHtml((err as Error).message)}</p>`;
+          }
+        });
+      } catch (err) {
+        unmergeResult.innerHTML = `<p style="color: var(--danger); margin-top: 10px;">${escapeHtml((err as Error).message)}</p>`;
       }
     });
 
