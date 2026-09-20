@@ -26,9 +26,46 @@ if (redirectTo) return Astro.redirect(redirectTo);
   <div class="stat-grid" id="stat-grid"></div>
 
   <div class="card stack">
-    <h2>Orders</h2>
+    <div class="row" style="justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+      <h2 style="margin: 0;">Orders</h2>
+      <div class="row" style="width: auto; gap: 6px; flex-wrap: wrap;">
+        <select id="search-field" style="width: auto; min-height: 38px;">
+          <option value="order_id">Order ID</option>
+          <option value="asin">ASIN</option>
+          <option value="sku">SKU</option>
+          <option value="product_name">Product name</option>
+          <option value="tracking_id">Tracking ID</option>
+          <option value="buyer_name">Buyer name</option>
+        </select>
+        <input type="text" id="search-input" placeholder="Search orders" style="width: auto; min-height: 38px; min-width: 180px;" />
+        <button type="button" class="btn" id="search-btn" style="width: auto; min-height: 38px;">Search</button>
+        <button type="button" class="btn btn-ghost" id="search-clear-btn" style="width: auto; min-height: 38px; display: none;">Clear</button>
+      </div>
+    </div>
+
     <div class="row" id="status-tabs" style="flex-wrap: wrap; gap: 6px;"></div>
+    <div class="row" id="sent-subtabs" style="flex-wrap: wrap; gap: 6px; display: none;"></div>
+
+    <div class="row" style="justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+      <span id="results-summary" style="font-size: 0.82rem; color: var(--muted);"></span>
+      <div class="row" style="width: auto; gap: 8px; align-items: center;">
+        <select id="sort-select" style="width: auto; min-height: 36px;">
+          <option value="ship_by_asc">Ship-by date (ascending)</option>
+          <option value="ship_by_desc">Ship-by date (descending)</option>
+          <option value="order_date_desc">Order date (newest)</option>
+          <option value="order_date_asc">Order date (oldest)</option>
+        </select>
+        <select id="page-size-select" style="width: auto; min-height: 36px;">
+          <option value="25">25 / page</option>
+          <option value="50" selected>50 / page</option>
+          <option value="100">100 / page</option>
+        </select>
+      </div>
+    </div>
+
     <div id="orders-table">Loading…</div>
+
+    <div class="row" id="pagination" style="justify-content: center; align-items: center; gap: 10px;"></div>
   </div>
 
   <script>
@@ -39,14 +76,23 @@ if (redirectTo) return Astro.redirect(redirectTo);
       external_order_id: string;
       source: string;
       status: string;
+      amazon_order_status: string | null;
+      easyship_status: string | null;
       customer_name: string | null;
       created_at: string;
+      ship_by: string | null;
       first_item_name: string | null;
       first_item_image: string | null;
       item_count: number;
       order_value: number | null;
       notes: string | null;
+      tracking_id: string | null;
+      display_status: string;
+      display_status_style: string;
     }
+
+    type Tab = 'pending' | 'unshipped' | 'sent' | 'cancelled';
+    type SentFilter = 'waiting_pickup' | 'shipped' | null;
 
     function productSummary(o: OrderRow): string {
       if (!o.first_item_name) return 'No items';
@@ -76,49 +122,61 @@ if (redirectTo) return Astro.redirect(redirectTo);
       </button>`;
     }
 
+    // Our own pick/pack pipeline stage — kept as a secondary pill alongside
+    // the Amazon-style "Order Status" column since it carries information
+    // Amazon has no visibility into (e.g. "packing" vs "picked").
     const STATUS_STYLE: Record<string, string> = {
       pending: 'status-neutral',
       batched: 'status-progress',
       picking: 'status-progress',
+      picked: 'status-progress',
       packing: 'status-progress',
+      packed: 'status-progress',
+      partial: 'status-warning',
       ready_to_ship: 'status-warning',
-      shipped: 'status-success'
+      shipped: 'status-success',
+      cancelled: 'status-danger'
     };
 
-    function statusPill(status: string): string {
+    function internalStatusPill(status: string): string {
       const cls = STATUS_STYLE[status] ?? 'status-neutral';
-      return `<span class="status-pill ${cls}">${status.replace(/_/g, ' ')}</span>`;
+      return `<span class="status-pill ${cls}" title="Internal warehouse stage">${status.replace(/_/g, ' ')}</span>`;
+    }
+
+    function amazonStatusPill(o: OrderRow): string {
+      return `<span class="status-pill ${o.display_status_style}">${o.display_status}</span>`;
     }
 
     const userPill = document.getElementById('user-pill')!;
     const actionResult = document.getElementById('action-result') as HTMLDivElement;
     const ordersTable = document.getElementById('orders-table')!;
     const statusTabs = document.getElementById('status-tabs')!;
+    const sentSubtabs = document.getElementById('sent-subtabs')!;
     const statGrid = document.getElementById('stat-grid')!;
+    const resultsSummary = document.getElementById('results-summary')!;
+    const pagination = document.getElementById('pagination')!;
+    const searchField = document.getElementById('search-field') as unknown as HTMLSelectElement;
+    const searchInput = document.getElementById('search-input') as HTMLInputElement;
+    const searchClearBtn = document.getElementById('search-clear-btn') as HTMLButtonElement;
+    const sortSelect = document.getElementById('sort-select') as unknown as HTMLSelectElement;
+    const pageSizeSelect = document.getElementById('page-size-select') as unknown as HTMLSelectElement;
     let warehouseId = '';
-    let allOrders: OrderRow[] = [];
+    let currentOrders: OrderRow[] = [];
     let skuCount: number | null = null;
-    let activeTab = 'all';
+    // Mirrors Seller Central's own top-level tabs and order — see
+    // getAdminOrders in lib/admin-orders.ts for how each order is bucketed.
+    let activeTab: Tab = 'unshipped';
+    let sentFilter: SentFilter = null;
+    let searchQuery = '';
+    let sort = 'ship_by_asc';
+    let page = 1;
+    let pageSize = 50;
+    let totalCount = 0;
+    let tabCounts: Record<Tab, number> = { pending: 0, unshipped: 0, sent: 0, cancelled: 0 };
+    let sentCounts: Record<'waiting_pickup' | 'shipped', number> = { waiting_pickup: 0, shipped: 0 };
 
-    // Standard-WMS-style status buckets — our internal status column has more
-    // granularity (picking/picked/packing/packed) than a floor manager needs
-    // to filter by day-to-day, so these group several statuses under one tab.
-    const STATUS_GROUPS: Record<string, string[]> = {
-      all: [],
-      new: ['pending', 'allocated'],
-      processing: ['batched', 'picking', 'picked', 'packing', 'packed', 'partial'],
-      ready: ['ready_to_ship'],
-      shipped: ['shipped'],
-      cancelled: ['cancelled']
-    };
-    const TAB_LABELS: Record<string, string> = {
-      all: 'All',
-      new: 'New',
-      processing: 'Processing',
-      ready: 'Ready to ship',
-      shipped: 'Shipped',
-      cancelled: 'Cancelled'
-    };
+    const TAB_ORDER: Tab[] = ['pending', 'unshipped', 'cancelled', 'sent'];
+    const TAB_LABELS: Record<Tab, string> = { pending: 'Pending', unshipped: 'Unshipped', cancelled: 'Cancelled', sent: 'Sent' };
 
     async function api(path: string, body?: unknown, method?: string) {
       const res = await fetch(path, {
@@ -138,12 +196,11 @@ if (redirectTo) return Astro.redirect(redirectTo);
     }
 
     function renderStats() {
-      const count = (key: string) => allOrders.filter((o) => STATUS_GROUPS[key].includes(o.status)).length;
       const cards: Array<{ label: string; value: number | string; accent: string }> = [
-        { label: 'New orders', value: count('new'), accent: 'stat-card-accent-neutral' },
-        { label: 'Processing', value: count('processing'), accent: 'stat-card-accent-progress' },
-        { label: 'Ready to ship', value: count('ready'), accent: 'stat-card-accent-warning' },
-        { label: 'Shipped', value: count('shipped'), accent: 'stat-card-accent-success' },
+        { label: 'Pending', value: tabCounts.pending ?? 0, accent: 'stat-card-accent-neutral' },
+        { label: 'Unshipped', value: tabCounts.unshipped ?? 0, accent: 'stat-card-accent-progress' },
+        { label: 'Sent', value: tabCounts.sent ?? 0, accent: 'stat-card-accent-success' },
+        { label: 'Cancelled', value: tabCounts.cancelled ?? 0, accent: 'stat-card-accent-warning' },
         { label: 'Current SKUs', value: skuCount ?? '—', accent: 'stat-card-accent-neutral' }
       ];
       statGrid.innerHTML = cards
@@ -157,47 +214,96 @@ if (redirectTo) return Astro.redirect(redirectTo);
     }
 
     function renderTabs() {
-      statusTabs.innerHTML = Object.keys(STATUS_GROUPS)
-        .map((key) => {
-          const count = key === 'all' ? allOrders.length : allOrders.filter((o) => STATUS_GROUPS[key].includes(o.status)).length;
-          return `<button type="button" class="pill tab-pill${key === activeTab ? ' active' : ''}" data-tab="${key}">${TAB_LABELS[key]}${count ? ` (${count})` : ''}</button>`;
-        })
-        .join('');
+      statusTabs.innerHTML = TAB_ORDER.map((key) => {
+        const count = tabCounts[key] ?? 0;
+        return `<button type="button" class="pill tab-pill${key === activeTab ? ' active' : ''}" data-tab="${key}">${TAB_LABELS[key]} (${count})</button>`;
+      }).join('');
 
       statusTabs.querySelectorAll('button[data-tab]').forEach((btn) => {
         btn.addEventListener('click', () => {
-          activeTab = (btn as HTMLButtonElement).dataset.tab!;
-          renderTabs();
-          renderOrders();
+          activeTab = (btn as HTMLButtonElement).dataset.tab as Tab;
+          sentFilter = null;
+          page = 1;
+          loadOrders();
         });
       });
     }
 
-    function renderOrders() {
-      const filtered = activeTab === 'all' ? allOrders : allOrders.filter((o) => STATUS_GROUPS[activeTab].includes(o.status));
+    // Amazon's own second-level split within "Sent" — see SENT_SUB_CASE in
+    // lib/admin-orders.ts for why this doesn't need the exact
+    // EasyShipShipmentStatus value, just our own status='shipped' transition.
+    function renderSentSubtabs() {
+      if (activeTab !== 'sent') {
+        sentSubtabs.style.display = 'none';
+        return;
+      }
+      sentSubtabs.style.display = 'flex';
+      const items: Array<{ key: SentFilter; label: string }> = [
+        { key: null, label: `All sent (${sentCounts.waiting_pickup + sentCounts.shipped})` },
+        { key: 'waiting_pickup', label: `Waiting for pickup (${sentCounts.waiting_pickup})` },
+        { key: 'shipped', label: `Shipped (${sentCounts.shipped})` }
+      ];
+      sentSubtabs.innerHTML = items
+        .map((it) => `<button type="button" class="pill tab-pill${sentFilter === it.key ? ' active' : ''}" data-sent="${it.key ?? ''}">${it.label}</button>`)
+        .join('');
+      sentSubtabs.querySelectorAll('button[data-sent]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          sentFilter = ((btn as HTMLButtonElement).dataset.sent || null) as SentFilter;
+          page = 1;
+          loadOrders();
+        });
+      });
+    }
 
-      if (!filtered.length) {
-        ordersTable.innerHTML = `<p>No ${activeTab === 'all' ? '' : TAB_LABELS[activeTab].toLowerCase() + ' '}orders${activeTab === 'all' ? ' yet' : ''}.</p>`;
+    function renderPagination() {
+      const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
+      resultsSummary.textContent = totalCount ? `${totalCount} order${totalCount === 1 ? '' : 's'}` : 'No orders';
+      pagination.innerHTML = `
+        <button type="button" class="btn btn-ghost" id="prev-page" style="width: auto;" ${page <= 1 ? 'disabled' : ''}>Previous</button>
+        <span style="font-size: 0.82rem; color: var(--muted);">Page ${page} of ${totalPages}</span>
+        <button type="button" class="btn btn-ghost" id="next-page" style="width: auto;" ${page >= totalPages ? 'disabled' : ''}>Next</button>`;
+      document.getElementById('prev-page')?.addEventListener('click', () => {
+        if (page > 1) {
+          page--;
+          loadOrders();
+        }
+      });
+      document.getElementById('next-page')?.addEventListener('click', () => {
+        if (page < totalPages) {
+          page++;
+          loadOrders();
+        }
+      });
+    }
+
+    function renderOrders() {
+      if (!currentOrders.length) {
+        ordersTable.innerHTML = `<p>No ${TAB_LABELS[activeTab].toLowerCase()} orders${searchQuery.trim() ? ' match that search' : ''}.</p>`;
         return;
       }
       ordersTable.innerHTML = `
         <div class="table-scroll"><table>
           <thead>
-            <tr><th>Order ID</th><th>Product</th><th>Status</th><th>Source</th><th>Value</th><th>Notes</th><th></th></tr>
+            <tr><th>Order date</th><th>Order ID</th><th>Product</th><th>Order Status</th><th>Stage</th><th>Tracking</th><th>Value</th><th>Notes</th><th></th></tr>
           </thead>
           <tbody>
-            ${filtered
+            ${currentOrders
               .map(
                 (o) => `<tr data-order-id="${o.id}">
-                  <td style="font-weight:700; font-variant-numeric: tabular-nums; white-space: nowrap;">${o.external_order_id}</td>
+                  <td style="white-space: nowrap; font-size: 0.8rem; color: var(--muted);">${new Date(o.created_at).toLocaleDateString()}</td>
+                  <td style="font-weight:700; font-variant-numeric: tabular-nums; white-space: nowrap;">
+                    ${o.external_order_id}
+                    <div style="font-weight:400; font-size:0.78rem; color: var(--muted);">${o.source}${o.customer_name ? ' · ' + escapeHtml(o.customer_name) : ''}</div>
+                  </td>
                   <td>
                     <div class="row" style="align-items:center; gap:10px;">
                       ${o.first_item_image ? `<img class="table-thumb" src="${o.first_item_image}" alt="" />` : ''}
                       <span class="truncate-cell" title="${(o.first_item_name ?? '').replace(/"/g, '&quot;')}">${productSummary(o)}</span>
                     </div>
                   </td>
-                  <td>${statusPill(o.status)}</td>
-                  <td style="white-space: nowrap;">${o.source}${o.customer_name ? ' · ' + o.customer_name : ''}</td>
+                  <td>${amazonStatusPill(o)}</td>
+                  <td>${internalStatusPill(o.status)}</td>
+                  <td style="font-size:0.8rem; white-space: nowrap;">${o.tracking_id ?? '—'}</td>
                   <td style="font-weight:700; white-space: nowrap;">${orderValue(o)}</td>
                   <td>${noteCell(o)}</td>
                   <td style="white-space: nowrap;">${shipAction(o)}</td>
@@ -213,7 +319,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
       ordersTable.querySelectorAll<HTMLButtonElement>('.note-btn').forEach((btn) => {
         btn.addEventListener('click', () => {
           const orderId = btn.dataset.orderId!;
-          const order = allOrders.find((o) => o.id === orderId);
+          const order = currentOrders.find((o) => o.id === orderId);
           const td = btn.closest('td')!;
           td.innerHTML = `
             <div class="row" style="gap:6px; align-items:center; min-width:230px;">
@@ -249,11 +355,59 @@ if (redirectTo) return Astro.redirect(redirectTo);
     }
 
     async function loadOrders() {
-      allOrders = await api(`/api/admin/orders?warehouseId=${warehouseId}`);
+      const params = new URLSearchParams({
+        warehouseId,
+        tab: activeTab,
+        sort,
+        page: String(page),
+        pageSize: String(pageSize)
+      });
+      if (activeTab === 'sent' && sentFilter) params.set('sentFilter', sentFilter);
+      if (searchQuery.trim()) {
+        params.set('searchField', searchField.value);
+        params.set('searchQuery', searchQuery.trim());
+      }
+      const result = await api(`/api/admin/orders?${params.toString()}`);
+      currentOrders = result.orders;
+      totalCount = result.totalCount;
+      tabCounts = result.tabCounts;
+      sentCounts = result.sentCounts;
       renderStats();
       renderTabs();
+      renderSentSubtabs();
       renderOrders();
+      renderPagination();
     }
+
+    searchInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        document.getElementById('search-btn')?.dispatchEvent(new MouseEvent('click'));
+      }
+    });
+    document.getElementById('search-btn')?.addEventListener('click', () => {
+      searchQuery = searchInput.value;
+      searchClearBtn.style.display = searchQuery.trim() ? 'inline-flex' : 'none';
+      page = 1;
+      loadOrders();
+    });
+    searchClearBtn.addEventListener('click', () => {
+      searchQuery = '';
+      searchInput.value = '';
+      searchClearBtn.style.display = 'none';
+      page = 1;
+      loadOrders();
+    });
+    sortSelect.addEventListener('change', () => {
+      sort = sortSelect.value;
+      page = 1;
+      loadOrders();
+    });
+    pageSizeSelect.addEventListener('change', () => {
+      pageSize = Number(pageSizeSelect.value);
+      page = 1;
+      loadOrders();
+    });
 
     async function loadSkuCount() {
       try {

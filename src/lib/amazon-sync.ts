@@ -39,6 +39,16 @@ export interface SyncResult {
  * cron cycle (see sync-job.ts), so an order that just flipped from Pending
  * to Unshipped/PartiallyShipped here becomes reservable in the very same
  * pass, with no separate scheduler needed.
+ *
+ * Also persists `orders.easyship_status` (raw EasyShipShipmentStatus) so the
+ * admin orders page can split "Sent" into "Waiting for pickup" vs "Shipped"
+ * the way Seller Central does — see admin-orders.ts. Only updated while the
+ * order is still in this function's WHERE clause (not yet our own
+ * 'shipped'/'cancelled'), so it stops advancing once picked up/dropped off
+ * flips the order to 'shipped' above; it won't keep tracking through to
+ * "Delivered" afterward. That's an accepted gap, not a bug — re-syncing
+ * already-terminal orders just to chase a display label isn't worth the
+ * extra GetOrders calls this account already worried about rate limits on.
  */
 export async function syncOrderStatuses(db: D1Database, warehouseId: string): Promise<SyncResult> {
   const unresolved = await db
@@ -57,7 +67,10 @@ export async function syncOrderStatuses(db: D1Database, warehouseId: string): Pr
   for (const order of unresolved.results) {
     const amazonStatus = statuses.get(order.external_order_id);
     if (!amazonStatus) continue;
-    await db.prepare(`UPDATE orders SET amazon_order_status = ? WHERE id = ?`).bind(amazonStatus.orderStatus, order.id).run();
+    await db
+      .prepare(`UPDATE orders SET amazon_order_status = ?, easyship_status = ? WHERE id = ?`)
+      .bind(amazonStatus.orderStatus, amazonStatus.easyShipShipmentStatus ?? null, order.id)
+      .run();
 
     const stillWithSeller = amazonStatus.easyShipShipmentStatus && EASYSHIP_NOT_YET_COLLECTED.has(amazonStatus.easyShipShipmentStatus);
 

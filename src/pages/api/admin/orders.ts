@@ -3,6 +3,7 @@ import { getDb, logAudit, newId } from '../../../lib/db';
 import { requireUser, AuthError } from '../../../lib/auth';
 import { resolveSkuIdByCode } from '../../../lib/skus';
 import { reserveOrderForPicking } from '../../../lib/orders';
+import { getAdminOrders, type AdminOrderTab, type SentFilter, type SearchField, type SortOption } from '../../../lib/admin-orders';
 
 /** Manual order entry / CSV-row-at-a-time import (§11 MVP: "manual + CSV/API"). One order per call; a CSV upload UI can call this in a loop. */
 export const POST: APIRoute = async (context) => {
@@ -55,25 +56,31 @@ export const POST: APIRoute = async (context) => {
   }
 };
 
+// Amazon-Seller-Central-style browsing: tab (Pending/Unshipped/Sent/
+// Cancelled), Sent's own waiting-for-pickup/shipped split, search, sort, and
+// real pagination — see getAdminOrders in lib/admin-orders.ts for why the
+// tabs are derived from Amazon's own status fields rather than this app's
+// internal pick/pack status. Query params all have sane defaults so the
+// plain `?warehouseId=` call this endpoint used to only support still works
+// (defaults to the 'all' tab, newest first, page 1 of 50).
 export const GET: APIRoute = async (context) => {
   const db = getDb();
   try {
     await requireUser(context, db, ['admin']);
-    const warehouseId = new URL(context.request.url).searchParams.get('warehouseId');
-    const orders = await db
-      .prepare(
-        `SELECT o.*,
-                (SELECT s.name FROM order_items oi JOIN skus s ON s.id = oi.sku_id WHERE oi.order_id = o.id ORDER BY oi.id LIMIT 1) AS first_item_name,
-                (SELECT s.image_url FROM order_items oi JOIN skus s ON s.id = oi.sku_id WHERE oi.order_id = o.id ORDER BY oi.id LIMIT 1) AS first_item_image,
-                (SELECT COUNT(*) FROM order_items oi WHERE oi.order_id = o.id) AS item_count,
-                (SELECT SUM(COALESCE(s.price, 0) * oi.quantity_ordered) FROM order_items oi JOIN skus s ON s.id = oi.sku_id WHERE oi.order_id = o.id) AS order_value
-         FROM orders o
-         WHERE o.warehouse_id = ?
-         ORDER BY o.created_at DESC LIMIT 100`
-      )
-      .bind(warehouseId)
-      .all();
-    return new Response(JSON.stringify(orders.results), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    const params = new URL(context.request.url).searchParams;
+    const warehouseId = params.get('warehouseId');
+    if (!warehouseId) return new Response(JSON.stringify({ error: 'warehouseId is required' }), { status: 400 });
+
+    const result = await getAdminOrders(db, warehouseId, {
+      tab: (params.get('tab') as AdminOrderTab) ?? 'all',
+      sentFilter: (params.get('sentFilter') as SentFilter) ?? undefined,
+      searchField: (params.get('searchField') as SearchField) ?? undefined,
+      searchQuery: params.get('searchQuery') ?? undefined,
+      sort: (params.get('sort') as SortOption) ?? undefined,
+      page: Number(params.get('page') ?? '1') || 1,
+      pageSize: Number(params.get('pageSize') ?? '50') || 50
+    });
+    return new Response(JSON.stringify(result), { status: 200, headers: { 'Content-Type': 'application/json' } });
   } catch (err) {
     if (err instanceof AuthError) return new Response(JSON.stringify({ error: err.message }), { status: err.status });
     return new Response(JSON.stringify({ error: (err as Error).message }), { status: 500 });

@@ -563,6 +563,12 @@ tbody tr:hover {
   border-color: var(--warning-border);
 }
 
+.status-danger {
+  background: var(--danger-bg);
+  color: var(--danger);
+  border-color: var(--danger-border);
+}
+
 .theme-toggle {
   position: fixed;
   top: 14px;

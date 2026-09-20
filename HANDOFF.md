@@ -1867,6 +1867,64 @@ to all 5 pages, confirmed `window.__initial*` populated with real data and
 them, screenshots confirmed real content rendered immediately (no visible "Loading…" flash).
 Deployed (Version ID `e6add544-463b-41bf-bc65-44e497fcc266`).
 
+## Recently done (2026-09-21) — admin Orders page rebuilt to mirror Seller Central, plus an FBA/Seller-Flex access check
+
+User asked for the admin orders page to look and behave like Amazon Seller Central's Manage Orders
+screen (tabs, search, sort, Amazon's own status vocabulary), and separately asked whether this
+account's SP-API access can even see FBA/Seller Flex orders.
+
+**FBA/Seller Flex check** (one-off live investigation, no code kept): added a temporary
+`debugSurveyFulfillmentChannels` export to amazon.ts and a temp `/api/admin/debug-channels` route,
+called GetOrders over the last 30 days with no `FulfillmentChannels` filter (unlike
+`fetchUnfulfilledOrders`, which deliberately filters to `MFN` — see its docstring). Result: 272 AFN
+(Amazon-fulfilled) orders vs 1333 MFN in 30 days — **this account's API access can see FBA orders
+fine**, they're just deliberately excluded from this WMS's pick/pack flow since Amazon's own FCs
+ship them, not this warehouse. Caveat found in the same response sample: Amazon's Orders API has no
+distinct "Seller Flex" signal — a Seller Flex order looks identical to a normal FBA order
+(`FulfillmentChannel: AFN`, `ShipServiceLevel: Expedited`, etc.), so there's no way to tell them
+apart from the order data alone. Both the temp function and route were deleted after answering this
+— nothing left in the codebase from it.
+
+**Admin Orders redesign** — new `migrations/0023_orders_easyship_status.sql` adds
+`orders.easyship_status` (raw EasyShipShipmentStatus, applied to both local and remote D1), now
+persisted by `syncOrderStatuses` (amazon-sync.ts) alongside `amazon_order_status` — previously
+fetched every sync but thrown away after being used in memory for the `stillWithSeller` check. Note
+the same caveat documented there: it stops advancing once an order reaches this app's own terminal
+`status = 'shipped'` (sync no longer looks at it), so it won't keep tracking through to "Delivered"
+for most orders — an accepted gap, not a bug, per the same "Amazon is only authoritative for the
+two terminal states" philosophy already governing `orders.status`.
+
+New `lib/admin-orders.ts` (`getAdminOrders`) does the actual work, kept separate from orders.ts
+(pick/pack pipeline logic) since this is pure read/browse:
+- Four top-level tabs — **Pending / Unshipped / Cancelled / Sent**, in that exact order (matches
+  Seller Central's own tab order from the user's screenshot) — derived from `amazon_order_status`
+  and `status`, not this app's internal pick/pack granularity (see `TAB_CASE`).
+- **Sent** splits into **Waiting for pickup** vs **Shipped**, matching Seller Central's own second-
+  level tabs — using `status != 'shipped'` as the signal (this app's own terminal state, only set
+  once the courier actually collects it — see amazon-sync.ts), not the exact EasyShipShipmentStatus
+  string, since that's already-verified logic rather than a new guess.
+- Per-row **Order Status** pill mirrors Amazon's own vocabulary (Pending, Unshipped, Waiting for
+  pickup, Picked up, Delivered to buyer, Shipped, Cancelled) — see `displayStatus()`.
+- Search by Order ID, ASIN, SKU, Product name, Tracking ID, or Buyer name (Amazon's own dropdown
+  also has "Buyer Email" and "Listing" — omitted since this app doesn't store buyer email, and
+  "Listing" was unclear enough to skip rather than guess).
+- Sort by ship-by date or order date, either direction; real pagination (`LIMIT`/`OFFSET`, not the
+  old hard `LIMIT 100` with no way to see past it) with a page-size selector (25/50/100).
+- Tab counts and the Sent sub-counts are computed independent of the active search, matching how
+  Seller Central's own tab counts don't shift when you type into its search box.
+The admin's own pick/pack stage (batched/picking/packing/etc.) is kept as a second "Stage" pill per
+row rather than dropped — Amazon has no visibility into it, and it's still what the floor actually
+needs day to day.
+`/api/admin/orders` GET rewritten to take `tab`/`sentFilter`/`searchField`/`searchQuery`/`sort`/
+`page`/`pageSize` query params (all optional, defaulting to the old plain-`warehouseId` behavior) and
+return `{ orders, totalCount, tabCounts, sentCounts }` instead of a bare array.
+Verified live in local dev: all 4 tabs, the Sent sub-tabs, SKU/Order-ID search (including the
+correct "No … orders match that search" empty state), Clear, and note-editing all work against real
+seeded data; spot-checked the new tab-count/list/tracking-search queries directly against
+**production** D1 (881+ real orders) — all sub-millisecond, cheapest at 87-590 rows_read, no risk to
+the D1 quota this session already had one incident with. Deployed (Version ID
+`6001a9fe-5a5d-4cfb-b854-719eec9b26a0`).
+
 ## Next steps — a prioritized plan
 
 Rewritten 2026-09-20 (twenty-one passes across two days — see "Recently done" entries above for the

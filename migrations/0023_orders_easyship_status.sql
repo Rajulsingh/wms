@@ -1,0 +1,11 @@
+-- Amazon's EasyShipShipmentStatus (PendingSchedule/PendingPickUp/PendingDropOff/
+-- PickedUp/DroppedOff/Delivered/...), tracked per order — syncOrderStatuses
+-- (amazon-sync.ts) already fetches this on every sync to decide whether a
+-- "Shipped" order is still physically with the seller (see
+-- EASYSHIP_NOT_YET_COLLECTED, amazon.ts) but previously only used it in
+-- memory and threw it away. Persisted now so the admin orders page can show
+-- Amazon's own "Sent > Waiting for pickup" vs "Sent > Shipped" split, the
+-- same way Seller Central does, instead of collapsing both into one
+-- "Shipped" bucket. NULL for non-Easy-Ship orders and anything synced
+-- before this migration.
+ALTER TABLE orders ADD COLUMN easyship_status TEXT;
