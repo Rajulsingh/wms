@@ -11,9 +11,8 @@ if (redirectTo) return Astro.redirect(redirectTo);
   <span class="pill" id="user-pill" slot="actions">…</span>
 
   <div class="row" style="flex-wrap: wrap;">
-    <button class="btn btn-primary" id="import-btn" style="width: auto;">Import from Amazon</button>
+    <button class="btn btn-primary" id="sync-now-btn" style="width: auto;">Sync with Amazon</button>
     <button class="btn" id="retry-btn" style="width: auto;">Assign orders to pick list</button>
-    <button class="btn btn-ghost" id="sync-now-btn" style="width: auto;">Sync with Amazon now</button>
     <div class="row" style="width: auto; margin-left: auto; align-items: center; gap: 10px;">
       <label class="row" style="width: auto; align-items: center; gap: 6px; font-size: 0.82rem; color: var(--muted);">
         <input type="checkbox" id="reset-include-shipped" style="width: 18px; height: 18px;" />
@@ -294,24 +293,6 @@ if (redirectTo) return Astro.redirect(redirectTo);
       }, 12000);
     }
 
-    document.getElementById('import-btn')?.addEventListener('click', async (e) => {
-      const btn = e.currentTarget as HTMLButtonElement;
-      try {
-        const summary = await withLoading(btn, 'Importing…', () => api('/api/admin/import-amazon-orders', { warehouseId, sinceHours: 72 }));
-        // Every imported order reserves its own stock immediately (see
-        // reserveOrderForPicking in lib/orders.ts) — no separate "create a
-        // batch" step needed any more.
-        let msg = `Imported ${summary.imported}, skipped ${summary.skipped}${summary.newSkusCreated.length ? `, ${summary.newSkusCreated.length} new SKUs pulled from Amazon's catalog` : ''}.`;
-        if (summary.shortOrders?.length) {
-          msg += `<br>${summary.shortOrders.length} blocked — short on stock:<br>${summary.shortOrders.map((s: { reason: string }) => s.reason).join('<br>')}<br><a href="/admin/inbound">Receive stock</a> to fix this.`;
-        }
-        showResult(msg);
-        await loadOrders();
-      } catch (err) {
-        showResult((err as Error).message, 'danger');
-      }
-    });
-
     document.getElementById('retry-btn')?.addEventListener('click', async (e) => {
       const btn = e.currentTarget as HTMLButtonElement;
       try {
@@ -346,8 +327,14 @@ if (redirectTo) return Astro.redirect(redirectTo);
       statusCancelled: number;
       retried: number;
       retrySucceeded: number;
+      shortOrders: Array<{ orderId: string; reason: string }>;
     }
 
+    // Replaces what used to be two separate buttons ("Import from Amazon"
+    // and this one) — they genuinely overlapped (both pulled new orders) and
+    // just confused which one to click. This does everything: pull new
+    // orders, check Amazon's current status on existing ones, and retry
+    // anything still blocked, all in one action.
     document.getElementById('sync-now-btn')?.addEventListener('click', async (e) => {
       const btn = e.currentTarget as HTMLButtonElement;
       try {
@@ -355,17 +342,23 @@ if (redirectTo) return Astro.redirect(redirectTo);
         const totals = (results as SyncJobResult[]).reduce(
           (acc, r) => ({
             imported: acc.imported + r.imported,
+            newSkusCreated: acc.newSkusCreated + r.newSkusCreated,
             statusShipped: acc.statusShipped + r.statusShipped,
             statusCancelled: acc.statusCancelled + r.statusCancelled,
-            retrySucceeded: acc.retrySucceeded + r.retrySucceeded
+            retrySucceeded: acc.retrySucceeded + r.retrySucceeded,
+            shortOrders: acc.shortOrders.concat(r.shortOrders)
           }),
-          { imported: 0, statusShipped: 0, statusCancelled: 0, retrySucceeded: 0 }
+          { imported: 0, newSkusCreated: 0, statusShipped: 0, statusCancelled: 0, retrySucceeded: 0, shortOrders: [] as Array<{ orderId: string; reason: string }> }
         );
-        showResult(
-          `Synced with Amazon: ${totals.imported} new order${totals.imported === 1 ? '' : 's'} imported, ` +
-            `${totals.statusShipped} marked shipped, ${totals.statusCancelled} cancelled, ` +
-            `${totals.retrySucceeded} blocked order${totals.retrySucceeded === 1 ? '' : 's'} resolved.`
-        );
+        let msg =
+          `Synced with Amazon: ${totals.imported} new order${totals.imported === 1 ? '' : 's'} imported` +
+          `${totals.newSkusCreated ? ` (${totals.newSkusCreated} new SKU${totals.newSkusCreated === 1 ? '' : 's'} pulled from Amazon's catalog)` : ''}, ` +
+          `${totals.statusShipped} marked shipped, ${totals.statusCancelled} cancelled, ` +
+          `${totals.retrySucceeded} blocked order${totals.retrySucceeded === 1 ? '' : 's'} resolved.`;
+        if (totals.shortOrders.length) {
+          msg += `<br>${totals.shortOrders.length} still blocked:<br>${totals.shortOrders.map((s) => s.reason).join('<br>')}<br>If a reason mentions stock, <a href="/admin/inbound">receive stock</a> to fix it.`;
+        }
+        showResult(msg);
         await loadOrders();
       } catch (err) {
         showResult((err as Error).message, 'danger');

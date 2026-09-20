@@ -17,7 +17,7 @@ export const POST: APIRoute = async (context) => {
   const db = getDb();
   try {
     const user = await requireUser(context, db, ['packer']);
-    const results = await runAmazonSyncJob(db);
+    const results = await runAmazonSyncJob(db, 72); // see api/admin/sync-now.ts — a manual click wants a generous catch-up window
     await logAudit(db, { userId: user.id, action: 'sync.manual', metadata: results });
     return new Response(JSON.stringify({ results }), { status: 200, headers: { 'Content-Type': 'application/json' } });
   } catch (err) {

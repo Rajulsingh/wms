@@ -18,7 +18,11 @@ export const POST: APIRoute = async (context) => {
   const db = getDb();
   try {
     const user = await requireUser(context, db, ['admin']);
-    const results = await runAmazonSyncJob(db);
+    // 72h, not the cron's 24h — a manual click is exactly the case where the
+    // last automatic tick might not have been recent (that's the whole
+    // reason this button exists), so it should catch up generously rather
+    // than assume otherwise.
+    const results = await runAmazonSyncJob(db, 72);
     await logAudit(db, { userId: user.id, action: 'sync.manual', metadata: results });
     return new Response(JSON.stringify({ results }), { status: 200, headers: { 'Content-Type': 'application/json' } });
   } catch (err) {

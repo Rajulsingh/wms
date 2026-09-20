@@ -12,12 +12,13 @@ export interface SyncJobResult {
   statusCancelled: number;
   retried: number;
   retrySucceeded: number;
+  shortOrders: Array<{ orderId: string; reason: string }>;
 }
 
 /**
  * The automatic side of order handling — runs on a Cloudflare Cron Trigger
- * (see src/worker.ts) instead of only firing when an admin clicks "Import
- * from Amazon". Per warehouse: pulls new orders, then checks Amazon's
+ * (see src/worker.ts) instead of only firing when an admin clicks "Sync with
+ * Amazon". Per warehouse: pulls new orders, then checks Amazon's
  * current status for every local Amazon order that isn't yet resolved (see
  * amazon-sync.ts for why that's a separate targeted call, not part of the
  * same pull), then retries reservation for anything still sitting blocked.
@@ -40,14 +41,24 @@ export interface SyncJobResult {
  * failure doesn't stop the rest — this runs unattended, so a transient
  * SP-API error for one warehouse shouldn't silently starve every other
  * warehouse's sync too.
+ *
+ * This used to be two separate admin actions — "Import from Amazon" (just
+ * the pull, one warehouse, 72h lookback) and a "sync" concept that also did
+ * the status-check/retry — which genuinely did overlap (both pulled new
+ * orders) and confused more than they helped. Now there's exactly one
+ * import path, this one; `sinceHours` defaults to the cron's own tight 24h
+ * window (it runs every ~5min so that's plenty) but a manual trigger (see
+ * api/admin/sync-now.ts, api/picker/sync-now.ts) passes a wider one, since a
+ * human clicking a button by hand wants a generous catch-up, not the
+ * assumption that the last automatic tick was recent.
  */
-export async function runAmazonSyncJob(db: D1Database): Promise<SyncJobResult[]> {
+export async function runAmazonSyncJob(db: D1Database, sinceHours = 24): Promise<SyncJobResult[]> {
   const warehouses = await db.prepare(`SELECT id FROM warehouses`).all<{ id: string }>();
   const results: SyncJobResult[] = [];
 
   for (const wh of warehouses.results) {
     try {
-      const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+      const since = new Date(Date.now() - sinceHours * 60 * 60 * 1000);
       const amazonOrders = await fetchUnfulfilledOrders(since);
       const importSummary = await importAmazonOrders(db, wh.id, amazonOrders);
       const statusResult = await syncOrderStatuses(db, wh.id);
@@ -62,7 +73,8 @@ export async function runAmazonSyncJob(db: D1Database): Promise<SyncJobResult[]>
         statusShipped: statusResult.shipped,
         statusCancelled: statusResult.cancelled,
         retried: retryResult.retried,
-        retrySucceeded: retryResult.succeeded
+        retrySucceeded: retryResult.succeeded,
+        shortOrders: retryResult.shortOrders
       });
     } catch (err) {
       console.error(`Amazon sync job failed for warehouse ${wh.id}:`, err);

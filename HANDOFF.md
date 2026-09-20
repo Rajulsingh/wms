@@ -1402,6 +1402,15 @@ a `title` attribute on the new admin button was overriding its accessible name i
 (the visible label "Sync with Amazon now" was invisible to `find`/screen readers, which instead saw
 the tooltip text) — removed the `title`, kept the label self-explanatory instead.
 
+**Update, same day**: user correctly pointed out "Import from Amazon" and "Sync with Amazon now"
+were doing overlapping work (both pulled new orders) — merged into one button. `runAmazonSyncJob`
+now takes a `sinceHours` param (cron keeps its 24h default; a manual click passes 72h, matching the
+old Import button's more generous catch-up window). `SyncJobResult` also gained `shortOrders` so
+the merged button doesn't lose the per-order blocked-reason detail the old Import button showed.
+Deleted `api/admin/import-amazon-orders.ts` and its button entirely — one action now: "Sync with
+Amazon" on `/admin`, does pull + status-check + retry together. Verified live against the real
+account again post-merge.
+
 ## Next steps — a prioritized plan
 
 Rewritten 2026-09-20 (twenty-one passes across two days — see "Recently done" entries above for the
