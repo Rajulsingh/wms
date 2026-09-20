@@ -1,116 +1,175 @@
 /*
- * ecomglider WMS design system — warm, high-contrast, built for a warehouse
- * floor: gloved hands (min 56px tap targets, §8) and unreliable Wi-Fi (system
- * font stack, no web font request, §9). The palette leans into the domain —
- * rust/amber like packing tape and warehouse signage — instead of a flat
- * black-on-white theme, so the app reads as ecomglider's own tool rather
- * than an unbranded template.
+ * ecomglider WMS design system — matches ecomglider.com's own design system
+ * (Inter/JetBrains Mono, monochrome ink-on-white + a blue accent, layered
+ * hairline-ring shadows, pill buttons) 1:1 on tokens, since this WMS is
+ * headed toward being a paid feature of that same platform and should read
+ * as the same product, not a separately-branded tool bolted on. Token
+ * *names* below are unchanged from the previous warm/rust theme on purpose
+ * — every page in this app references colors via `var(--x)` rather than
+ * literal hex, so retargeting the values here is what actually cascades the
+ * new look through every existing button/card/table/pill without having to
+ * touch each page individually.
+ *
+ * Two deliberate departures from a literal token copy, both about meaning
+ * carrying over correctly rather than just the hex values:
+ * - `--success` stays green (ecomglider's own `--color-success` is the same
+ *   blue as their links — fine for a marketing site with no real "good vs
+ *   bad" state to show, but a warehouse floor scanning a table of order
+ *   statuses needs shipped=green/cancelled=red/pending=amber to stay
+ *   visually distinct at a glance). `--danger`/`--warning` DO take
+ *   ecomglider's literal error/warning hexes, since "bad" and "caution" mean
+ *   the same thing in both products.
+ * - `--sidebar-accent` (new) is a lighter blue than the base `--info`,
+ *   because the admin sidebar is a fixed dark panel regardless of app theme
+ *   (see .admin-sidebar below) — `--accent` itself is near-black in light
+ *   mode and would be unreadable against that dark background.
  */
 
+/* Self-hosted (no third-party font CDN request) — matches ecomglider.com's
+   own choice of Inter/JetBrains Mono as the open-source substitutes for
+   Geist/Geist Mono. Applied on every page, including the picker/packer
+   floor pages, per an explicit decision to unify the whole platform's look;
+   this does add a one-time font download the old system-font stack didn't
+   need, mitigated by these being small self-hosted variable-font files that
+   cache immutably across every page after the first load. */
+@import '@fontsource-variable/inter';
+@import '@fontsource/jetbrains-mono/400.css';
+@import '@fontsource/jetbrains-mono/500.css';
+
 :root {
-  --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  --font: 'InterVariable', 'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
 
-  --bg: #f7f4ef;
-  --fg: #1a1613;
-  --muted: #756c60;
-  --muted-2: #a39a8c;
-  --border: #e3dbcd;
-  --border-strong: #d4c9b6;
+  --bg: #fafafa;
+  --fg: #171717;
+  --muted: #4d4d4d;
+  --muted-2: #888888;
+  --border: #ebebeb;
+  --border-strong: #a1a1a1;
   --surface: #ffffff;
-  --surface-2: #f0e9dd;
-  --surface-inset: #efe8db;
+  --surface-2: #f5f5f5;
+  --surface-inset: #fafafa;
 
-  --accent: #ad3e0f;
-  --accent-hover: #93340c;
-  --accent-fg: #fff7ee;
-  --accent-soft: #fbeee3;
-  --accent-soft-border: #f0d5bd;
+  --accent: #171717;
+  --accent-hover: #2b2b2b;
+  --accent-fg: #ffffff;
+  --accent-soft: #ececec;
+  --accent-soft-border: #d4d4d4;
+
+  /* Informational / "in progress" accent — ecomglider's own link/highlight
+     blue. Kept distinct from --accent (which is the near-black primary
+     *action* color) so a passive status badge never looks like a clickable
+     primary button. */
+  --info: #0070f3;
+  --info-soft: #d3e5ff;
+  --info-soft-border: #a8cdfb;
 
   --success: #15803d;
   --success-bg: #e7f6ec;
   --success-border: #bfe5cc;
-  --danger: #c72c2c;
-  --danger-bg: #fceeed;
-  --danger-border: #f3c8c5;
-  --warning-bg: #fdf1d6;
-  --warning-fg: #8a5a09;
-  --warning-border: #f0dca4;
+  --danger: #c50000;
+  --danger-bg: #f7d4d6;
+  --danger-border: #ee0000;
+  --warning-bg: #ffefcf;
+  --warning-fg: #ab570a;
+  --warning-border: #f5a623;
+
+  --sidebar-accent: #4d9fff;
 
   --radius: 12px;
   --radius-sm: 8px;
   --radius-lg: 16px;
-  --shadow-sm: 0 1px 2px rgba(26, 22, 19, 0.08);
-  --shadow-md: 0 12px 28px -8px rgba(26, 22, 19, 0.18), 0 2px 6px rgba(26, 22, 19, 0.08);
-  --shadow-card: 0 1px 2px rgba(26, 22, 19, 0.04), 0 1px 0 rgba(255, 255, 255, 0.6) inset;
-  --shadow-btn-primary: 0 1px 2px rgba(26, 22, 19, 0.18), 0 3px 8px -3px rgba(173, 62, 15, 0.35);
+  --radius-pill: 100px;
+  /* Elevation — stacked, low-opacity shadows + an inset hairline ring,
+     never a single heavy drop shadow. Exact recipe from ecomglider.com's
+     own DESIGN.md tokens (shadow-card / shadow-modal). */
+  --shadow-hairline: inset 0 0 0 1px rgba(0, 0, 0, 0.08);
+  --shadow-sm: 0px 1px 1px rgba(0, 0, 0, 0.02), 0px 2px 2px rgba(0, 0, 0, 0.04), inset 0 0 0 1px rgba(0, 0, 0, 0.08);
+  --shadow-md: 0px 1px 1px rgba(0, 0, 0, 0.02), 0px 8px 16px -4px rgba(0, 0, 0, 0.04), 0px 24px 32px -8px rgba(0, 0, 0, 0.06),
+    inset 0 0 0 1px rgba(0, 0, 0, 0.08);
+  --shadow-card: 0px 1px 1px rgba(0, 0, 0, 0.02), 0px 2px 2px rgba(0, 0, 0, 0.04), inset 0 0 0 1px rgba(0, 0, 0, 0.08);
 }
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme='light']) {
-    --bg: #131110;
-    --fg: #f1ebe1;
-    --muted: #9c9184;
-    --muted-2: #6b6255;
-    --border: #322c24;
-    --border-strong: #453d32;
-    --surface: #1d1a16;
-    --surface-2: #262019;
-    --surface-inset: #17140f;
+    --bg: #0a0a0a;
+    --fg: #ededed;
+    --muted: #a8a8a8;
+    --muted-2: #767676;
+    --border: #2a2a2a;
+    --border-strong: #454545;
+    --surface: #141414;
+    --surface-2: #1e1e1e;
+    --surface-inset: #101010;
 
-    --accent: #e8823f;
-    --accent-hover: #f2954f;
-    --accent-fg: #1a0f06;
-    --accent-soft: #2e2013;
-    --accent-soft-border: #4a3319;
+    /* Primary flips to a light chip in dark mode (same as ecomglider.com's
+       own --color-primary override) — a *solid black* button on a near-
+       black page would be invisible, so the "primary action" color has to
+       invert brightness, not just the page background. */
+    --accent: #ededed;
+    --accent-hover: #ffffff;
+    --accent-fg: #0a0a0a;
+    --accent-soft: #262626;
+    --accent-soft-border: #3d3d3d;
+
+    --info: #3d9bff;
+    --info-soft: #0f2c4d;
+    --info-soft-border: #1c4a80;
 
     --success: #4fd483;
     --success-bg: #142d1f;
     --success-border: #1e4a2e;
     --danger: #ff8177;
-    --danger-bg: #34150f;
-    --danger-border: #5a221d;
-    --warning-bg: #302408;
+    --danger-bg: #3d0f0f;
+    --danger-border: #ff8177;
+    --warning-bg: #3d2f0a;
     --warning-fg: #f0c15f;
-    --warning-border: #55420f;
+    --warning-border: #ab570a;
 
-    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
-    --shadow-md: 0 16px 40px -12px rgba(0, 0, 0, 0.6), 0 4px 12px rgba(0, 0, 0, 0.35);
-    --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.3), 0 1px 0 rgba(255, 255, 255, 0.03) inset;
-    --shadow-btn-primary: 0 1px 2px rgba(0, 0, 0, 0.35), 0 2px 10px -3px rgba(232, 130, 63, 0.3);
+    --shadow-hairline: inset 0 0 0 1px rgba(255, 255, 255, 0.1);
+    --shadow-sm: 0px 1px 1px rgba(0, 0, 0, 0.2), 0px 2px 2px rgba(0, 0, 0, 0.2), inset 0 0 0 1px rgba(255, 255, 255, 0.1);
+    --shadow-md: 0px 1px 1px rgba(0, 0, 0, 0.2), 0px 8px 16px -4px rgba(0, 0, 0, 0.3), 0px 24px 32px -8px rgba(0, 0, 0, 0.4),
+      inset 0 0 0 1px rgba(255, 255, 255, 0.1);
+    --shadow-card: 0px 1px 1px rgba(0, 0, 0, 0.2), 0px 2px 2px rgba(0, 0, 0, 0.2), inset 0 0 0 1px rgba(255, 255, 255, 0.1);
   }
 }
 
 :root[data-theme='dark'] {
-  --bg: #131110;
-  --fg: #f1ebe1;
-  --muted: #9c9184;
-  --muted-2: #6b6255;
-  --border: #322c24;
-  --border-strong: #453d32;
-  --surface: #1d1a16;
-  --surface-2: #262019;
-  --surface-inset: #17140f;
+  --bg: #0a0a0a;
+  --fg: #ededed;
+  --muted: #a8a8a8;
+  --muted-2: #767676;
+  --border: #2a2a2a;
+  --border-strong: #454545;
+  --surface: #141414;
+  --surface-2: #1e1e1e;
+  --surface-inset: #101010;
 
-  --accent: #e8823f;
-  --accent-hover: #f2954f;
-  --accent-fg: #1a0f06;
-  --accent-soft: #2e2013;
-  --accent-soft-border: #4a3319;
+  --accent: #ededed;
+  --accent-hover: #ffffff;
+  --accent-fg: #0a0a0a;
+  --accent-soft: #262626;
+  --accent-soft-border: #3d3d3d;
+
+  --info: #3d9bff;
+  --info-soft: #0f2c4d;
+  --info-soft-border: #1c4a80;
 
   --success: #4fd483;
   --success-bg: #142d1f;
   --success-border: #1e4a2e;
   --danger: #ff8177;
-  --danger-bg: #34150f;
-  --danger-border: #5a221d;
-  --warning-bg: #302408;
+  --danger-bg: #3d0f0f;
+  --danger-border: #ff8177;
+  --warning-bg: #3d2f0a;
   --warning-fg: #f0c15f;
-  --warning-border: #55420f;
+  --warning-border: #ab570a;
 
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
-  --shadow-md: 0 16px 40px -12px rgba(0, 0, 0, 0.6), 0 4px 12px rgba(0, 0, 0, 0.35);
-  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.3), 0 1px 0 rgba(255, 255, 255, 0.03) inset;
-  --shadow-btn-primary: 0 1px 2px rgba(0, 0, 0, 0.35), 0 2px 10px -3px rgba(232, 130, 63, 0.3);
+  --shadow-hairline: inset 0 0 0 1px rgba(255, 255, 255, 0.1);
+  --shadow-sm: 0px 1px 1px rgba(0, 0, 0, 0.2), 0px 2px 2px rgba(0, 0, 0, 0.2), inset 0 0 0 1px rgba(255, 255, 255, 0.1);
+  --shadow-md: 0px 1px 1px rgba(0, 0, 0, 0.2), 0px 8px 16px -4px rgba(0, 0, 0, 0.3), 0px 24px 32px -8px rgba(0, 0, 0, 0.4),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.1);
+  --shadow-card: 0px 1px 1px rgba(0, 0, 0, 0.2), 0px 2px 2px rgba(0, 0, 0, 0.2), inset 0 0 0 1px rgba(255, 255, 255, 0.1);
 }
 
 * {
@@ -131,12 +190,20 @@ body {
   min-height: 100dvh;
 }
 
+/* Exact ecomglider.com recipe — a bold on-brand selection highlight rather
+   than the browser default, static (not theme-driven) since it reads fine
+   against either a light or dark page. */
 ::selection {
-  background: var(--accent-soft-border);
+  background-color: #171717;
+  color: #f2f2f2;
 }
 
+/* Blue, not --accent — ecomglider.com deliberately keeps its "link" blue
+   distinct from "primary action" black/white (see --info above): a plain
+   inline text link (e.g. "review in Exceptions") reads as a hyperlink,
+   while a real button stays the primary color. */
 a {
-  color: var(--accent);
+  color: var(--info);
 }
 
 h1,
@@ -184,33 +251,41 @@ p {
   padding: 18px;
 }
 
+/* Pill-shaped, borderless-looking (a --shadow-hairline inset ring instead
+   of a visible border) — ecomglider.com's Button.astro "secondary" variant
+   is the base look here, since most buttons in this app aren't the one
+   primary action on the screen. Tap-target sizing (56px/44px min-height)
+   is kept from the original warehouse-floor requirement rather than
+   ecomglider's own smaller 48px/36px marketing-button sizes — a gloved hand
+   on a phone needs the bigger target regardless of which app is rendering
+   it, so this is a deliberate size departure from a literal token copy. */
 .btn {
   appearance: none;
-  border: 1px solid var(--border);
+  border: 1px solid transparent;
   background: var(--surface);
   color: var(--fg);
   font-family: inherit;
   font-size: 1.05rem;
-  font-weight: 600;
-  border-radius: var(--radius-sm);
+  font-weight: 500;
+  border-radius: var(--radius-pill);
   min-height: 56px;
-  padding: 0 20px;
+  padding: 0 22px;
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 8px;
   cursor: pointer;
   width: 100%;
-  box-shadow: var(--shadow-sm);
-  transition: transform 0.1s ease, background-color 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+  box-shadow: var(--shadow-hairline);
+  transition: opacity 0.15s ease, background-color 0.15s ease, box-shadow 0.15s ease;
 }
 
 .btn:hover {
-  border-color: var(--muted-2);
+  background: var(--surface-2);
 }
 
 .btn:active {
-  transform: scale(0.98);
+  opacity: 0.85;
 }
 
 .btn:focus-visible {
@@ -221,28 +296,27 @@ p {
 .btn-primary {
   background: var(--accent);
   color: var(--accent-fg);
-  border-color: var(--accent);
-  box-shadow: var(--shadow-btn-primary);
+  box-shadow: none;
 }
 
 .btn-primary:hover {
   background: var(--accent-hover);
-  border-color: var(--accent-hover);
+  opacity: 1;
 }
 
 .btn-danger {
   background: var(--danger-bg);
   color: var(--danger);
-  border-color: var(--danger-border);
+  box-shadow: inset 0 0 0 1px var(--danger-border);
 }
 
 .btn-danger:hover {
   background: var(--danger-border);
+  color: #ffffff;
 }
 
 .btn-ghost {
   background: transparent;
-  border-color: transparent;
   color: var(--muted);
   min-height: 44px;
   font-weight: 500;
@@ -390,6 +464,10 @@ video.scanner {
   border: 1px solid var(--border);
 }
 
+/* ecomglider.com's own .form-input treatment (hairline border, radius-sm,
+   outline-based focus — see below), sized up from their 40px/14px marketing
+   form fields to this app's original 52px/1.05rem for the same gloved-hand
+   tap-target reason .btn keeps its larger size above. */
 input[type='text'],
 input[type='number'],
 input[type='password'],
@@ -399,7 +477,7 @@ select {
   padding: 14px 16px;
   border-radius: var(--radius-sm);
   border: 1px solid var(--border);
-  background: var(--surface-inset);
+  background: var(--surface);
   color: var(--fg);
   width: 100%;
   min-height: 52px;
@@ -415,11 +493,14 @@ select {
   padding-right: 40px;
 }
 
+/* Outline-based, not a box-shadow glow — matches ecomglider.com's own
+   .form-input:focus-visible exactly (outline: 2px solid var(--color-
+   primary); outline-offset: 1px). */
 input:focus-visible,
 select:focus-visible {
-  outline: none;
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
 label {
@@ -435,7 +516,7 @@ label {
    cause on long Amazon titles; see HANDOFF.md). */
 .order-card-ship {
   font-weight: 700;
-  color: var(--accent);
+  color: var(--info);
 }
 
 .table-scroll {
@@ -449,12 +530,15 @@ table {
   font-size: 0.9rem;
 }
 
+/* Monospace uppercase headers — matches ecomglider.com's own console table
+   (text-caption-mono) rather than this app's previous sans-serif headers. */
 th {
   text-align: left;
   padding: 10px 12px;
   color: var(--muted);
-  font-size: 0.75rem;
-  font-weight: 700;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  font-weight: 500;
   letter-spacing: 0.04em;
   text-transform: uppercase;
   border-bottom: 1px solid var(--border);
@@ -546,9 +630,9 @@ tbody tr:hover {
 }
 
 .status-progress {
-  background: var(--accent-soft);
-  color: var(--accent);
-  border-color: var(--accent-soft-border);
+  background: var(--info-soft);
+  color: var(--info);
+  border-color: var(--info-soft-border);
 }
 
 .status-success {
@@ -624,6 +708,9 @@ a.brand {
   color: inherit;
 }
 
+/* Solid rounded-square mark (radius-sm, matching ecomglider.com's own
+   Logo.astro: `rect rx="8" fill="var(--color-primary)"`), not the old warm
+   rust gradient. */
 .brand-mark {
   display: flex;
   align-items: center;
@@ -631,8 +718,8 @@ a.brand {
   width: 34px;
   height: 34px;
   flex-shrink: 0;
-  border-radius: 9px;
-  background: linear-gradient(155deg, var(--accent) 0%, var(--accent-hover) 100%);
+  border-radius: var(--radius-sm);
+  background: var(--accent);
   color: var(--accent-fg);
   box-shadow: var(--shadow-sm);
 }
@@ -660,7 +747,11 @@ a.brand {
   font-weight: 700;
   letter-spacing: 0.06em;
   text-transform: uppercase;
-  color: var(--accent);
+  /* --info (blue), not --accent — --accent is now the same near-black as
+     --fg, which would make this label invisible against .brand-name right
+     above it. Blue also matches ecomglider.com's own use of blue for small
+     label-like UI (nav pills, badges). */
+  color: var(--info);
 }
 
 /* Site-wide build-stage marker — see TopBar.astro, AdminSidebar.astro, and
@@ -687,8 +778,11 @@ a.brand {
   align-items: center;
   justify-content: center;
   padding: 20px;
+  /* --info-soft, not --accent-soft — the sign-in screen is the one place a
+     small deliberate splash of ecomglider's blue earns its keep; --accent
+     itself is neutral black/white now and would give this no color at all. */
   background:
-    radial-gradient(circle at 20% 0%, var(--accent-soft) 0%, transparent 38%),
+    radial-gradient(circle at 20% 0%, var(--info-soft) 0%, transparent 38%),
     var(--bg);
 }
 
@@ -705,17 +799,20 @@ a.brand {
 /*
  * Admin shell — persistent dark sidebar + content top bar, replacing the
  * old hamburger-dropdown/.screen pattern for /admin/* only (picker/packer/
- * login keep the mobile-first shell above). Sidebar is always dark navy
+ * login keep the mobile-first shell above). Sidebar is always dark
  * regardless of the light/dark app theme — it's chrome, not content, same
  * as Seller Flex's own sidebar never following the rest of the page theme.
+ * Colors are ecomglider.com's own dark-mode neutrals (--color-canvas etc.
+ * in their dark override), not an independent navy palette, so the sidebar
+ * reads as "this app's dark chrome" rather than a different product.
  */
 :root {
-  --sidebar-bg: #171a21;
-  --sidebar-bg-2: #1e222b;
-  --sidebar-fg: #e8e6e1;
-  --sidebar-muted: #9098a8;
-  --sidebar-border: #2a2e38;
-  --sidebar-active-bg: #2a2e38;
+  --sidebar-bg: #0a0a0a;
+  --sidebar-bg-2: #1e1e1e;
+  --sidebar-fg: #ededed;
+  --sidebar-muted: #a8a8a8;
+  --sidebar-border: #2a2a2a;
+  --sidebar-active-bg: #262626;
 }
 
 .admin-shell {
@@ -755,7 +852,11 @@ a.brand {
 }
 
 .admin-sidebar-brand .brand-section {
-  color: var(--accent);
+  /* --sidebar-accent, not the base .brand-section blue or --accent — the
+     sidebar is a fixed dark panel regardless of the app's light/dark theme,
+     so it needs its own always-legible-on-dark accent (see :root above),
+     independent of whichever value --accent/--info currently hold. */
+  color: var(--sidebar-accent);
 }
 
 .admin-sidebar-nav {
@@ -805,7 +906,7 @@ a.brand {
 
 .admin-sidebar-link.active {
   background: var(--sidebar-active-bg);
-  color: var(--accent);
+  color: var(--sidebar-accent);
 }
 
 .admin-content {
@@ -945,7 +1046,7 @@ a.brand {
 }
 
 .stat-card-accent-progress {
-  border-left-color: var(--accent);
+  border-left-color: var(--info);
 }
 
 .stat-card-accent-success {
@@ -1023,23 +1124,26 @@ a.brand {
   color: var(--muted);
 }
 
+/* success (done) / info (current) — not --accent, which is now the neutral
+   primary-action color rather than a status color. Matches the same
+   done=green/current=blue language as .status-success/.status-progress. */
 .stepper-step.done .stepper-step-node {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: var(--accent-fg);
+  background: var(--success);
+  border-color: var(--success);
+  color: #ffffff;
 }
 
 .stepper-step.done .stepper-step-line {
-  background: var(--accent);
+  background: var(--success);
 }
 
 .stepper-step.current .stepper-step-node {
-  border-color: var(--accent);
-  color: var(--accent);
+  border-color: var(--info);
+  color: var(--info);
 }
 
 .stepper-step.current .stepper-step-label {
-  color: var(--accent);
+  color: var(--info);
 }
 
 /* Product thumbnail sized for a table cell (vs. .thumb, which is used in
@@ -1146,8 +1250,9 @@ a.brand {
 }
 
 .barcode-id {
+  font-family: var(--font-mono);
   font-size: 0.7rem;
-  font-weight: 700;
+  font-weight: 500;
   letter-spacing: 0.02em;
   color: var(--muted);
   font-variant-numeric: tabular-nums;

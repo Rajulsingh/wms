@@ -2002,6 +2002,120 @@ session's earlier pagination fix went live, and has since aged fully out of reac
   has real tradeoffs (extra GetOrders/GetOrderItems calls, D1 writes) worth discussing with the user
   rather than assuming, especially given this session's own earlier D1-quota incident.
 
+## Recently done (2026-09-21) — the two follow-ups above, actually built: sync watermark + "Import order by ID"
+
+Continuing directly from the previous entry — asked the user which fix(es) they wanted; they chose
+both.
+
+**Persisted sync watermark** (the systemic fix). New `warehouses.amazon_orders_synced_through`
+column. `runAmazonSyncJob` (sync-job.ts) now reads this per warehouse instead of always computing
+`since` from a fixed `sinceHours` rolling window; captures `runStartedAt` *before* calling
+`fetchUnfulfilledOrders`, and only writes it as the new watermark once that warehouse's fetch+import
+succeeds (a failure leaves the watermark untouched, so the same range is naturally retried next
+time — safe, since import already dedupes by external order id). `sinceHours` is now only ever a
+bootstrap fallback, used exactly once per warehouse while the watermark is still NULL. Verified live
+in local dev: two consecutive "Sync with Amazon" clicks — first one used the fallback window and
+imported normally (7 orders), second one's watermark had advanced to ~25 seconds earlier and
+correctly imported 0 new orders, proving it's using the real gap, not still using a fixed window.
+Note this does **not** retroactively fix an order that's already stuck outside the *old* window
+(their watermark is written fresh going forward, not backdated) — that's what the tool below is for.
+
+**"Import order by ID"** (the one-off tool, reusable beyond just this one incident). New
+`fetchOrderById` in amazon.ts (GetOrders + GetOrderItems for one specific Amazon order id, rejecting
+non-MFN orders with a clear error) and `POST /api/admin/import-order` (admin-auth, audit-logged),
+feeding the result through the same `importAmazonOrders` every normal sync uses — no separate/
+divergent import logic. New input+button on the admin Orders page next to the other bulk actions.
+Verified all three response paths live in local dev: already-imported order → "nothing to import";
+AFN order id → clear rejection; nonexistent order id → "Amazon has no order with id...". The
+success path itself (a genuinely new order) wasn't exercised in local dev — every real recent order
+already existed there from this session's earlier testing — but it's a straight composition of two
+independently-already-verified pieces (`fetchOrderById` mirrors `fetchUnfulfilledOrders`'s own
+per-order construction exactly; `importAmazonOrders` is the same trusted function every other import
+path uses).
+**Still open**: `405-8730967-2581100` itself hasn't actually been fixed on production — doing that
+means an authenticated admin actually clicking the new "Import order by ID" button (I don't have and
+shouldn't ask for the production admin PIN). Asked the user to do this themselves.
+Deployed (Version ID `29000c3f-7a25-4cd0-a785-0451ec127078`).
+
+## Recently done (2026-09-21) — full visual reskin to match ecomglider.com
+
+User's plan: this WMS eventually becomes a premium, paid feature of the ecomglider.com platform
+itself, not a separately-branded tool — asked for the whole app (including the picker/packer/scan
+floor pages, confirmed explicitly, not just admin) to match ecomglider.com's actual design system,
+rebuilding key shared components to match rather than just retinting colors.
+
+Pulled the real reference, not a screenshot guess: `../Ecom Seller Suite/peaceful-plasma` is the
+actual ecomglider.com Astro codebase on this machine — read its `src/styles/global.css` (full
+`@theme` token block: colors, radii, layered hairline-ring shadow recipes), `Button.astro` (pill
+shape, primary=solid ink/on-primary, secondary=canvas+shadow-hairline), `Badge.astro`, `Table.astro`,
+`Logo.astro` (solid ink rounded-square mark, rx=8, matching `--radius-md`), `NavBar.astro`, and
+`src/pages/console/index.astro` (their own SP-API order console — the closest thing they have to an
+actual app screen, not just marketing pages) for the `.form-input` spec (hairline border, radius-sm,
+outline-based focus, not a box-shadow glow). This is the actual source of truth transcribed below,
+not a guess from the one screenshot the user shared.
+
+**Fonts**: added `@fontsource-variable/inter` + `@fontsource/jetbrains-mono` (self-hosted, same
+choice ecomglider.com makes as the open-source Geist/Geist Mono substitutes) to `global.css`,
+replacing the old system-font-only stack — a deliberate departure from that stack's original
+"no web font request, unreliable warehouse Wi-Fi" reasoning (§9), since the user explicitly chose
+"everywhere, including floor pages" knowing that tradeoff. Mitigated by these being small, per-
+language-subset, immutably-cached self-hosted files (dist adds ~1.1MB total, only the "latin"
+subset actually loads for this app's text).
+
+**Tokens**: rewrote `global.css`'s `:root`/dark-mode blocks with ecomglider.com's actual hex values
+— *keeping every existing CSS custom-property name* (`--bg`, `--accent`, `--success`, `--radius`,
+`--shadow-card`, etc.) since every page in this app already styles itself via `var(--x)` rather than
+literal hex, so retargeting values here is what cascades the new look everywhere without touching
+each page. Two deliberate departures from a literal token copy, documented in a comment at the top
+of global.css: (1) `--success` stays green — ecomglider.com's own `--color-success` is literally
+the same blue as their links, fine for a marketing site with no real good/bad state to show, but
+wrong for a warehouse floor scanning a table of order statuses that needs shipped=green/cancelled=
+red/pending=amber to stay visually distinct; `--danger`/`--warning` DO take ecomglider's literal
+error/warning hexes since those meanings *do* line up. (2) new `--sidebar-accent` (a lighter blue)
+for the admin sidebar specifically, since `--accent` itself is near-black in light mode and the
+sidebar is a fixed dark panel regardless of app theme — using `--accent` there would be invisible.
+Also new: `--font-mono`, `--info`/`--info-soft`/`--info-soft-border` (a distinct "in progress /
+informational" blue, since `--accent` is now the neutral primary-action color, not a status color),
+`--radius-pill`, `--shadow-hairline`.
+
+**Components rebuilt to match, not just retinted**:
+- `.btn`/`.btn-primary`/`.btn-ghost`/`.btn-danger` — pill-shaped (`--radius-pill`), secondary
+  buttons use an inset hairline-ring shadow instead of a visible border (ecomglider.com's actual
+  "secondary" button treatment), primary is solid `--accent` with no colored glow (their own
+  Button.astro applies no shadow to the primary variant at all — the old rust `--shadow-btn-primary`
+  glow was removed, not just recolored). Tap-target sizing (56px/44px min-height) was **kept** from
+  the original warehouse requirement rather than copying ecomglider.com's smaller 48px/36px marketing
+  buttons — a gloved hand needs the bigger target regardless of which app is rendering it.
+- Inputs/selects — hairline border + `outline: 2px solid var(--accent); outline-offset: 1px;` on
+  focus (exact match to ecomglider.com's `.form-input:focus-visible`), replacing the old box-shadow
+  glow. Size (52px min-height/1.05rem) kept large for the same gloved-hand reason as buttons.
+- `th` — monospace uppercase (`--font-mono`), matching ecomglider.com's own console table headers
+  (`text-caption-mono`) instead of this app's previous sans-serif headers.
+- `::selection` — solid ink bg + light text, ecomglider.com's own exact (non-theme-driven) recipe.
+- `a` (plain text links) and `.order-card-ship` (the "Ship →" link) — `--info` (blue), not
+  `--accent` — ecomglider.com deliberately keeps "link" blue distinct from "primary action" black.
+- `.status-progress`, `.stat-card-accent-progress`, `.stepper-step.current` — switched from
+  `--accent` to `--info` (blue); `.stepper-step.done` switched to `--success` (green) — `--accent`
+  is no longer a status color, so anything that was borrowing it for "in progress"/"done" needed a
+  real status token instead.
+- `.brand-mark` (the logo box) — solid `--accent` fill, `--radius-sm` corners, matching
+  ecomglider.com's `Logo.astro` (`rect rx="8" fill="var(--color-primary)"`) exactly instead of the
+  old warm gradient.
+- `.admin-sidebar-*` dark-panel tokens (`--sidebar-bg` etc.) switched from an independent navy
+  palette to ecomglider.com's actual dark-mode neutrals, so the sidebar reads as "this product's
+  dark chrome," not a different one.
+- Favicon + `theme-color` meta (Base.astro) updated from the old rust hex to `#171717`.
+
+Verified live, both themes, both viewport sizes: login (light + dark, desktop + mobile), admin
+Orders (light + dark — tabs, sub-tabs, status pills, stat cards, sidebar active state), packer
+picking flow (mobile, light + dark — steppers, multi-unit tags, success banner), packer/scan (danger
+banner, table). Hit the exact same Vite dep-cache staleness bug documented earlier this session
+(installing the two new font packages changed the Vite config, invalidating the dep cache and 404ing
+a stale `@zxing_library.js` reference) — fixed with the already-known remedy (`astro dev stop && rm
+-rf node_modules/.vite && astro dev --background`), not a real bug in the theme work itself.
+`npx astro check` and `npx astro build` both clean. Deployed to production and spot-checked the
+live login page there too. Version ID `6d0e899f-2772-4a35-8049-4ce63f13a97b`.
+
 ## Next steps — a prioritized plan
 
 Rewritten 2026-09-20 (twenty-one passes across two days — see "Recently done" entries above for the
