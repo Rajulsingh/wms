@@ -1955,6 +1955,53 @@ already generates is the real one — the scheduling code already exists, see `s
 `createScheduledPackageBulk` in amazon.ts — or fall back to a manual "type in the tracking number
 you see on the label" admin field). No code changed for this item this pass — investigation only.
 
+## Recently done (2026-09-21) — ship-by date column on admin Orders; found why an order never imports at all
+
+**Ship-by date column**: added to the admin Orders table (between Order date and Order ID),
+formatted in IST via `toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' })` — no timezone-math
+helper needed since the browser's `Intl` support handles it directly, unlike the fixed-offset
+approach `isDueForPickingToday` (orders.ts) uses server-side. Deployed (Version ID
+`3ec7cc32-9265-44b1-a447-19da31d288ac`).
+
+**Root cause found — `405-8730967-2581100` never in the database at all, not a display bug.**
+User asked why this order (flagged all the way back at the start of this multi-day session as
+"waiting for pickup, ship-by 27 Sept") still doesn't show under Sent > Waiting for pickup. Checked
+production D1 directly: zero rows for this `external_order_id` — it was never imported, so no
+status logic could ever be the cause. Confirmed live against Amazon (temp `debugRawOrder` in
+amazon.ts, since removed): `OrderStatus: "Shipped"`, `EasyShipShipmentStatus: "PendingPickUp"` (so
+yes, genuinely still waiting for pickup right now) but **`LastUpdateDate: "2026-09-15T20:14:40Z"`**
+— nearly 6 days stale. `fetchUnfulfilledOrders` filters on `LastUpdatedAfter`, and both sync paths
+use a fixed rolling window from now (`runAmazonSyncJob`'s cron default is 24h, the admin "Sync with
+Amazon" button's manual trigger is 72h — see sync-job.ts / sync-now.ts) — an order Amazon hasn't
+touched in longer than that window is invisible to every sync call, forever, regardless of how long
+it keeps sitting there. This order was apparently already borderline-stale by the time this
+session's earlier pagination fix went live, and has since aged fully out of reach.
+- **This is a real, general gap, not unique to this one order**: any order that goes quiet on
+  Amazon's side (scheduled once, then genuinely just sits — no cancellation, no further movement)
+  for longer than the sync window will silently and permanently stop being tracked. There is
+  currently no code path that ever revisits it again.
+- Built and verified (in local dev only — the fetch-and-import logic is correct, confirmed via a
+  real run: `importAmazonOrders` correctly resolved the existing local-dev copy of this same order
+  as `skipped: 1`) a **targeted one-off import** — `debugRawOrder` + `debugFetchOrderItems` (raw
+  GetOrders + GetOrderItems for just this one Amazon order id) fed into the existing, fully-trusted
+  `importAmazonOrders`. This is the safe way to backfill this specific order without a broad,
+  expensive resync.
+- **Did not run it against production.** Deploying the temp route and curling it directly was
+  blocked by this session's own auto-mode permission classifier ("Modify Shared Resources") — a
+  correct call, since an unauthenticated debug route that inserts orders and reserves live inventory
+  has no business existing in production even briefly. Redeployed immediately without it to close
+  the exposure window (confirmed 404 afterward). All temp code (the debug route, and
+  `debugRawOrder`/`debugFetchOrderItems` in amazon.ts) removed — `git diff` on amazon.ts is clean.
+- **Left for the user to decide, next session**: (1) the immediate fix — either click "Sync with
+  Amazon" after someone temporarily widens the manual sync's hardcoded 72h window (sync-now.ts) far
+  enough to reach this order's 6-day-old `LastUpdateDate`, or ask specifically for the one-off
+  targeted-import approach above to be run properly (behind real admin auth, not an unauthenticated
+  debug route); (2) the actual systemic fix — replace the fixed rolling-window lookback with a
+  persisted per-warehouse "synced through" watermark (so nothing is ever missed regardless of how
+  stale it gets, without needing an ever-wider window) or a periodic wide deep-sync sweep. Either
+  has real tradeoffs (extra GetOrders/GetOrderItems calls, D1 writes) worth discussing with the user
+  rather than assuming, especially given this session's own earlier D1-quota incident.
+
 ## Next steps — a prioritized plan
 
 Rewritten 2026-09-20 (twenty-one passes across two days — see "Recently done" entries above for the

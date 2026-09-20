@@ -103,6 +103,15 @@ if (redirectTo) return Astro.redirect(redirectTo);
       return o.order_value ? `₹${o.order_value.toFixed(2)}` : '—';
     }
 
+    // IST, not the browser's local zone — this warehouse is IST-only and the
+    // date this deadline actually falls on in IST is what matters for
+    // "is this due today" judgment calls, same reasoning as isDueForPickingToday
+    // in lib/orders.ts.
+    function shipByDate(o: OrderRow): string {
+      if (!o.ship_by) return '—';
+      return new Date(o.ship_by).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric' });
+    }
+
     // Amazon's Merchant Fulfillment label can be bought any time once the order exists — matches the "labels purchased upfront" workflow, not gated on picking/packing being done first.
     function shipAction(o: OrderRow): string {
       if (o.source !== 'amazon') return '';
@@ -284,13 +293,14 @@ if (redirectTo) return Astro.redirect(redirectTo);
       ordersTable.innerHTML = `
         <div class="table-scroll"><table>
           <thead>
-            <tr><th>Order date</th><th>Order ID</th><th>Product</th><th>Order Status</th><th>Stage</th><th>Tracking</th><th>Value</th><th>Notes</th><th></th></tr>
+            <tr><th>Order date</th><th>Ship by</th><th>Order ID</th><th>Product</th><th>Order Status</th><th>Stage</th><th>Tracking</th><th>Value</th><th>Notes</th><th></th></tr>
           </thead>
           <tbody>
             ${currentOrders
               .map(
                 (o) => `<tr data-order-id="${o.id}">
                   <td style="white-space: nowrap; font-size: 0.8rem; color: var(--muted);">${new Date(o.created_at).toLocaleDateString()}</td>
+                  <td style="white-space: nowrap; font-size: 0.8rem; font-weight: 700;">${shipByDate(o)}</td>
                   <td style="font-weight:700; font-variant-numeric: tabular-nums; white-space: nowrap;">
                     ${o.external_order_id}
                     <div style="font-weight:400; font-size:0.78rem; color: var(--muted);">${o.source}${o.customer_name ? ' · ' + escapeHtml(o.customer_name) : ''}</div>
