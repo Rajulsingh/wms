@@ -2248,6 +2248,28 @@ this list.
    reconciled against system stock.
 10. **Daily outbound is picking volume, not ship-date volume** — see "What's built" → Reports.
     Revisit only if the user specifically wants true ship-date tracking.
+11a. **Reports API role not granted — blocks investigating a real fix for AWB-scan mismatches.**
+    User reported a real incident: scanning a physical AWB (`372690986408`) matched it to the wrong
+    order via the FIFO fallback in `applyAwbByScan` (packer.ts). Investigated why: checked production
+    and found `carrier` is `NULL` on every shipment record that exists — meaning 100% of this
+    account's Easy Ship pickups are scheduled directly on Seller Central, never through this app's
+    own `scheduleEasyShipForOrder`/`purchaseLabelForOrder` (which DO correctly capture the real
+    AWB→order link, see the earlier "AWB scanning matched against real data" pass) — so that fix has
+    nothing to match against for this account's actual workflow, and always falls through to FIFO.
+    Asked the user which direction to take; they chose investigating whether Amazon's Reports API can
+    supply a bulk order→tracking mapping automatically, so scheduling doesn't have to move into this
+    app. Found a strong candidate (`GET_FLAT_FILE_ORDER_REPORT_DATA_SHIPPING`, Amazon's documented
+    "Order Tracking Report") and tried requesting it live (`POST /reports/2021-06-30/reports`) rather
+    than assume it contains the right columns — got `403 Unauthorized`, the same class of blocker
+    Easy Ship and Listings Items each hit before their SP-API roles were granted (see item 1 above
+    and item 13 below). **Blocked on the seller granting this SP-API app the Reports role in Seller
+    Central** (Manage Apps → this app's authorization) — cannot verify the report's actual content,
+    let alone build anything on it, until that's granted. Revisit by re-running the same
+    create-report → poll → download flow once granted; if the report does contain a usable
+    order/tracking mapping, the next step is a scheduled pull (mirroring the existing cron pattern)
+    that pre-registers each mapping into `awbs` before packing, giving `applyAwbByScan` real data to
+    match against instead of FIFO — same mechanism the purchase-time insert already provides, just
+    sourced from this report instead of a purchase response.
 11. **Dead code**: `src/pages/api/picker/scan-item.ts` / `verifyItemScan` in `picker.ts` — left
     over from before the picker dropped mandatory scanning, nothing calls it. Safe to delete.
 12. **Cosmetic**: `Warehouse` type in `types.ts` doesn't include the `ship_from_*` columns from
