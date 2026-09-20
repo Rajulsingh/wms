@@ -1038,6 +1038,58 @@ a.brand {
   white-space: nowrap;
 }
 
+/* Determinate/indeterminate progress bar for long-running admin actions
+   (Amazon catalog sync, duplicate scan) — shows real percentage when the
+   caller knows one (sync streams page-by-page counts), or an animated
+   sliding fill when it doesn't (a single fast query has no sub-steps to
+   report, but still runs long enough over a slow connection to want
+   feedback that it's alive, not stuck). */
+.progress-bar {
+  position: relative;
+  width: 100%;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  overflow: hidden;
+  display: none;
+}
+
+.progress-bar.active {
+  display: block;
+}
+
+.progress-bar-fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 0%;
+  background: var(--accent);
+  border-radius: 999px;
+  transition: width 0.25s ease;
+}
+
+.progress-bar.indeterminate .progress-bar-fill {
+  width: 35%;
+  animation: progress-bar-slide 1.1s ease-in-out infinite;
+}
+
+@keyframes progress-bar-slide {
+  0% {
+    left: -35%;
+  }
+  100% {
+    left: 100%;
+  }
+}
+
+.progress-label {
+  font-size: 0.78rem;
+  color: var(--muted);
+  margin-top: 4px;
+}
+
 /* Scan-to-open row — text input (also the natural home for a physical
    USB/handheld barcode scanner's keyboard-wedge input) + camera-scan button,
    reusing the existing video.scanner look from picker/packer. */

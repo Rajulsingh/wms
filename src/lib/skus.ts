@@ -30,6 +30,8 @@ interface SkuRef {
   id: string;
   sku_code: string;
   name: string;
+  image_url: string | null;
+  asin: string | null;
   merged_into_id: string | null;
 }
 
@@ -37,8 +39,8 @@ async function loadMergeable(db: D1Database, sourceCode: string, targetCode: str
   if (sourceCode === targetCode) throw new SkuMergeError('same_sku', 'Pick two different SKU codes to merge');
 
   const [source, target] = await Promise.all([
-    db.prepare(`SELECT id, sku_code, name, merged_into_id FROM skus WHERE sku_code = ?`).bind(sourceCode).first<SkuRef>(),
-    db.prepare(`SELECT id, sku_code, name, merged_into_id FROM skus WHERE sku_code = ?`).bind(targetCode).first<SkuRef>()
+    db.prepare(`SELECT id, sku_code, name, image_url, asin, merged_into_id FROM skus WHERE sku_code = ?`).bind(sourceCode).first<SkuRef>(),
+    db.prepare(`SELECT id, sku_code, name, image_url, asin, merged_into_id FROM skus WHERE sku_code = ?`).bind(targetCode).first<SkuRef>()
   ]);
   if (!source) throw new SkuMergeError('not_found', `No SKU found with code "${sourceCode}"`);
   if (!target) throw new SkuMergeError('not_found', `No SKU found with code "${targetCode}"`);
@@ -49,12 +51,17 @@ async function loadMergeable(db: D1Database, sourceCode: string, targetCode: str
 }
 
 export interface SkuMergePreview {
-  source: { id: string; code: string; name: string };
-  target: { id: string; code: string; name: string };
+  source: { id: string; code: string; name: string; imageUrl: string | null; asin: string | null };
+  target: { id: string; code: string; name: string; imageUrl: string | null; asin: string | null };
   inventoryLines: number;
   inventoryUnits: number;
   orderItemCount: number;
   pickTaskCount: number;
+  // True only when BOTH sides have a known ASIN and they differ — a strong
+  // signal these are genuinely different products or variations (e.g. a
+  // color/size sibling) that happen to share an identical Amazon title, not
+  // a real duplicate. Never true just because one side is missing an ASIN.
+  asinMismatch: boolean;
 }
 
 /** Read-only — what a merge of these two codes would move, so admin can see it before committing. */
@@ -68,18 +75,21 @@ export async function previewSkuMerge(db: D1Database, sourceCode: string, target
   ]);
 
   return {
-    source: { id: source.id, code: source.sku_code, name: source.name },
-    target: { id: target.id, code: target.sku_code, name: target.name },
+    source: { id: source.id, code: source.sku_code, name: source.name, imageUrl: source.image_url, asin: source.asin },
+    target: { id: target.id, code: target.sku_code, name: target.name, imageUrl: target.image_url, asin: target.asin },
     inventoryLines: inv?.lines ?? 0,
     inventoryUnits: inv?.units ?? 0,
     orderItemCount: oi?.c ?? 0,
-    pickTaskCount: pt?.c ?? 0
+    pickTaskCount: pt?.c ?? 0,
+    asinMismatch: Boolean(source.asin && target.asin && source.asin !== target.asin)
   };
 }
 
 export interface DuplicateSkuCandidate {
   id: string;
   code: string;
+  imageUrl: string | null;
+  asin: string | null;
   inventoryUnits: number;
   orderItemCount: number;
   createdAt: string;
@@ -89,6 +99,13 @@ export interface DuplicateSkuGroup {
   name: string;
   candidates: DuplicateSkuCandidate[];
   suggestedKeepId: string;
+  // True when candidates in this group carry two or more distinct known
+  // ASINs — the group was formed purely on an identical product title, and
+  // a title match alone can't tell a real duplicate apart from a
+  // same-title variation (see mergeSku's doc comment and HANDOFF.md: two
+  // already-merged SKU pairs in production had matching titles but
+  // different photos). Doesn't mean "don't merge" — just "look closer."
+  hasAsinMismatch: boolean;
 }
 
 /**
@@ -110,7 +127,7 @@ export interface DuplicateSkuGroup {
 export async function findDuplicateSkus(db: D1Database): Promise<DuplicateSkuGroup[]> {
   const rows = await db
     .prepare(
-      `SELECT s.id, s.sku_code, s.name, s.created_at,
+      `SELECT s.id, s.sku_code, s.name, s.image_url, s.asin, s.created_at,
               COALESCE((SELECT SUM(quantity_on_hand) FROM inventory WHERE sku_id = s.id), 0) AS inventory_units,
               (SELECT COUNT(*) FROM order_items WHERE sku_id = s.id) AS order_item_count
        FROM skus s
@@ -120,17 +137,34 @@ export async function findDuplicateSkus(db: D1Database): Promise<DuplicateSkuGro
          )
        ORDER BY TRIM(LOWER(s.name)), s.created_at ASC`
     )
-    .all<{ id: string; sku_code: string; name: string; created_at: string; inventory_units: number; order_item_count: number }>();
+    .all<{
+      id: string;
+      sku_code: string;
+      name: string;
+      image_url: string | null;
+      asin: string | null;
+      created_at: string;
+      inventory_units: number;
+      order_item_count: number;
+    }>();
 
   const groups = new Map<string, DuplicateSkuGroup>();
   for (const r of rows.results) {
     const key = r.name.trim().toLowerCase();
     let g = groups.get(key);
     if (!g) {
-      g = { name: r.name, candidates: [], suggestedKeepId: '' };
+      g = { name: r.name, candidates: [], suggestedKeepId: '', hasAsinMismatch: false };
       groups.set(key, g);
     }
-    g.candidates.push({ id: r.id, code: r.sku_code, inventoryUnits: r.inventory_units, orderItemCount: r.order_item_count, createdAt: r.created_at });
+    g.candidates.push({
+      id: r.id,
+      code: r.sku_code,
+      imageUrl: r.image_url,
+      asin: r.asin,
+      inventoryUnits: r.inventory_units,
+      orderItemCount: r.order_item_count,
+      createdAt: r.created_at
+    });
   }
   for (const g of groups.values()) {
     const best = g.candidates.reduce((a, b) => {
@@ -139,6 +173,8 @@ export async function findDuplicateSkus(db: D1Database): Promise<DuplicateSkuGro
       return a.createdAt <= b.createdAt ? a : b;
     });
     g.suggestedKeepId = best.id;
+    const knownAsins = new Set(g.candidates.map((c) => c.asin).filter((a): a is string => Boolean(a)));
+    g.hasAsinMismatch = knownAsins.size > 1;
   }
   return Array.from(groups.values());
 }

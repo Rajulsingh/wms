@@ -52,8 +52,8 @@ export async function importAmazonOrders(db: D1Database, warehouseId: string, or
         const catalog = item.asin ? await fetchCatalogItemDetails(item.asin) : { title: null, imageUrl: null };
         skuId = newId();
         await db
-          .prepare(`INSERT INTO skus (id, sku_code, name, image_url) VALUES (?, ?, ?, ?)`)
-          .bind(skuId, item.sellerSku, catalog.title ?? item.title ?? item.sellerSku, catalog.imageUrl)
+          .prepare(`INSERT INTO skus (id, sku_code, name, image_url, asin) VALUES (?, ?, ?, ?, ?)`)
+          .bind(skuId, item.sellerSku, catalog.title ?? item.title ?? item.sellerSku, catalog.imageUrl, item.asin ?? null)
           .run();
         summary.newSkusCreated.push(item.sellerSku);
       }

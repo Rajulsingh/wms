@@ -1172,6 +1172,47 @@ a SKU-grouped *view + bulk-assign action* on top of it.
   active test packer's own polling swept up everything else too — expected with a single packer, not
   a bug).
 
+## Recently done (2026-09-20, a twenty-seventh pass) — SKU merge tool couldn't tell duplicates from variations
+
+The user's complaint: SKUs feel "synced wrong" — the duplicate-scan and merge screens never showed a
+photo, title, or anything else to actually compare two candidates before merging, and the sync/scan
+buttons gave no sense of progress. Checked production data before touching anything (per the usual
+practice here — verify against real rows, don't assume): of the 44 SKUs already merged via this tool,
+2 pairs turned out to have **different Amazon photos** despite an identical title — e.g. "5 Pack Cute
+Dog Bookmarks" covers more than one color variant under the same generic listing title, and the
+exact-name duplicate scan (`findDuplicateSkus`, `skus.ts`) can't tell that apart from a real duplicate
+using title text alone. That's the real bug: not a sync/matching defect (checked — no case/whitespace
+`sku_code` collisions exist in production), but a missing-signal problem in the merge tool itself.
+
+- **ASIN now persisted** (`migrations/0016_sku_asin.sql`, applied local + remote) — `fetchAllListings`
+  and Amazon order-item imports both already fetched the ASIN and silently discarded it; now stored
+  on `skus.asin` by both `catalog-sync.ts` and `orders.ts`. It's the one signal that survives when two
+  genuinely different products share a byte-identical title.
+- **`findDuplicateSkus`** (`skus.ts`) now returns `imageUrl`/`asin` per candidate and a group-level
+  `hasAsinMismatch` flag (true when a group's candidates carry ≥2 distinct known ASINs). **
+  `previewSkuMerge`** now returns `imageUrl`/`asin` for both sides plus an `asinMismatch` flag — never
+  true just because one side's ASIN is unknown, only when both are known and differ.
+- **`/admin/inventory.astro`** — the duplicate-scan list now shows each candidate's actual photo, code,
+  and ASIN side by side (not just codes/counts), with a red banner on any group with an ASIN mismatch
+  warning it's likely different variations, not duplicates. The merge-preview banner does the same:
+  both SKUs' photos + ASIN shown before "Confirm merge", switching to a red (not just amber) banner
+  and an explicit ASIN-mismatch warning when applicable. Nothing is blocked — still admin's call — but
+  now an informed one.
+- **Progress feedback**: "Scan for duplicates" gets an animated indeterminate bar (single fast query,
+  no real sub-steps to report). "Sync Amazon catalog" (`inbound.astro`) gets real incremental
+  progress — `syncAmazonCatalog` now takes an `onProgress` callback fired after each page of listings
+  is fetched *and written* (not just fetched), and the API route (`sync-amazon-catalog.ts`) streams
+  newline-delimited JSON instead of one response at the end, so the client can show "N listings synced
+  so far…" while a 200+ page sync is still running instead of a frozen spinner.
+- Verified live in dev against the real Amazon catalog (local D1, not production data): sync streamed
+  real incremental counts up to "227 listings synced" then completed; the duplicate scan found 41 real
+  groups from the synced catalog, correctly showed matching photos+ASIN for a genuine duplicate pair
+  and correctly red-flagged/showed differing photos for an ASIN-mismatched pair (the "Dog Bookmarks"
+  case) with the merge-preview screen rendering the same warning before confirm.
+- **Left alone deliberately**: did not attempt to un-merge the 2 already-suspect production pairs
+  found while investigating — that's a data decision for the user now that they can actually see the
+  photos, not something to silently correct. Worth pointing out to them directly.
+
 ## Next steps — a prioritized plan
 
 Rewritten 2026-09-20 (twenty-one passes across two days — see "Recently done" entries above for the

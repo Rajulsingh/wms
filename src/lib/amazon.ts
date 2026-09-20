@@ -303,7 +303,7 @@ export interface ListingSummary {
  * right tool for this. Capped at 1000 items / 50 pages of 20, matching
  * Amazon's own stated ceiling for this endpoint's pagination.
  */
-export async function fetchAllListings(): Promise<ListingSummary[]> {
+export async function fetchAllListings(onPage?: (pageItems: ListingSummary[]) => void | Promise<void>): Promise<ListingSummary[]> {
   const env = getEnv();
   const sellerId = env.AMAZON_MERCHANT_ID;
   if (!sellerId) {
@@ -337,18 +337,25 @@ export async function fetchAllListings(): Promise<ListingSummary[]> {
       pagination?: { nextToken?: string };
     };
 
+    const pageItems: ListingSummary[] = [];
     for (const item of data.items ?? []) {
       // mainImage lives nested inside each per-marketplace summary entry, not
       // as a top-level field on the item — confirmed against a real response
       // (the published JSON schema doesn't make this placement obvious).
       const summary = item.summaries?.find((s) => s.marketplaceId === env.AMAZON_MARKETPLACE_ID) ?? item.summaries?.[0];
-      results.push({
+      pageItems.push({
         sku: item.sku,
         asin: summary?.asin ?? null,
         title: summary?.itemName ?? null,
         imageUrl: summary?.mainImage?.link ?? null
       });
     }
+    results.push(...pageItems);
+    // Reports each page as soon as it arrives instead of only after every
+    // page has been fetched — lets a caller (catalog-sync's progress stream)
+    // show real incremental progress for a sync that can take many pages
+    // instead of one silent wait then a single jump to 100%.
+    if (onPage) await onPage(pageItems);
 
     pageToken = data.pagination?.nextToken;
     pages++;

@@ -13,6 +13,8 @@ if (redirectTo) return Astro.redirect(redirectTo);
       <h2>Product catalog</h2>
       <p>The product search below only knows about SKUs that already exist locally — normally that's every SKU an Amazon order has referenced, plus anything entered manually. If a product you sell on Amazon isn't showing up yet, sync your full Amazon listings catalog in.</p>
       <button class="btn" id="sync-catalog-btn" style="width: auto;">Sync Amazon catalog</button>
+      <div id="sync-progress" class="progress-bar"><div class="progress-bar-fill"></div></div>
+      <div id="sync-progress-label" class="progress-label" style="display:none;"></div>
       <div id="sync-result" class="banner" style="display:none;"></div>
     </div>
 
@@ -217,13 +219,60 @@ if (redirectTo) return Astro.redirect(redirectTo);
     document.getElementById('sync-catalog-btn')?.addEventListener('click', async () => {
       const btn = document.getElementById('sync-catalog-btn') as HTMLButtonElement;
       const resultEl = document.getElementById('sync-result')!;
+      const progressEl = document.getElementById('sync-progress')!;
+      const progressFill = progressEl.querySelector('.progress-bar-fill') as HTMLElement;
+      const progressLabel = document.getElementById('sync-progress-label')!;
       btn.disabled = true;
       btn.textContent = 'Syncing…';
+      resultEl.style.display = 'none';
+      progressEl.classList.add('active');
+      progressFill.style.width = '0%';
+      progressLabel.style.display = 'block';
+      progressLabel.textContent = 'Fetching listings from Amazon…';
+
+      // The server streams newline-delimited JSON (see sync-amazon-catalog.ts)
+      // instead of one response at the end — a full sync can walk many pages
+      // against Amazon, and this is the only way to show real progress
+      // instead of a spinner frozen for however long that takes.
       try {
-        const result = await api('/api/admin/sync-amazon-catalog', {});
-        resultEl.className = 'banner banner-success';
-        resultEl.textContent = `Synced ${result.total} listings from Amazon (${result.created} new, ${result.updated} updated).`;
-        resultEl.style.display = 'block';
+        const res = await fetch('/api/admin/sync-amazon-catalog', { method: 'POST' });
+        if (!res.ok || !res.body) {
+          const data: any = await res.json().catch(() => ({}));
+          throw new Error(data.error ?? `Request failed (${res.status})`);
+        }
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let done = false;
+        while (!done) {
+          const chunk = await reader.read();
+          done = chunk.done;
+          if (chunk.value) buffer += decoder.decode(chunk.value, { stream: true });
+          let newlineIndex: number;
+          while ((newlineIndex = buffer.indexOf('\n')) >= 0) {
+            const line = buffer.slice(0, newlineIndex).trim();
+            buffer = buffer.slice(newlineIndex + 1);
+            if (!line) continue;
+            const msg = JSON.parse(line);
+            if (msg.type === 'progress') {
+              // Total page count isn't known upfront (Amazon paginates via an
+              // opaque token, not a total), so this approaches 100% without
+              // ever quite reaching it until the final "done" message — still
+              // a still-useful signal that it's moving, not stuck.
+              const pct = Math.min(92, 100 * (1 - 1 / (1 + msg.processed / 60)));
+              progressFill.style.width = `${pct}%`;
+              progressLabel.textContent = `${msg.processed} listing${msg.processed === 1 ? '' : 's'} synced so far…`;
+            } else if (msg.type === 'done') {
+              progressFill.style.width = '100%';
+              progressLabel.textContent = `Done — ${msg.total} listings.`;
+              resultEl.className = 'banner banner-success';
+              resultEl.textContent = `Synced ${msg.total} listings from Amazon (${msg.created} new, ${msg.updated} updated).`;
+              resultEl.style.display = 'block';
+            } else if (msg.type === 'error') {
+              throw new Error(msg.error ?? 'Sync failed');
+            }
+          }
+        }
         await loadReceipts(); // refreshes the local `skus` array the product search below reads from
       } catch (err) {
         resultEl.className = 'banner banner-danger';
@@ -232,6 +281,10 @@ if (redirectTo) return Astro.redirect(redirectTo);
       } finally {
         btn.disabled = false;
         btn.textContent = 'Sync Amazon catalog';
+        setTimeout(() => {
+          progressEl.classList.remove('active');
+          progressLabel.style.display = 'none';
+        }, 800);
       }
     });
 

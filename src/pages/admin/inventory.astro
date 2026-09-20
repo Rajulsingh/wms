@@ -21,13 +21,15 @@ if (redirectTo) return Astro.redirect(redirectTo);
       <input type="text" id="merge-target" placeholder="SKU code to keep" style="flex: 1; min-width: 180px;" />
       <button class="btn" id="merge-preview-btn" style="width: auto;">Preview merge</button>
     </div>
+    <div id="merge-progress" class="progress-bar indeterminate"><div class="progress-bar-fill"></div></div>
     <div id="merge-result"></div>
   </div>
 
   <div class="card stack">
     <h2>Possible duplicate SKUs</h2>
-    <p>Finds SKUs with an exactly matching product name — almost always the same physical item Amazon sent under more than one SellerSKU. Only exact name matches are flagged; a small title difference won't show up here, so this isn't exhaustive.</p>
+    <p>Finds SKUs with an exactly matching product name — almost always the same physical item Amazon sent under more than one SellerSKU. Only exact name matches are flagged; a small title difference won't show up here, so this isn't exhaustive. An identical title doesn't always mean identical product — compare the photos (and the ASIN, when shown) before merging.</p>
     <button class="btn" id="scan-duplicates-btn" style="width: auto;">Scan for duplicates</button>
+    <div id="scan-progress" class="progress-bar indeterminate"><div class="progress-bar-fill"></div></div>
     <div id="duplicates-result"></div>
   </div>
 
@@ -118,14 +120,29 @@ if (redirectTo) return Astro.redirect(redirectTo);
     const mergeSourceInput = document.getElementById('merge-source') as HTMLInputElement;
     const mergeTargetInput = document.getElementById('merge-target') as HTMLInputElement;
 
+    interface MergeSide { id: string; code: string; name: string; imageUrl: string | null; asin: string | null }
     interface MergePreview {
-      source: { id: string; code: string; name: string };
-      target: { id: string; code: string; name: string };
+      source: MergeSide;
+      target: MergeSide;
       inventoryLines: number;
       inventoryUnits: number;
       orderItemCount: number;
       pickTaskCount: number;
+      asinMismatch: boolean;
     }
+
+    function mergeSideCardHtml(label: string, side: MergeSide): string {
+      return `
+        <div class="stack" style="gap: 4px; align-items: center; text-align: center; flex: 1; min-width: 140px;">
+          <span style="font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted);">${label}</span>
+          ${side.imageUrl ? `<img class="thumb thumb-lg" src="${side.imageUrl}" alt="" />` : '<div class="thumb thumb-lg"></div>'}
+          <strong>${escapeHtml(side.code)}</strong>
+          <span style="font-size: 0.78rem; color: var(--muted);">${escapeHtml(side.name)}</span>
+          <span style="font-size: 0.72rem; color: var(--muted);">ASIN: ${side.asin ? escapeHtml(side.asin) : 'unknown'}</span>
+        </div>`;
+    }
+
+    const mergeProgress = document.getElementById('merge-progress')!;
 
     document.getElementById('merge-preview-btn')?.addEventListener('click', async (e) => {
       const sourceCode = mergeSourceInput.value.trim();
@@ -136,16 +153,24 @@ if (redirectTo) return Astro.redirect(redirectTo);
         return;
       }
       const btn = e.currentTarget as HTMLButtonElement;
+      mergeProgress.classList.add('active');
       try {
         const preview: MergePreview = await withLoading(btn, 'Checking…', () =>
           api(`/api/admin/sku-merge?sourceCode=${encodeURIComponent(sourceCode)}&targetCode=${encodeURIComponent(targetCode)}`)
         );
         mergeResult.innerHTML = `
-          <div class="banner banner-warning" style="margin-top: 10px;">
-            <p style="margin: 0 0 8px;">
-              Merging <strong>${escapeHtml(preview.source.code)}</strong> (${escapeHtml(preview.source.name)}) into
-              <strong>${escapeHtml(preview.target.code)}</strong> (${escapeHtml(preview.target.name)}) will move:
-            </p>
+          <div class="banner ${preview.asinMismatch ? 'banner-danger' : 'banner-warning'}" style="margin-top: 10px;">
+            ${
+              preview.asinMismatch
+                ? `<p style="margin: 0 0 10px; font-weight: 700;">⚠ These have different Amazon ASINs (${escapeHtml(preview.source.asin!)} vs ${escapeHtml(preview.target.asin!)}) despite the same title — they're likely different products or variations (e.g. color/size), not duplicates. Compare the photos below carefully before merging.</p>`
+                : ''
+            }
+            <div class="row" style="gap: 12px; align-items: flex-start; flex-wrap: wrap; margin-bottom: 10px;">
+              ${mergeSideCardHtml('Retire', preview.source)}
+              <div style="align-self: center; font-size: 1.2rem; color: var(--muted);">→</div>
+              ${mergeSideCardHtml('Keep', preview.target)}
+            </div>
+            <p style="margin: 0 0 8px;">Merging will move:</p>
             <ul style="margin: 0 0 10px; padding-left: 20px;">
               <li>${preview.inventoryLines} inventory location${preview.inventoryLines === 1 ? '' : 's'} (${preview.inventoryUnits} unit${preview.inventoryUnits === 1 ? '' : 's'})</li>
               <li>${preview.orderItemCount} order line${preview.orderItemCount === 1 ? '' : 's'}</li>
@@ -171,12 +196,16 @@ if (redirectTo) return Astro.redirect(redirectTo);
         });
       } catch (err) {
         mergeResult.innerHTML = `<p style="color: var(--danger); margin-top: 10px;">${escapeHtml((err as Error).message)}</p>`;
+      } finally {
+        mergeProgress.classList.remove('active');
       }
     });
 
     interface DuplicateCandidate {
       id: string;
       code: string;
+      imageUrl: string | null;
+      asin: string | null;
       inventoryUnits: number;
       orderItemCount: number;
       createdAt: string;
@@ -185,9 +214,21 @@ if (redirectTo) return Astro.redirect(redirectTo);
       name: string;
       candidates: DuplicateCandidate[];
       suggestedKeepId: string;
+      hasAsinMismatch: boolean;
     }
 
     const duplicatesResult = document.getElementById('duplicates-result')!;
+    const scanProgress = document.getElementById('scan-progress')!;
+
+    function candidateCardHtml(c: DuplicateCandidate, isKeep: boolean): string {
+      return `
+        <div class="stack" style="gap: 2px; align-items: center; text-align: center; width: 96px;">
+          ${c.imageUrl ? `<img class="thumb thumb-lg" src="${c.imageUrl}" alt="" />` : '<div class="thumb thumb-lg"></div>'}
+          <strong style="font-size: 0.8rem;">${escapeHtml(c.code)}</strong>
+          <span style="font-size: 0.7rem; color: var(--muted);">${c.asin ? escapeHtml(c.asin) : 'no ASIN'}</span>
+          <span class="status-pill ${isKeep ? 'status-success' : 'status-neutral'}" style="font-size: 0.68rem;">${isKeep ? 'Keep' : `${c.inventoryUnits}u`}</span>
+        </div>`;
+    }
 
     // Reuses the exact same preview-then-confirm merge flow above instead
     // of a separate one-click merge path — every single merge, whether
@@ -203,6 +244,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
     document.getElementById('scan-duplicates-btn')?.addEventListener('click', async (e) => {
       const btn = e.currentTarget as HTMLButtonElement;
       duplicatesResult.innerHTML = '';
+      scanProgress.classList.add('active');
       try {
         const groups: DuplicateGroup[] = await withLoading(btn, 'Scanning…', () => api('/api/admin/sku-duplicates'));
         if (!groups.length) {
@@ -217,17 +259,19 @@ if (redirectTo) return Astro.redirect(redirectTo);
           const keep = g.candidates.find((c) => c.id === g.suggestedKeepId)!;
           const others = g.candidates.filter((c) => c.id !== g.suggestedKeepId);
           const row = document.createElement('div');
-          row.className = 'item-row';
-          row.style.flexWrap = 'wrap';
+          row.className = 'card';
           row.innerHTML = `
-            <div class="stack" style="gap: 2px; flex: 1; min-width: 240px;">
-              <span class="truncate-cell" style="max-width: 100%;" title="${escapeHtml(g.name)}">${escapeHtml(g.name)}</span>
-              <span style="font-size: 0.78rem; color: var(--muted);">
-                Keep <strong>${escapeHtml(keep.code)}</strong> (${keep.inventoryUnits} units, ${keep.orderItemCount} order line${keep.orderItemCount === 1 ? '' : 's'})
-                — vs ${others.map((c) => `${escapeHtml(c.code)} (${c.inventoryUnits} units)`).join(', ')}
-              </span>
+            ${
+              g.hasAsinMismatch
+                ? `<div class="banner banner-danger" style="margin-bottom: 10px;">⚠ Same title, different Amazon ASINs — these may be different products or variations, not duplicates. Check the photos before merging.</div>`
+                : ''
+            }
+            <span class="truncate-cell" style="max-width: 100%; font-weight: 600;" title="${escapeHtml(g.name)}">${escapeHtml(g.name)}</span>
+            <div class="row" style="flex-wrap: wrap; gap: 16px; align-items: flex-start; margin-top: 10px;">
+              ${candidateCardHtml(keep, true)}
+              ${others.map((c) => candidateCardHtml(c, false)).join('')}
             </div>
-            <div class="row" style="width: auto; flex-wrap: wrap; gap: 6px;">
+            <div class="row" style="width: auto; flex-wrap: wrap; gap: 6px; margin-top: 10px;">
               ${others
                 .map(
                   (c) =>
@@ -242,6 +286,8 @@ if (redirectTo) return Astro.redirect(redirectTo);
         });
       } catch (err) {
         duplicatesResult.innerHTML = `<p style="color: var(--danger); margin-top: 10px;">${escapeHtml((err as Error).message)}</p>`;
+      } finally {
+        scanProgress.classList.remove('active');
       }
     });
 
