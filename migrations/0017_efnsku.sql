@@ -1,0 +1,21 @@
+-- EFNSKU ("Ecomglider Fulfillment Network SKU") — our own answer to Amazon's
+-- FNSKU concept. Amazon assigns an FNSKU per physical unit identity so FBA
+-- always knows exactly what's in a bin regardless of which ASIN/SellerSKU a
+-- given order references; this is the same idea applied to our own
+-- receiving desk. Every SKU-merge/catalog-sync bug fixed this session traces
+-- back to the same root problem: the *only* signals available for "is this
+-- the same physical product" were things Amazon's own systems generate
+-- (title, ASIN, photo), and none of them are reliable enough alone —
+-- confirmed repeatedly against real production data. EFNSKU sidesteps that
+-- entirely: assigned by a human physically holding the item at receiving
+-- time, not inferred after the fact.
+--
+-- Nullable and not unique at the SQL level on its own — enforced instead via
+-- a partial unique index, since most existing rows won't have one until
+-- backfilled at their next receiving. See lib/skus.ts (setEfnsku) for the
+-- assignment logic, which also doubles as this system's merge trigger: if a
+-- SellerSKU is entered with an EFNSKU that already belongs to another SKU,
+-- that's the human confirming "this is the same product I already logged,"
+-- and the two are merged automatically via the existing mergeSku() path.
+ALTER TABLE skus ADD COLUMN efnsku TEXT;
+CREATE UNIQUE INDEX idx_skus_efnsku ON skus(efnsku) WHERE efnsku IS NOT NULL;

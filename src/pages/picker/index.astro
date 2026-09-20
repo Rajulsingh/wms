@@ -37,8 +37,21 @@ import TopBar from '../../components/TopBar.astro';
 
     interface BatchEntry {
       batchId: string;
+      status: string;
       rows: Row[];
     }
+
+    // Gates the picker into their list instead of dropping them straight
+    // into it the instant the page loads — the pick list itself is still
+    // assembled fully automatically in the background (claim-batch below
+    // runs on every boot with no admin step required), this only adds a
+    // deliberate "I'm ready" tap before work starts, and a second explicit
+    // "go" before the picker is actually looking at rack instructions.
+    // 'gate' = summary + Activate button, 'activating' = progress bar while
+    // (re-)fetching for freshness, 'ready' = activated, waiting for Start
+    // picking, 'working' = the real pick-section list (former sole state).
+    type Stage = 'gate' | 'activating' | 'ready' | 'working';
+    let stage: Stage = 'gate';
 
     interface LocationGroup {
       key: string;
@@ -92,14 +105,30 @@ import TopBar from '../../components/TopBar.astro';
 
       const claimed = await api('/api/picker/claim-batch', { warehouseId });
       batchList = claimed.batches ?? [];
-      render();
+      // A reload mid-walk (some rows already picked/short/damaged) resumes
+      // straight into the list — the gate is for "here's new work," not a
+      // hoop to jump back through for work already underway. Batch status
+      // itself can't tell us this: nothing in this scan-free list UI ever
+      // moves a pick_batch to 'in_progress' (that only happens through the
+      // older QR-confirm flow this page doesn't use), so task-level progress
+      // is the real signal.
+      stage = hasStartedWork(batchList) ? 'working' : 'gate';
+      renderStage();
 
       // Batches keep arriving — admin assigning one directly, or a fresh
       // auto-sweep once everything currently shown is finished — so this
       // never stops polling. Only actually re-renders when something new
       // shows up, so an open "why was this short" panel elsewhere on the
-      // page survives a quiet tick. See HANDOFF.md.
+      // page survives a quiet tick. Only the 'working' stage renders new
+      // rows straight into the visible list — during 'gate'/'ready' it just
+      // refreshes the summary counts so a picker still on that screen isn't
+      // shown a stale total, without silently starting work for them. See
+      // HANDOFF.md.
       setInterval(pollForMore, 8000);
+    }
+
+    function hasStartedWork(batches: BatchEntry[]): boolean {
+      return batches.some((b) => b.rows.some((r) => r.status !== 'pending'));
     }
 
     async function pollForMore() {
@@ -108,12 +137,97 @@ import TopBar from '../../components/TopBar.astro';
         const data = await api('/api/picker/claim-batch', { warehouseId });
         const incoming: BatchEntry[] = data.batches ?? [];
         const newOnes = incoming.filter((b) => !batchList.some((e) => e.batchId === b.batchId));
-        if (newOnes.length) {
-          batchList.push(...newOnes);
-          render();
-        }
+        if (!newOnes.length) return;
+        batchList.push(...newOnes);
+        if (stage === 'working') render();
+        else if (stage === 'gate') renderGate();
       } catch {
         // Transient — ignore, the next tick retries.
+      }
+    }
+
+    function renderStage() {
+      if (stage === 'gate') renderGate();
+      else if (stage === 'activating') renderActivating();
+      else if (stage === 'ready') renderReady();
+      else render();
+    }
+
+    function batchSummary(): { orders: number; lines: number; units: number } {
+      const rows = allRows();
+      return {
+        orders: new Set(rows.map((r) => r.external_order_id)).size,
+        lines: new Set(rows.map((r) => `${r.location_code}__${r.sku_code}`)).size,
+        units: rows.reduce((sum, r) => sum + r.quantity_required, 0)
+      };
+    }
+
+    function renderGate() {
+      const { orders, lines, units } = batchSummary();
+      const errorHtml = lastError ? `<div class="banner banner-danger">${escapeHtml(lastError)}</div>` : '';
+      app.innerHTML = orders
+        ? `
+        ${errorHtml}
+        <div class="stack" style="flex:1; justify-content:center; text-align:center; gap: 16px;">
+          <div>
+            <div class="big-label">Pick list ready</div>
+            <p>${orders} order${orders === 1 ? '' : 's'} · ${lines} SKU line${lines === 1 ? '' : 's'} · ${units} unit${units === 1 ? '' : 's'}</p>
+          </div>
+          <button class="btn btn-primary" id="activate-btn" style="width: auto; align-self: center; padding: 0 32px;">Activate pick list</button>
+        </div>`
+        : `
+        ${errorHtml}
+        <div class="stack" style="flex:1; justify-content:center; text-align:center;">
+          <div class="big-label">No batches</div>
+          <p>Nothing assigned right now — this checks automatically, or tap to check now.</p>
+          <button class="btn" id="retry">Check again</button>
+        </div>`;
+      document.getElementById('activate-btn')?.addEventListener('click', activate);
+      document.getElementById('retry')?.addEventListener('click', boot);
+    }
+
+    function renderActivating() {
+      app.innerHTML = `
+        <div class="stack" style="flex:1; justify-content:center; text-align:center; gap: 12px;">
+          <div class="big-label">Activating…</div>
+          <div class="progress-bar indeterminate active" style="max-width: 280px; margin: 0 auto;"><div class="progress-bar-fill"></div></div>
+        </div>`;
+    }
+
+    function renderReady() {
+      const { orders, lines, units } = batchSummary();
+      app.innerHTML = `
+        <div class="stack" style="flex:1; justify-content:center; text-align:center; gap: 16px;">
+          <div class="banner banner-success" style="display:inline-block;">Pick list activated</div>
+          <p>${orders} order${orders === 1 ? '' : 's'} · ${lines} SKU line${lines === 1 ? '' : 's'} · ${units} unit${units === 1 ? '' : 's'} ready to go.</p>
+          <button class="btn btn-primary" id="start-btn" style="width: auto; align-self: center; padding: 0 32px;">Start picking</button>
+        </div>`;
+      document.getElementById('start-btn')?.addEventListener('click', () => {
+        stage = 'working';
+        render();
+      });
+    }
+
+    // Re-fetches (rather than reusing what boot() already has) so "activate"
+    // genuinely reflects the current pick list — anything assigned in the
+    // seconds between landing on this screen and tapping the button is
+    // included, not just whatever existed at page load. The optimized
+    // getMyBatches (lib/picker.ts) fetches every batch's rows in one query
+    // instead of looping per batch, so this stays fast even with a full cart
+    // of small orders — no artificial delay added on top of it.
+    async function activate() {
+      stage = 'activating';
+      renderActivating();
+      try {
+        const data = await api('/api/picker/claim-batch', { warehouseId });
+        batchList = data.batches ?? [];
+        lastError = '';
+        stage = 'ready';
+        renderReady();
+      } catch (err) {
+        lastError = (err as Error).message;
+        stage = 'gate';
+        renderGate();
       }
     }
 

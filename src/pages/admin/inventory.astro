@@ -39,6 +39,10 @@ if (redirectTo) return Astro.redirect(redirectTo);
       <button class="btn" id="unmerge-preview-btn" style="width: auto;">Look up</button>
     </div>
     <div id="unmerge-result"></div>
+    <div class="row" style="justify-content: flex-end; margin-top: 4px;">
+      <button class="btn btn-ghost" id="unmerge-all-btn" style="width: auto; color: var(--danger);">Unmerge all listings</button>
+    </div>
+    <div id="unmerge-all-result"></div>
   </div>
 
   <div class="card stack">
@@ -61,17 +65,17 @@ if (redirectTo) return Astro.redirect(redirectTo);
     <div class="table-scroll">
       <table id="inventory-table">
         <thead>
-          <tr><th>SKU</th><th>Location</th><th>On hand</th><th>Reserved</th><th>Price</th><th></th></tr>
+          <tr><th>SKU</th><th>EFNSKU</th><th>Location</th><th>On hand</th><th>Reserved</th><th>Price</th><th></th></tr>
         </thead>
         <tbody id="inventory-rows">
-          <tr><td colspan="6">Loading…</td></tr>
+          <tr><td colspan="7">Loading…</td></tr>
         </tbody>
       </table>
     </div>
   </div>
 
   <script>
-    import { withLoading, escapeHtml } from '../../lib/ui';
+    import { withLoading, escapeHtml, confirmDangerousAction } from '../../lib/ui';
 
     interface Row {
       id: string;
@@ -79,6 +83,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
       sku_code: string;
       sku_name: string;
       price: number | null;
+      efnsku: string | null;
       location_id: string;
       location_code: string;
       zone_name: string | null;
@@ -108,6 +113,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
               (r) => `
         <tr data-inv-id="${r.id}" data-sku-id="${r.sku_id}">
           <td>${r.sku_code}<br><span style="font-size: 0.75rem; color: var(--muted);">${r.sku_name}</span></td>
+          <td>${r.efnsku ? `<strong>${escapeHtml(r.efnsku)}</strong>` : '<span style="color: var(--muted);">—</span>'}</td>
           <td>${r.zone_name ? r.zone_name + ' · ' : ''}${r.location_code}</td>
           <td><input type="number" class="onhand-input" value="${r.quantity_on_hand}" min="0" style="width: 90px; min-height: 40px; padding: 6px 8px;" /></td>
           <td>${r.quantity_reserved}</td>
@@ -116,7 +122,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
         </tr>`
             )
             .join('')
-        : '<tr><td colspan="6">No inventory yet — <a href="/admin/inbound">receive some stock</a> to get started.</td></tr>';
+        : '<tr><td colspan="7">No inventory yet — <a href="/admin/inbound">receive some stock</a> to get started.</td></tr>';
 
       tbody.querySelectorAll('tr[data-inv-id]').forEach((tr) => {
         const row = tr as HTMLTableRowElement;
@@ -142,7 +148,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
     const mergeSourceInput = document.getElementById('merge-source') as HTMLInputElement;
     const mergeTargetInput = document.getElementById('merge-target') as HTMLInputElement;
 
-    interface MergeSide { id: string; code: string; name: string; imageUrl: string | null; asin: string | null }
+    interface MergeSide { id: string; code: string; name: string; imageUrl: string | null; asin: string | null; efnsku: string | null }
     interface MergePreview {
       source: MergeSide;
       target: MergeSide;
@@ -151,6 +157,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
       orderItemCount: number;
       pickTaskCount: number;
       asinMismatch: boolean;
+      efnskuMismatch: boolean;
     }
 
     function mergeSideCardHtml(label: string, side: MergeSide): string {
@@ -161,6 +168,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
           <strong>${escapeHtml(side.code)}</strong>
           <span style="font-size: 0.78rem; color: var(--muted);">${escapeHtml(side.name)}</span>
           <span style="font-size: 0.72rem; color: var(--muted);">ASIN: ${side.asin ? escapeHtml(side.asin) : 'unknown'}</span>
+          ${side.efnsku ? `<span class="status-pill status-success" style="font-size: 0.68rem;">${escapeHtml(side.efnsku)}</span>` : ''}
         </div>`;
     }
 
@@ -181,11 +189,13 @@ if (redirectTo) return Astro.redirect(redirectTo);
           api(`/api/admin/sku-merge?sourceCode=${encodeURIComponent(sourceCode)}&targetCode=${encodeURIComponent(targetCode)}`)
         );
         mergeResult.innerHTML = `
-          <div class="banner ${preview.asinMismatch ? 'banner-danger' : 'banner-warning'}" style="margin-top: 10px;">
+          <div class="banner ${preview.efnskuMismatch || preview.asinMismatch ? 'banner-danger' : 'banner-warning'}" style="margin-top: 10px;">
             ${
-              preview.asinMismatch
-                ? `<p style="margin: 0 0 10px; font-weight: 700;">⚠ These have different Amazon ASINs (${escapeHtml(preview.source.asin!)} vs ${escapeHtml(preview.target.asin!)}) despite the same title — they're likely different products or variations (e.g. color/size), not duplicates. Compare the photos below carefully before merging.</p>`
-                : ''
+              preview.efnskuMismatch
+                ? `<p style="margin: 0 0 10px; font-weight: 700;">⚠ These already have different EFNSKUs (${escapeHtml(preview.source.efnsku!)} vs ${escapeHtml(preview.target.efnsku!)}) — a human already confirmed at receiving that these are two different products. Merging overrides that deliberate call; only proceed if that was a mistake.</p>`
+                : preview.asinMismatch
+                  ? `<p style="margin: 0 0 10px; font-weight: 700;">⚠ These have different Amazon ASINs (${escapeHtml(preview.source.asin!)} vs ${escapeHtml(preview.target.asin!)}) despite the same title — they're likely different products or variations (e.g. color/size), not duplicates. Compare the photos below carefully before merging.</p>`
+                  : ''
             }
             <div class="row" style="gap: 12px; align-items: flex-start; flex-wrap: wrap; margin-bottom: 10px;">
               ${mergeSideCardHtml('Retire', preview.source)}
@@ -280,11 +290,32 @@ if (redirectTo) return Astro.redirect(redirectTo);
       }
     });
 
+    const unmergeAllResult = document.getElementById('unmerge-all-result')!;
+    document.getElementById('unmerge-all-btn')?.addEventListener('click', async (e) => {
+      const btn = e.currentTarget as HTMLButtonElement;
+      const ok = await confirmDangerousAction({
+        title: 'Unmerge every listing',
+        message:
+          'This clears every merge relationship in the catalog at once, restoring the SKU list to exactly what it would be with no merges at all. It does not move any inventory or orders — those stay exactly where they are. Only the "these codes are the same product" links are removed, so future Amazon orders under a previously-merged code will land on that code\'s own (currently empty) SKU again instead of the SKU it used to redirect to.',
+        continueLabel: 'Unmerge all'
+      });
+      if (!ok) return;
+      try {
+        const result = await withLoading(btn, 'Unmerging…', () => api('/api/admin/sku-unmerge-all', {}, 'POST'));
+        unmergeAllResult.innerHTML = result.count
+          ? `<div class="banner banner-success" style="margin-top: 10px;">Unmerged ${result.count} listing${result.count === 1 ? '' : 's'}.</div>`
+          : `<p style="margin-top: 10px;">Nothing was merged — no change made.</p>`;
+      } catch (err) {
+        unmergeAllResult.innerHTML = `<p style="color: var(--danger); margin-top: 10px;">${escapeHtml((err as Error).message)}</p>`;
+      }
+    });
+
     interface DuplicateCandidate {
       id: string;
       code: string;
       imageUrl: string | null;
       asin: string | null;
+      efnsku: string | null;
       inventoryUnits: number;
       orderItemCount: number;
       createdAt: string;
@@ -297,6 +328,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
       candidates: DuplicateCandidate[];
       suggestedKeepId: string;
       hasAsinMismatch: boolean;
+      hasEfnskuMismatch: boolean;
     }
 
     const MATCH_TYPE_LABEL: Record<DuplicateMatchType, { pill: string; pillClass: string; note: string | null }> = {
@@ -322,6 +354,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
           ${c.imageUrl ? `<img class="thumb thumb-lg" src="${c.imageUrl}" alt="" />` : '<div class="thumb thumb-lg"></div>'}
           <strong style="font-size: 0.8rem;">${escapeHtml(c.code)}</strong>
           <span style="font-size: 0.7rem; color: var(--muted);">${c.asin ? escapeHtml(c.asin) : 'no ASIN'}</span>
+          ${c.efnsku ? `<span style="font-size: 0.68rem; font-weight: 700;">${escapeHtml(c.efnsku)}</span>` : ''}
           <span class="status-pill ${isKeep ? 'status-success' : 'status-neutral'}" style="font-size: 0.68rem;">${isKeep ? 'Keep' : `${c.inventoryUnits}u`}</span>
         </div>`;
     }
@@ -371,9 +404,11 @@ if (redirectTo) return Astro.redirect(redirectTo);
             </div>
             ${label.note ? `<p style="margin: 6px 0 0; font-size: 0.8rem; color: var(--muted);">${escapeHtml(label.note)}</p>` : ''}
             ${
-              g.hasAsinMismatch
-                ? `<div class="banner banner-warning" style="margin-top: 8px;">⚠ These candidates carry different Amazon ASINs — could be a genuine color/size variation you intentionally treat as one SKU, or could be a real mismatch. Check the photos below before deciding.</div>`
-                : ''
+              g.hasEfnskuMismatch
+                ? `<div class="banner banner-danger" style="margin-top: 8px;">⚠ These already have different EFNSKUs — a human already confirmed at receiving that these are different products. Merging overrides that call.</div>`
+                : g.hasAsinMismatch
+                  ? `<div class="banner banner-warning" style="margin-top: 8px;">⚠ These candidates carry different Amazon ASINs — could be a genuine color/size variation you intentionally treat as one SKU, or could be a real mismatch. Check the photos below before deciding.</div>`
+                  : ''
             }
             <div class="row" style="flex-wrap: wrap; gap: 16px; align-items: flex-start; margin-top: 10px;">
               ${candidateCardHtml(keep, true)}

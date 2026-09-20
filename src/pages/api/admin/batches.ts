@@ -4,11 +4,12 @@ import { requireUser, AuthError } from '../../../lib/auth';
 import { retryBlockedOrders } from '../../../lib/orders';
 import { assignBatchToPacker, PickerFlowError } from '../../../lib/picker';
 
-// Reservation now happens automatically at import/creation time (see
-// reserveOrderForPicking in lib/orders.ts) — this is the manual nudge for
-// whatever's still blocked (almost always insufficient stock), for an admin
-// to trigger right after fixing it rather than waiting on the automatic
-// retry in receiveStock or a picker's next poll. See HANDOFF.md.
+// "Assign orders to pick list" on /admin — reservation already happens
+// automatically at import/creation time (see reserveOrderForPicking in
+// lib/orders.ts), so this is the manual nudge for whatever's still blocked
+// (almost always insufficient stock), for an admin to trigger right after
+// fixing it rather than waiting on the automatic retry in receiveStock or a
+// picker's next poll. See HANDOFF.md.
 export const POST: APIRoute = async (context) => {
   const db = getDb();
   try {

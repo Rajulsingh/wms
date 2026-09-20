@@ -1,5 +1,5 @@
 import { newId, logAudit } from './db';
-import { resolveSkuIdByCode } from './skus';
+import { resolveSkuIdByCode, setEfnsku, SkuMergeError } from './skus';
 import { retryBlockedOrdersForSku } from './orders';
 
 export class InboundError extends Error {
@@ -11,6 +11,10 @@ export class InboundError extends Error {
 export interface ReceiveLine {
   skuId?: string;
   newSku?: { skuCode: string; name: string };
+  // Only meaningful when the SKU (new or existing) doesn't already have one
+  // — see setEfnsku in lib/skus.ts. Optional so existing callers/tests that
+  // predate EFNSKU keep working unchanged.
+  efnsku?: string;
   locationId: string;
   quantity: number;
 }
@@ -53,10 +57,12 @@ export async function receiveStock(
 
     let skuId = line.skuId;
     let skuCode: string;
+    let alreadyHasEfnsku = false;
     if (skuId) {
-      const sku = await db.prepare(`SELECT sku_code FROM skus WHERE id = ?`).bind(skuId).first<{ sku_code: string }>();
+      const sku = await db.prepare(`SELECT sku_code, efnsku FROM skus WHERE id = ?`).bind(skuId).first<{ sku_code: string; efnsku: string | null }>();
       if (!sku) throw new InboundError('sku_not_found', 'SKU not found');
       skuCode = sku.sku_code;
+      alreadyHasEfnsku = sku.efnsku != null;
     } else {
       if (!line.newSku?.skuCode?.trim() || !line.newSku?.name?.trim()) {
         throw new InboundError('sku_required', 'Pick an existing SKU or provide a code and name for a new one');
@@ -68,11 +74,29 @@ export async function receiveStock(
       const resolvedId = await resolveSkuIdByCode(db, code);
       if (resolvedId) {
         skuId = resolvedId;
+        const existing = await db.prepare(`SELECT efnsku FROM skus WHERE id = ?`).bind(resolvedId).first<{ efnsku: string | null }>();
+        alreadyHasEfnsku = existing?.efnsku != null;
       } else {
         skuId = newId();
         await db.prepare(`INSERT INTO skus (id, sku_code, name) VALUES (?, ?, ?)`).bind(skuId, code, line.newSku.name.trim()).run();
       }
       skuCode = code;
+    }
+
+    // Assigning (or recognizing) the EFNSKU is what actually determines the
+    // final SKU for this line — if the value typed in already belongs to
+    // another SKU, setEfnsku merges this one into it (see lib/skus.ts), so
+    // the resolved id has to be re-read afterward rather than assumed to
+    // still be `skuId`.
+    if (line.efnsku?.trim() && !alreadyHasEfnsku) {
+      try {
+        await setEfnsku(db, userId, skuCode, line.efnsku);
+      } catch (err) {
+        if (err instanceof SkuMergeError) throw new InboundError(err.code, err.message);
+        throw err;
+      }
+      const resolved = await resolveSkuIdByCode(db, skuCode);
+      if (resolved) skuId = resolved;
     }
 
     const location = await db.prepare(`SELECT id FROM locations WHERE id = ? AND warehouse_id = ?`).bind(line.locationId, warehouseId).first<{ id: string }>();

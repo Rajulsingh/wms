@@ -1311,6 +1311,68 @@ color/size variations for duplicates just because their generic titles matched.
 - **Note for the user**: production's 33 merged SKUs still won't show a backfilled ASIN until "Sync Amazon
   catalog" is clicked again on `/admin/inbound` — I can't trigger it myself (needs a live admin session).
 
+## Recently done (2026-09-20, a twenty-ninth pass) — EFNSKU, an "unmerge all" button, and a packer activation gate
+
+Three separate asks from the same conversation, landed together.
+
+**EFNSKU — our own answer to Amazon's FNSKU concept** (`migrations/0017_efnsku.sql`, `lib/skus.ts`).
+Every SKU-merge bug fixed this session traced back to the same root cause: the only signals
+available for "is this the same physical product" (title, ASIN, photo) all come from Amazon and
+have each turned out unreliable alone. EFNSKU sidesteps that by putting a human in the loop at the
+moment the physical item is actually in hand — receiving. New `skus.efnsku` column (nullable,
+partial-unique index). `suggestNextEfnsku` proposes the next sequential code (`EFN-000042`, easy to
+read/write on a physical label); `setEfnsku` is the assignment function and — this is the important
+part — doubles as the merge trigger: if the EFNSKU typed in already belongs to a different SKU, that
+means staff just confirmed "this is the same product I already logged," and the two are merged
+immediately via the existing, audited `mergeSku()` path rather than a second merge mechanism.
+Deliberately did **not** do the "proper" fix of splitting `skus` into a separate products/SellerSKU-
+alias schema (would touch inventory/order_items/pick_tasks FKs across nearly the whole app) — this
+additive approach gets the same practical outcome (a human-verified, Amazon-independent product
+identity) by reusing 100% of already-built, tested merge infrastructure instead.
+- **Receiving (`/admin/inbound.astro`)** now shows an EFNSKU field, pre-filled with the suggestion,
+  whenever a line's SKU (new, or existing without one yet) needs one — hidden once a SKU already
+  has one. Copy explains the merge-on-reuse behavior directly in the form.
+- **Displayed** in the Inventory stock table (new EFNSKU column) and in the merge-preview/duplicate-
+  scan cards alongside ASIN. `previewSkuMerge` and `findDuplicateSkus` both gained an
+  `efnskuMismatch`/`hasEfnskuMismatch` signal — stronger than the existing ASIN-mismatch one, since
+  it means a human already made the "different products" call, not just that Amazon's catalog data
+  disagrees. Surfaced as a `banner-danger` (vs. the ASIN case's `banner-warning`).
+- **Verified live in dev**: received a new SKU (`TEST-EFN-1`, suggested `EFN-000001` accepted as-is);
+  received a second, different SKU code but typed `EFN-000001` again — confirmed it auto-merged into
+  the first and correctly summed the inventory at the shared location.
+- **Not done yet**: EFNSKU isn't shown on the picker/packer screens, and printing it on shipping
+  labels (replacing the plain `sku_code` originally planned for that — see "short code" in Open
+  items) is still blocked on the same Easy Ship SP-API/label-content item it always was — noting the
+  field to use once that unblocks, no code needed today.
+
+**"Unmerge all listings"** (`unmergeAllSkus` in `lib/skus.ts`, `api/admin/sku-unmerge-all.ts`) — a
+blunt, one-click reset of every merge relationship at once, for "start over from a clean slate."
+Separate route from the single-SKU unmerge on purpose (more consequential, shouldn't be reachable by
+a body-shape typo), gated behind the same `confirmDangerousAction` dialog pattern used for "Reset
+picking & packing." Same non-negotiable as single unmerge: never moves inventory/orders, only clears
+`merged_into_id`.
+
+**Packer "Activate pick list" gate** (`picker/index.astro`, `lib/picker.ts`). The user's framing:
+admin's "Retry blocked orders" button (renamed **"Assign orders to pick list"** on `/admin` — same
+`retryBlockedOrders` call underneath, just honestly relabeled for what it actually does) and the
+picker's automatic instant-claim-on-login were the two existing paths orders reach a pick list
+through; wanted a deliberate two-tap start on the picker's side (`Activate pick list` → progress bar
+→ `Start picking`) without reintroducing any wait on admin action — the list itself is still
+assembled fully automatically in the background exactly as before.
+- `getMyBatches` rewritten to fetch every claimed batch's rows in one query instead of looping
+  `getPickListView` per batch (was N+1 D1 round trips) — "make its processing quick" from the user,
+  and this gate now depends on that round trip feeling instant. Also returns each batch's `status`.
+- New `Stage` state machine in `picker/index.astro`: `gate` (summary + Activate button) →
+  `activating` (progress bar, re-fetches for freshness) → `ready` (Start picking button) → `working`
+  (the original flat pick-section list, unchanged). A reload mid-walk skips straight to `working` —
+  detected via task-level progress (`some row status !== 'pending'`), not batch status, since this
+  scan-free list UI never actually moves a `pick_batch` to `'in_progress'` (that only happens through
+  the older QR-confirm flow, `confirm-location.ts`/`scan-item.ts`, which nothing here calls — see
+  Open items #11, still dead code).
+- **Verified live in dev**: logged in as the seed `packer` user, saw the gate with a real summary
+  (13 orders · 5 SKU lines · 27 units), activated, started picking, picked one line, reloaded — landed
+  straight back in the working list with no gate, as intended.
+
 ## Next steps — a prioritized plan
 
 Rewritten 2026-09-20 (twenty-one passes across two days — see "Recently done" entries above for the

@@ -47,6 +47,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
       name: string;
       image_url: string | null;
       price: number | null;
+      efnsku: string | null;
     }
     interface LocationOption {
       id: string;
@@ -66,6 +67,22 @@ if (redirectTo) return Astro.redirect(redirectTo);
     let skus: SkuOption[] = [];
     let locations: LocationOption[] = [];
     let lineSeq = 0;
+    // Next EFNSKU suggestion — see HANDOFF.md for why this exists: Amazon's
+    // own title/ASIN/photo data has repeatedly turned out unreliable for
+    // telling two SellerSKUs apart, so receiving now assigns our own
+    // identifier (filled in by whoever has the physical item in hand, the
+    // most reliable signal there is) instead of trusting Amazon's catalog
+    // data. Bumped locally each time a line consumes one so multiple new
+    // lines added before submitting don't all suggest the same value.
+    let nextEfnsku = '';
+
+    function bumpEfnsku(code: string): string {
+      const match = code.match(/^(.*?)(\d+)$/);
+      if (!match) return code;
+      const [, prefix, digits] = match;
+      const next = (parseInt(digits, 10) + 1).toString().padStart(digits.length, '0');
+      return `${prefix}${next}`;
+    }
 
     async function api(path: string, body?: unknown) {
       const res = await fetch(path, {
@@ -102,6 +119,15 @@ if (redirectTo) return Astro.redirect(redirectTo);
           <input type="text" class="new-sku-name" placeholder="New SKU name" />
           <button class="btn btn-ghost use-search-instead" style="width: auto; min-height: 36px;">Search instead</button>
         </div>
+        <div class="efnsku-field stack" style="display:none; gap: 4px;">
+          <label>EFNSKU (assign while you have the physical item in hand)</label>
+          <input type="text" class="efnsku-input" placeholder="EFN-000000" />
+          <p style="font-size: 0.72rem; margin: 0; color: var(--muted);">
+            Leave the suggested code as-is for a new product. If this is actually the same item you've already
+            logged under a different SKU code, type <em>that</em> product's EFNSKU instead — the two will merge
+            automatically.
+          </p>
+        </div>
         <label>Location (bin)</label>
         <select class="location-select">${locationOptionsHtml()}</select>
         <label>Quantity</label>
@@ -112,6 +138,23 @@ if (redirectTo) return Astro.redirect(redirectTo);
       const resultsEl = el.querySelector('.sku-results') as HTMLDivElement;
       const previewEl = el.querySelector('.selected-sku-preview') as HTMLDivElement;
       const newSkuFields = el.querySelector('.new-sku-fields') as HTMLDivElement;
+      const efnskuField = el.querySelector('.efnsku-field') as HTMLDivElement;
+      const efnskuInput = el.querySelector('.efnsku-input') as HTMLInputElement;
+
+      // Shown whenever this line's SKU (new, or existing without one yet)
+      // needs an EFNSKU assigned; hidden when the selected SKU already has
+      // one (nothing to fill in — it's already identified). Each call that
+      // shows it consumes and bumps the shared suggestion so several new
+      // lines in one receipt don't all propose the same code.
+      function showEfnskuField() {
+        efnskuField.style.display = 'flex';
+        efnskuInput.value = nextEfnsku;
+        nextEfnsku = bumpEfnsku(nextEfnsku);
+      }
+      function hideEfnskuField() {
+        efnskuField.style.display = 'none';
+        efnskuInput.value = '';
+      }
 
       function showSearch() {
         el.removeAttribute('data-sku-id');
@@ -119,6 +162,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
         resultsEl.style.display = 'none';
         previewEl.style.display = 'none';
         newSkuFields.style.display = 'none';
+        hideEfnskuField();
         searchInput.value = '';
         searchInput.focus();
       }
@@ -131,9 +175,11 @@ if (redirectTo) return Astro.redirect(redirectTo);
         previewEl.style.display = 'flex';
         previewEl.innerHTML = `
           ${sku.image_url ? `<img class="thumb" src="${sku.image_url}" alt="" />` : '<div class="thumb"></div>'}
-          <span class="name">${sku.name}<br /><span style="font-size: 0.75rem; color: var(--muted);">${sku.sku_code} · ${priceLabel(sku.price)}</span></span>
+          <span class="name">${sku.name}<br /><span style="font-size: 0.75rem; color: var(--muted);">${sku.sku_code} · ${priceLabel(sku.price)}${sku.efnsku ? ` · <strong>${sku.efnsku}</strong>` : ''}</span></span>
           <button class="btn btn-ghost change-sku" style="width: auto; min-height: 36px;">Change</button>`;
         previewEl.querySelector('.change-sku')?.addEventListener('click', showSearch);
+        if (sku.efnsku) hideEfnskuField();
+        else showEfnskuField();
       }
 
       searchInput.addEventListener('input', () => {
@@ -167,6 +213,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
         resultsEl.style.display = 'none';
         previewEl.style.display = 'none';
         newSkuFields.style.display = 'flex';
+        showEfnskuField();
       });
       el.querySelector('.use-search-instead')?.addEventListener('click', showSearch);
       el.querySelector('.remove-line')?.addEventListener('click', () => el.remove());
@@ -174,7 +221,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
       document.getElementById('lines')!.appendChild(el);
     }
 
-    function readLines(): Array<{ skuId?: string; newSku?: { skuCode: string; name: string }; locationId: string; quantity: number }> {
+    function readLines(): Array<{ skuId?: string; newSku?: { skuCode: string; name: string }; efnsku?: string; locationId: string; quantity: number }> {
       const cards = Array.from(document.querySelectorAll('#lines > [data-line-id]')) as HTMLElement[];
       return cards.map((card) => {
         const skuId = card.dataset.skuId;
@@ -189,6 +236,11 @@ if (redirectTo) return Astro.redirect(redirectTo);
             name: (card.querySelector('.new-sku-name') as HTMLInputElement).value.trim()
           };
         }
+        const efnskuField = card.querySelector('.efnsku-field') as HTMLDivElement;
+        if (efnskuField.style.display !== 'none') {
+          const efnsku = (card.querySelector('.efnsku-input') as HTMLInputElement).value.trim();
+          if (efnsku) line.efnsku = efnsku;
+        }
         return line;
       });
     }
@@ -197,6 +249,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
       const data = await api(`/api/admin/inbound?warehouseId=${warehouseId}`);
       skus = data.skus;
       locations = data.locations;
+      nextEfnsku = data.nextEfnsku;
       renderReceipts(data.receipts);
       if (!document.querySelector('#lines > [data-line-id]')) addLine();
     }

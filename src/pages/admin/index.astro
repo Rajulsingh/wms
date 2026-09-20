@@ -12,7 +12,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
 
   <div class="row" style="flex-wrap: wrap;">
     <button class="btn btn-primary" id="import-btn" style="width: auto;">Import from Amazon</button>
-    <button class="btn" id="retry-btn" style="width: auto;">Retry blocked orders</button>
+    <button class="btn" id="retry-btn" style="width: auto;">Assign orders to pick list</button>
     <div class="row" style="width: auto; margin-left: auto; align-items: center; gap: 10px;">
       <label class="row" style="width: auto; align-items: center; gap: 6px; font-size: 0.82rem; color: var(--muted);">
         <input type="checkbox" id="reset-include-shipped" style="width: 18px; height: 18px;" />
@@ -314,20 +314,20 @@ if (redirectTo) return Astro.redirect(redirectTo);
     document.getElementById('retry-btn')?.addEventListener('click', async (e) => {
       const btn = e.currentTarget as HTMLButtonElement;
       try {
-        const result = await withLoading(btn, 'Retrying…', () => api('/api/admin/batches', { warehouseId }));
+        const result = await withLoading(btn, 'Assigning…', () => api('/api/admin/batches', { warehouseId }));
         if (!result.retried) {
-          showResult('Nothing blocked right now — every order is already reserved.');
+          showResult('Nothing to assign right now — every order already has a pick list.');
         } else if (result.shortOrders?.length) {
           // Not always a stock shortage — "No items to reserve" here means
           // this order's items aren't actually sitting pending (a data
           // state issue, not something Receive Stock fixes), so the reasons
           // are shown as-is rather than all being labeled "short on stock".
           showResult(
-            `Retried ${result.retried}, ${result.succeeded} resolved. Still blocked:<br>${result.shortOrders.map((s: { reason: string }) => s.reason).join('<br>')}<br>If a reason mentions stock, <a href="/admin/inbound">receive stock</a> to fix it — otherwise check <a href="/admin/exceptions">Exceptions</a> or ask for help.`,
+            `Assigned ${result.succeeded} of ${result.retried} to a pick list. Still blocked:<br>${result.shortOrders.map((s: { reason: string }) => s.reason).join('<br>')}<br>If a reason mentions stock, <a href="/admin/inbound">receive stock</a> to fix it — otherwise check <a href="/admin/exceptions">Exceptions</a> or ask for help.`,
             result.succeeded > 0 ? 'success' : 'danger'
           );
         } else {
-          showResult(`Retried ${result.retried} — all ${result.succeeded} resolved.`);
+          showResult(`Assigned all ${result.succeeded} order${result.succeeded === 1 ? '' : 's'} to a pick list — packers will see it automatically.`);
         }
         await loadOrders();
       } catch (err) {

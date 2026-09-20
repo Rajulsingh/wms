@@ -32,6 +32,7 @@ interface SkuRef {
   name: string;
   image_url: string | null;
   asin: string | null;
+  efnsku: string | null;
   merged_into_id: string | null;
 }
 
@@ -39,8 +40,8 @@ async function loadMergeable(db: D1Database, sourceCode: string, targetCode: str
   if (sourceCode === targetCode) throw new SkuMergeError('same_sku', 'Pick two different SKU codes to merge');
 
   const [source, target] = await Promise.all([
-    db.prepare(`SELECT id, sku_code, name, image_url, asin, merged_into_id FROM skus WHERE sku_code = ?`).bind(sourceCode).first<SkuRef>(),
-    db.prepare(`SELECT id, sku_code, name, image_url, asin, merged_into_id FROM skus WHERE sku_code = ?`).bind(targetCode).first<SkuRef>()
+    db.prepare(`SELECT id, sku_code, name, image_url, asin, efnsku, merged_into_id FROM skus WHERE sku_code = ?`).bind(sourceCode).first<SkuRef>(),
+    db.prepare(`SELECT id, sku_code, name, image_url, asin, efnsku, merged_into_id FROM skus WHERE sku_code = ?`).bind(targetCode).first<SkuRef>()
   ]);
   if (!source) throw new SkuMergeError('not_found', `No SKU found with code "${sourceCode}"`);
   if (!target) throw new SkuMergeError('not_found', `No SKU found with code "${targetCode}"`);
@@ -51,8 +52,8 @@ async function loadMergeable(db: D1Database, sourceCode: string, targetCode: str
 }
 
 export interface SkuMergePreview {
-  source: { id: string; code: string; name: string; imageUrl: string | null; asin: string | null };
-  target: { id: string; code: string; name: string; imageUrl: string | null; asin: string | null };
+  source: { id: string; code: string; name: string; imageUrl: string | null; asin: string | null; efnsku: string | null };
+  target: { id: string; code: string; name: string; imageUrl: string | null; asin: string | null; efnsku: string | null };
   inventoryLines: number;
   inventoryUnits: number;
   orderItemCount: number;
@@ -62,6 +63,12 @@ export interface SkuMergePreview {
   // color/size sibling) that happen to share an identical Amazon title, not
   // a real duplicate. Never true just because one side is missing an ASIN.
   asinMismatch: boolean;
+  // True when BOTH sides already have an EFNSKU and they differ — stronger
+  // than asinMismatch: it means a human, physically holding each item at
+  // receiving, already independently confirmed these are two different
+  // products (see setEfnsku). Merging anyway means overriding that
+  // deliberate call, not just an Amazon catalog quirk.
+  efnskuMismatch: boolean;
 }
 
 /** Read-only — what a merge of these two codes would move, so admin can see it before committing. */
@@ -75,13 +82,14 @@ export async function previewSkuMerge(db: D1Database, sourceCode: string, target
   ]);
 
   return {
-    source: { id: source.id, code: source.sku_code, name: source.name, imageUrl: source.image_url, asin: source.asin },
-    target: { id: target.id, code: target.sku_code, name: target.name, imageUrl: target.image_url, asin: target.asin },
+    source: { id: source.id, code: source.sku_code, name: source.name, imageUrl: source.image_url, asin: source.asin, efnsku: source.efnsku },
+    target: { id: target.id, code: target.sku_code, name: target.name, imageUrl: target.image_url, asin: target.asin, efnsku: target.efnsku },
     inventoryLines: inv?.lines ?? 0,
     inventoryUnits: inv?.units ?? 0,
     orderItemCount: oi?.c ?? 0,
     pickTaskCount: pt?.c ?? 0,
-    asinMismatch: Boolean(source.asin && target.asin && source.asin !== target.asin)
+    asinMismatch: Boolean(source.asin && target.asin && source.asin !== target.asin),
+    efnskuMismatch: Boolean(source.efnsku && target.efnsku && source.efnsku !== target.efnsku)
   };
 }
 
@@ -90,6 +98,7 @@ export interface DuplicateSkuCandidate {
   code: string;
   imageUrl: string | null;
   asin: string | null;
+  efnsku: string | null;
   inventoryUnits: number;
   orderItemCount: number;
   createdAt: string;
@@ -124,6 +133,13 @@ export interface DuplicateSkuGroup {
   // and decide deliberately," since it's also exactly how the exact-title
   // scan mistook a real gun holder variation for a duplicate previously.
   hasAsinMismatch: boolean;
+  // True when candidates carry two or more distinct known EFNSKUs — stronger
+  // than hasAsinMismatch, since an EFNSKU is assigned by a human physically
+  // holding the item at receiving (see setEfnsku), not inferred from Amazon
+  // catalog data. Can occur even within a same_asin group (a receiving
+  // mistake, or two batches of the same ASIN a human deliberately tracks
+  // separately) — checked regardless of matchType for that reason.
+  hasEfnskuMismatch: boolean;
 }
 
 interface DupRow {
@@ -132,6 +148,7 @@ interface DupRow {
   name: string;
   image_url: string | null;
   asin: string | null;
+  efnsku: string | null;
   created_at: string;
   inventory_units: number;
   order_item_count: number;
@@ -151,6 +168,7 @@ function toCandidate(r: DupRow): DuplicateSkuCandidate {
     code: r.sku_code,
     imageUrl: r.image_url,
     asin: r.asin,
+    efnsku: r.efnsku,
     inventoryUnits: r.inventory_units,
     orderItemCount: r.order_item_count,
     createdAt: r.created_at
@@ -181,7 +199,7 @@ function toCandidate(r: DupRow): DuplicateSkuCandidate {
 export async function findDuplicateSkus(db: D1Database): Promise<DuplicateSkuGroup[]> {
   const rows = await db
     .prepare(
-      `SELECT s.id, s.sku_code, s.name, s.image_url, s.asin, s.created_at,
+      `SELECT s.id, s.sku_code, s.name, s.image_url, s.asin, s.efnsku, s.created_at,
               COALESCE((SELECT SUM(quantity_on_hand) FROM inventory WHERE sku_id = s.id), 0) AS inventory_units,
               (SELECT COUNT(*) FROM order_items WHERE sku_id = s.id) AS order_item_count
        FROM skus s
@@ -206,13 +224,15 @@ export async function findDuplicateSkus(db: D1Database): Promise<DuplicateSkuGro
       if (members.length < 2) continue;
       const candidates = members.map(toCandidate);
       const knownAsins = new Set(candidates.map((c) => c.asin).filter((a): a is string => Boolean(a)));
+      const knownEfnskus = new Set(candidates.map((c) => c.efnsku).filter((e): e is string => Boolean(e)));
       groups.push({
         matchType,
         matchValue: key,
         name: members[0].name,
         candidates,
         suggestedKeepId: pickSuggestedKeep(candidates),
-        hasAsinMismatch: knownAsins.size > 1
+        hasAsinMismatch: knownAsins.size > 1,
+        hasEfnskuMismatch: knownEfnskus.size > 1
       });
       for (const m of members) placed.add(m.id);
     }
@@ -296,8 +316,8 @@ export async function mergeSku(db: D1Database, userId: string, sourceCode: strin
 }
 
 export interface SkuUnmergePreview {
-  source: { id: string; code: string; name: string; imageUrl: string | null; asin: string | null };
-  target: { id: string; code: string; name: string; imageUrl: string | null; asin: string | null };
+  source: { id: string; code: string; name: string; imageUrl: string | null; asin: string | null; efnsku: string | null };
+  target: { id: string; code: string; name: string; imageUrl: string | null; asin: string | null; efnsku: string | null };
   // What currently sits under the target's own id — NOT what would move back.
   // Unmerging never moves inventory/orders automatically (see unmergeSku):
   // once merged, a target's own pre-existing data and anything genuinely
@@ -310,10 +330,10 @@ export interface SkuUnmergePreview {
 }
 
 async function loadUnmergeable(db: D1Database, sourceCode: string): Promise<{ source: SkuRef; target: SkuRef }> {
-  const source = await db.prepare(`SELECT id, sku_code, name, image_url, asin, merged_into_id FROM skus WHERE sku_code = ?`).bind(sourceCode).first<SkuRef>();
+  const source = await db.prepare(`SELECT id, sku_code, name, image_url, asin, efnsku, merged_into_id FROM skus WHERE sku_code = ?`).bind(sourceCode).first<SkuRef>();
   if (!source) throw new SkuMergeError('not_found', `No SKU found with code "${sourceCode}"`);
   if (!source.merged_into_id) throw new SkuMergeError('not_merged', `"${sourceCode}" isn't currently merged into anything`);
-  const target = await db.prepare(`SELECT id, sku_code, name, image_url, asin, merged_into_id FROM skus WHERE id = ?`).bind(source.merged_into_id).first<SkuRef>();
+  const target = await db.prepare(`SELECT id, sku_code, name, image_url, asin, efnsku, merged_into_id FROM skus WHERE id = ?`).bind(source.merged_into_id).first<SkuRef>();
   if (!target) throw new SkuMergeError('not_found', `"${sourceCode}"'s merge target no longer exists`);
   return { source, target };
 }
@@ -328,8 +348,8 @@ export async function previewSkuUnmerge(db: D1Database, sourceCode: string): Pro
   ]);
 
   return {
-    source: { id: source.id, code: source.sku_code, name: source.name, imageUrl: source.image_url, asin: source.asin },
-    target: { id: target.id, code: target.sku_code, name: target.name, imageUrl: target.image_url, asin: target.asin },
+    source: { id: source.id, code: source.sku_code, name: source.name, imageUrl: source.image_url, asin: source.asin, efnsku: source.efnsku },
+    target: { id: target.id, code: target.sku_code, name: target.name, imageUrl: target.image_url, asin: target.asin, efnsku: target.efnsku },
     targetInventoryLines: inv?.lines ?? 0,
     targetInventoryUnits: inv?.units ?? 0,
     targetOrderItemCount: oi?.c ?? 0
@@ -369,4 +389,89 @@ export async function unmergeSku(db: D1Database, userId: string, sourceCode: str
   });
 
   return { sourceCode: source.sku_code, wasTargetCode: target.sku_code };
+}
+
+/**
+ * Unmerges every currently-merged SKU at once — restores the catalog to
+ * exactly what Amazon's own listings say, with no merge relationships left
+ * at all. A blunt tool: it can't tell a genuine duplicate merge from a
+ * correct one any better than a human glancing at the list can, so this is
+ * for "start over from a clean slate" (e.g. after the bulk exact-title
+ * cleanup mentioned in HANDOFF.md turned out to need per-pair review anyway)
+ * — not a routine action. Same non-negotiable as a single unmerge: never
+ * moves inventory/order_items/pick_tasks, just clears every `merged_into_id`.
+ */
+export async function unmergeAllSkus(db: D1Database, userId: string): Promise<{ count: number; sourceCodes: string[] }> {
+  const merged = await db.prepare(`SELECT id, sku_code FROM skus WHERE merged_into_id IS NOT NULL`).all<{ id: string; sku_code: string }>();
+  if (!merged.results.length) return { count: 0, sourceCodes: [] };
+
+  await db.prepare(`UPDATE skus SET merged_into_id = NULL WHERE merged_into_id IS NOT NULL`).run();
+
+  await logAudit(db, {
+    userId,
+    action: 'sku.unmerge_all',
+    entityType: 'sku',
+    metadata: { count: merged.results.length, sourceCodes: merged.results.map((r) => r.sku_code) }
+  });
+
+  return { count: merged.results.length, sourceCodes: merged.results.map((r) => r.sku_code) };
+}
+
+/** Next suggested EFNSKU — sequential and zero-padded so it reads/writes easily on a physical label, e.g. "EFN-000042". Purely a suggestion; receiving can type any value instead (see setEfnsku). */
+export async function suggestNextEfnsku(db: D1Database): Promise<string> {
+  const row = await db.prepare(`SELECT efnsku FROM skus WHERE efnsku LIKE 'EFN-%' ORDER BY efnsku DESC LIMIT 1`).first<{ efnsku: string }>();
+  const lastNum = row ? parseInt(row.efnsku.slice(4), 10) : 0;
+  const next = (Number.isFinite(lastNum) ? lastNum : 0) + 1;
+  return `EFN-${String(next).padStart(6, '0')}`;
+}
+
+export interface SetEfnskuResult {
+  efnsku: string;
+  merged: boolean;
+  mergedIntoCode?: string;
+}
+
+/**
+ * Assigns an EFNSKU to a SellerSKU — filled in by whoever is physically
+ * receiving the stock, with the actual item in hand, which is the most
+ * reliable "is this the same product" signal there is (better than title,
+ * ASIN, or photo, all of which have turned out to be unreliable alone — see
+ * HANDOFF.md). Doubles as this system's merge trigger: if the EFNSKU typed
+ * in already belongs to a different SKU, that's staff confirming "this is
+ * the same physical product I've already logged," and the two are merged
+ * immediately via the existing, audited mergeSku() path — reusing it rather
+ * than inventing a second merge mechanism. Follows a merge chain to whatever
+ * SKU is currently live for that EFNSKU, in case its original holder has
+ * itself since been merged into something else.
+ */
+export async function setEfnsku(db: D1Database, userId: string, skuCode: string, efnsku: string): Promise<SetEfnskuResult> {
+  const trimmed = efnsku.trim();
+  if (!trimmed) throw new SkuMergeError('efnsku_required', 'EFNSKU is required');
+
+  const self = await db.prepare(`SELECT id, merged_into_id FROM skus WHERE sku_code = ?`).bind(skuCode).first<{ id: string; merged_into_id: string | null }>();
+  if (!self) throw new SkuMergeError('not_found', `No SKU found with code "${skuCode}"`);
+  if (self.merged_into_id) throw new SkuMergeError('already_merged', `"${skuCode}" has already been merged into another SKU`);
+
+  const existingHolder = await db
+    .prepare(`SELECT id, sku_code, merged_into_id FROM skus WHERE efnsku = ? AND id != ?`)
+    .bind(trimmed, self.id)
+    .first<{ id: string; sku_code: string; merged_into_id: string | null }>();
+
+  if (!existingHolder) {
+    await db.prepare(`UPDATE skus SET efnsku = ? WHERE id = ?`).bind(trimmed, self.id).run();
+    await logAudit(db, { userId, action: 'sku.efnsku_assigned', entityType: 'sku', entityId: self.id, metadata: { skuCode, efnsku: trimmed } });
+    return { efnsku: trimmed, merged: false };
+  }
+
+  const finalTargetId = existingHolder.merged_into_id ?? existingHolder.id;
+  const finalTarget = await db.prepare(`SELECT sku_code FROM skus WHERE id = ?`).bind(finalTargetId).first<{ sku_code: string }>();
+  if (!finalTarget) throw new SkuMergeError('not_found', `"${trimmed}" could not be resolved to a live SKU`);
+
+  if (finalTarget.sku_code === skuCode) {
+    // Already resolves to itself (e.g. re-submitting the same form) — nothing to do.
+    return { efnsku: trimmed, merged: false };
+  }
+
+  await mergeSku(db, userId, skuCode, finalTarget.sku_code);
+  return { efnsku: trimmed, merged: true, mergedIntoCode: finalTarget.sku_code };
 }

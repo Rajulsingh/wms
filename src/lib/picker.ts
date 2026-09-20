@@ -450,14 +450,29 @@ export async function getMyActiveBatches(db: D1Database, warehouseId: string, pi
   return rows.results.map((r) => r.id);
 }
 
+export interface MyBatchEntry {
+  batchId: string;
+  status: string;
+  rows: PickListRow[];
+}
+
 /**
  * Returns this picker's active batches (rows for each), auto-claiming/
  * creating one via `claimNextBatch` only when they currently have none —
  * mirrors the original claim-time behavior for a picker with no work, while
  * never taking a second batch away from the pending pool for someone who
  * already has one (admin assignment is the only way to get a second).
+ *
+ * Fetches every batch's rows in one query instead of looping `getPickListView`
+ * per batch — the picker page now gates on an explicit "Activate pick list"
+ * step (see picker/index.astro) that has to feel instant, and a packer with
+ * a dozen small orders waiting was previously a dozen sequential D1 round
+ * trips just to render the button. `status` is included per batch so the UI
+ * can tell a genuinely fresh claim (still 'assigned') from a reload mid-walk
+ * (already 'in_progress') and skip the activation gate for the latter —
+ * resuming shouldn't require re-confirming work already underway.
  */
-export async function getMyBatches(db: D1Database, warehouseId: string, pickerId: string): Promise<Array<{ batchId: string; rows: PickListRow[] }>> {
+export async function getMyBatches(db: D1Database, warehouseId: string, pickerId: string): Promise<MyBatchEntry[]> {
   const batchIds = await getMyActiveBatches(db, warehouseId, pickerId);
   // Sweep in everything currently available, not just one — not gated on
   // "only when I have none" either, so this doubles as the continuous-flow
@@ -472,11 +487,54 @@ export async function getMyBatches(db: D1Database, warehouseId: string, pickerId
     if (!claimed) break;
     batchIds.push(claimed);
   }
-  const out: Array<{ batchId: string; rows: PickListRow[] }> = [];
-  for (const batchId of batchIds) {
-    out.push({ batchId, rows: await getPickListView(db, batchId) });
+  if (!batchIds.length) return [];
+
+  const placeholders = batchIds.map(() => '?').join(',');
+  const [statusRows, allRows] = await Promise.all([
+    db.prepare(`SELECT id, status FROM pick_batches WHERE id IN (${placeholders})`).bind(...batchIds).all<{ id: string; status: string }>(),
+    db
+      .prepare(
+        `SELECT
+           pt.pick_batch_id AS pick_batch_id,
+           pt.id AS pick_task_id,
+           z.name AS zone_name,
+           loc.code AS location_code,
+           loc.sequence_number,
+           sk.sku_code,
+           sk.name AS sku_name,
+           sk.image_url,
+           o.external_order_id,
+           o.source AS order_source,
+           o.notes AS order_notes,
+           pt.quantity_required,
+           pt.quantity_picked,
+           pt.status
+         FROM pick_tasks pt
+         JOIN locations loc ON loc.id = pt.location_id
+         LEFT JOIN zones z ON z.id = loc.zone_id
+         JOIN skus sk ON sk.id = pt.sku_id
+         JOIN order_items oi ON oi.id = pt.order_item_id
+         JOIN orders o ON o.id = oi.order_id
+         WHERE pt.pick_batch_id IN (${placeholders}) AND o.status != 'cancelled'
+         ORDER BY loc.sequence_number ASC, sk.sku_code ASC`
+      )
+      .bind(...batchIds)
+      .all<PickListRow & { pick_batch_id: string }>()
+  ]);
+
+  const statusByBatch = new Map(statusRows.results.map((r) => [r.id, r.status]));
+  const rowsByBatch = new Map<string, PickListRow[]>();
+  for (const r of allRows.results) {
+    const list = rowsByBatch.get(r.pick_batch_id) ?? [];
+    list.push(r);
+    rowsByBatch.set(r.pick_batch_id, list);
   }
-  return out;
+
+  return batchIds.map((batchId) => ({
+    batchId,
+    status: statusByBatch.get(batchId) ?? 'pending',
+    rows: rowsByBatch.get(batchId) ?? []
+  }));
 }
 
 export interface SkuDemandRow {

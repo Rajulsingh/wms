@@ -10,7 +10,7 @@ export const GET: APIRoute = async (context) => {
     const rows = await db
       .prepare(
         `SELECT inv.id, inv.sku_id, inv.location_id, inv.quantity_on_hand, inv.quantity_reserved, inv.status,
-                s.sku_code, s.name AS sku_name, s.price, s.image_url,
+                s.sku_code, s.name AS sku_name, s.price, s.image_url, s.efnsku,
                 loc.code AS location_code, z.name AS zone_name
          FROM inventory inv
          JOIN skus s ON s.id = inv.sku_id
