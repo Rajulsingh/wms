@@ -16,6 +16,27 @@ if (redirectTo) return Astro.redirect(redirectTo);
       <div id="sync-progress" class="progress-bar"><div class="progress-bar-fill"></div></div>
       <div id="sync-progress-label" class="progress-label" style="display:none;"></div>
       <div id="sync-result" class="banner" style="display:none;"></div>
+
+      <details style="margin-top: 4px;">
+        <summary style="cursor: pointer; font-weight: 600;">Full catalog (active + inactive)</summary>
+        <p style="font-size: 0.82rem; color: var(--muted); margin: 8px 0;">
+          Every SKU Amazon has told us about. <strong>Inactive</strong> means Amazon doesn't consider it directly
+          sellable — almost always a variation-family "parent" listing (used only to group its real, orderable child
+          SKUs together on Amazon's own product page), which never carries its own stock. Inactive listings are
+          shown here for visibility only — they're excluded from "Receive stock" above and from duplicate-SKU
+          scanning, since they can never hold real inventory.
+        </p>
+        <div class="table-scroll">
+          <table id="catalog-table">
+            <thead>
+              <tr><th>SKU</th><th>ASIN</th><th>Status</th></tr>
+            </thead>
+            <tbody id="catalog-rows">
+              <tr><td colspan="3">Loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </details>
     </div>
 
     <div class="card stack">
@@ -61,6 +82,13 @@ if (redirectTo) return Astro.redirect(redirectTo);
       created_at: string;
       line_count: number;
       total_quantity: number;
+    }
+    interface CatalogRow {
+      id: string;
+      sku_code: string;
+      name: string;
+      asin: string | null;
+      is_parent_asin: number;
     }
 
     let warehouseId = '';
@@ -254,6 +282,23 @@ if (redirectTo) return Astro.redirect(redirectTo);
       if (!document.querySelector('#lines > [data-line-id]')) addLine();
     }
 
+    async function loadCatalog() {
+      const rows: CatalogRow[] = await api('/api/admin/skus');
+      const tbody = document.getElementById('catalog-rows')!;
+      tbody.innerHTML = rows.length
+        ? rows
+            .map(
+              (r) => `
+        <tr>
+          <td>${r.sku_code}<br><span style="font-size: 0.75rem; color: var(--muted);">${r.name}</span></td>
+          <td>${r.asin ?? '—'}</td>
+          <td><span class="status-pill ${r.is_parent_asin ? 'status-neutral' : 'status-success'}">${r.is_parent_asin ? 'Inactive' : 'Active'}</span></td>
+        </tr>`
+            )
+            .join('')
+        : '<tr><td colspan="3">No catalog synced yet.</td></tr>';
+    }
+
     function renderReceipts(receipts: ReceiptRow[]) {
       const list = document.getElementById('receipt-list')!;
       list.innerHTML = receipts.length
@@ -327,6 +372,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
           }
         }
         await loadReceipts(); // refreshes the local `skus` array the product search below reads from
+        await loadCatalog();
       } catch (err) {
         resultEl.className = 'banner banner-danger';
         resultEl.textContent = (err as Error).message;
@@ -379,6 +425,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
       }
       warehouseId = me.user.warehouseId;
       await loadReceipts();
+      await loadCatalog();
     }
 
     boot();

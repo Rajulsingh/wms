@@ -12,8 +12,14 @@ export const GET: APIRoute = async (context) => {
     if (!warehouseId) return new Response(JSON.stringify({ error: 'warehouseId is required' }), { status: 400 });
 
     const [skus, locations, receipts, nextMsku] = await Promise.all([
+      // Only active (buyable) listings are selectable here — a parent/inactive
+      // listing (is_parent_asin = 1) holds no real inventory on Amazon and can
+      // never be ordered, so it must never be the target of a stock receipt.
+      // Excluding it here (rather than only from duplicate-scan, see skus.ts)
+      // is what actually stops it from becoming a live inventory row in the
+      // first place.
       db
-        .prepare(`SELECT id, sku_code, name, image_url, price, msku FROM skus WHERE merged_into_id IS NULL ORDER BY sku_code`)
+        .prepare(`SELECT id, sku_code, name, image_url, price, msku FROM skus WHERE merged_into_id IS NULL AND is_parent_asin = 0 ORDER BY sku_code`)
         .all<{ id: string; sku_code: string; name: string; image_url: string | null; price: number | null; msku: string | null }>(),
       db
         .prepare(

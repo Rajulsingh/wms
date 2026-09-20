@@ -1460,6 +1460,58 @@ helper (`lib/concurrency.ts`, a small worker-pool `mapWithConcurrency`, not a ne
   guarantee into a race. They're also typically a much smaller list than a fresh order pull, so the
   speed upside would have been marginal against a real behavioral risk.
 
+## Recently done (2026-09-21, a thirty-second pass) — active/inactive listing visibility, and a D1 rows_read incident
+
+**Active vs. inactive listings.** Follow-on to the parent-SKU work above: the receiving product
+search (`/api/admin/inbound` GET, used by inbound.astro's "Receive stock" tool) listed *every*
+non-merged SKU including `is_parent_asin = 1` rows — meaning an admin could still pick a parent
+listing like `HOG-4AA` as the target of a stock receipt, creating a real inventory row for
+something that can never actually be ordered. Fixed by adding `AND is_parent_asin = 0` to that
+query. Separately, there was no admin-visible listing of the full catalog at all — a parent/
+inactive SKU was completely invisible everywhere once flagged. Gave `/api/admin/skus` GET (until
+now unused — dead code) a real purpose: returns every non-merged SKU with `asin`/`is_parent_asin`,
+and wired it into a new collapsible "Full catalog (active + inactive)" table on inbound.astro,
+labelled Active/Inactive. Verified live: 176 active + 58 inactive shown in the table; the receiving
+search's SKU list dropped from 234 to 175 (excludes both inactive listings and one already-merged
+code) and no longer contains `HOG-4AA` or `KTN4`.
+
+**D1 `rows_read` incident.** Cloudflare emailed that the free-tier daily cap (5,000,000 rows_read)
+was at 77% for the day, three days after launch. Investigated with `wrangler d1 info wms-db`
+(shows rolling 24h stats): 112,854 read queries, 6,282,058 rows read — ~56 rows/query average
+despite every table in the schema being under a few hundred rows, which only makes sense as **full
+table scans**, not big single queries. Two root causes found, both fixed (not just one — traced it
+all the way through rather than stopping at the first plausible answer):
+1. `getTodaySummary` (dashboard.ts) — the "how's today going" panel *any* logged-in user can open
+   (`api/dashboard/today.ts` has no role restriction on purpose), polled every 15s per open tab —
+   had two subqueries filtering `audit_log` with `date(created_at) = date('now')`. Wrapping a
+   column in a function defeats any index on it, so this was a full scan of the *entire* audit_log
+   table (1,486 rows and growing — it's the append-only log of every scan/action ever) on every
+   single poll, from every open tab, forever. This alone plausibly accounts for the large majority
+   of the day's reads, and would only get worse as audit_log keeps growing.
+2. `pick_batches` had no index at all beyond its primary key, despite being filtered by
+   `warehouse_id`/`assigned_picker_id`/`status` in several 8-15s-polled endpoints (claim-batch,
+   packer/picker dashboards, admin pick-assign's `sku-demand` poll) — likewise a full scan on every
+   poll, from every session, on every one of those endpoints.
+- Fixed the query pattern everywhere it appeared (`dashboard.ts` x3, `packer.ts` x2 — one against
+  `pack_sessions`, one against `awb_scans`): rewrote `date(col) = date('now')` to a plain
+  `col >= date('now') AND col < date('now', '+1 day')` range. `created_at`/`picked_at`/
+  `completed_at`/`scanned_at` are all ISO 8601 text (`datetime('now')`), which sorts identically to
+  a real comparison, so this is a pure behavior-preserving rewrite — just one that an index can
+  actually use.
+- New indexes (`migrations/0020_hot_path_indexes.sql`): `audit_log(action, created_at)`,
+  `pick_batches(warehouse_id, status)`, `pick_batches(assigned_picker_id, status)`,
+  `pick_tasks(status)`, `pack_sessions(packer_id, status)`, `order_items(sku_id)`. `awb_scans`
+  already had `(warehouse_id, scanned_at)` from migration 0013 — the query rewrite alone made that
+  existing index usable, no new index needed there.
+- Applied directly to remote D1 immediately (schema-only, no deploy needed, safe to run against a
+  live database) ahead of shipping the query-side fix, since the free-tier cap was actively at risk
+  of being hit that same day. `wrangler d1 execute --remote --file` printed a spurious "Not
+  currently importing anything" error after "Processed 6 queries" — a known CLI quirk, not a real
+  failure; verified all 6 indexes actually exist via `sqlite_master` before trusting it.
+- Not otherwise changed: polling intervals (8-15s across picker/packer/admin screens) were left
+  alone — every one of them already had a `document.hidden` guard, so the real problem was
+  per-query cost, not polling frequency itself.
+
 ## Next steps — a prioritized plan
 
 Rewritten 2026-09-20 (twenty-one passes across two days — see "Recently done" entries above for the

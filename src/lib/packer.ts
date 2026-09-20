@@ -388,8 +388,13 @@ export interface PackerDailySummary {
 /**
  * What this packer has actually finished packing today, newest first — "so
  * they know what they have done" instead of a dashboard that only ever
- * shows work still waiting. `date(completed_at) = date('now')` scopes to
- * the server's calendar day, same as any other "today" summary here would.
+ * shows work still waiting. Scoped to the server's calendar day via a plain
+ * range on `completed_at` rather than `date(completed_at) = date('now')` —
+ * the latter wraps the column in a function, which defeats any index on it
+ * (see dashboard.ts's getTodaySummary for the full story — the same pattern
+ * there was reading several million rows/day off a growing table). This
+ * endpoint is polled every 15s by every packer's dashboard, so keeping it
+ * indexable matters here too even though pack_sessions is small today.
  */
 export async function getPackerDailySummary(db: D1Database, warehouseId: string, packerId: string): Promise<PackerDailySummary> {
   const rows = await db
@@ -399,7 +404,7 @@ export async function getPackerDailySummary(db: D1Database, warehouseId: string,
               (SELECT sk.image_url FROM order_items oi JOIN skus sk ON sk.id = oi.sku_id WHERE oi.order_id = ps.order_id ORDER BY oi.id LIMIT 1) AS image_url
        FROM pack_sessions ps JOIN orders o ON o.id = ps.order_id
        WHERE ps.packer_id = ? AND o.warehouse_id = ? AND ps.status IN ('completed', 'partial')
-         AND date(ps.completed_at) = date('now')
+         AND ps.completed_at >= date('now') AND ps.completed_at < date('now', '+1 day')
        ORDER BY ps.completed_at DESC`
     )
     .bind(packerId, warehouseId)
@@ -517,7 +522,7 @@ export async function getTodayScans(db: D1Database, warehouseId: string): Promis
               (SELECT COUNT(*) FROM order_items oi WHERE oi.order_id = o.id) AS item_count,
               (SELECT COALESCE(SUM(oi.quantity_packed), 0) FROM order_items oi WHERE oi.order_id = o.id) AS unit_count
        FROM awb_scans sc JOIN orders o ON o.id = sc.order_id
-       WHERE sc.warehouse_id = ? AND date(sc.scanned_at) = date('now')
+       WHERE sc.warehouse_id = ? AND sc.scanned_at >= date('now') AND sc.scanned_at < date('now', '+1 day')
        ORDER BY sc.scanned_at DESC
        LIMIT 100`
     )

@@ -51,16 +51,33 @@ export async function getTodaySummary(db: D1Database, warehouseId: string): Prom
     if (row.status in statusCounts) statusCounts[row.status] = row.c;
   }
 
+  // Every one of this function's "today" filters used to be written as
+  // `date(col) = date('now')` — wrapping the column in a function defeats
+  // any index on it (SQLite can't range-scan a computed expression), forcing
+  // a full table scan every single call. That's cheap while a table is
+  // small, but this function is polled every 15s by *every* logged-in
+  // session regardless of role (see api/dashboard/today.ts) and audit_log in
+  // particular is append-only and grows forever — a real production
+  // incident (see HANDOFF.md): 3 days after launch this was already reading
+  // several million rows/day against Cloudflare's D1 free-tier row-read cap,
+  // almost entirely from these two audit_log subqueries. `created_at`/
+  // `picked_at`/`completed_at` are ISO 8601 text (`datetime('now')`), which
+  // sorts identically to a real date/time comparison, so a plain `col >=
+  // date('now') AND col < date('now', '+1 day')` range is both correct and
+  // (with the index below) actually indexable.
+  const todayStart = "date('now')";
+  const todayEnd = "date('now', '+1 day')";
+
   const shippedToday = await db
     .prepare(
-      `SELECT COUNT(*) as c FROM audit_log WHERE action = 'order.shipped_sync' AND entity_id IN (SELECT id FROM orders WHERE warehouse_id = ?) AND date(created_at) = date('now')`
+      `SELECT COUNT(*) as c FROM audit_log WHERE action = 'order.shipped_sync' AND entity_id IN (SELECT id FROM orders WHERE warehouse_id = ?) AND created_at >= ${todayStart} AND created_at < ${todayEnd}`
     )
     .bind(warehouseId)
     .first<{ c: number }>();
 
   const cancelledToday = await db
     .prepare(
-      `SELECT COUNT(*) as c FROM audit_log WHERE action = 'order.cancelled_sync' AND entity_id IN (SELECT id FROM orders WHERE warehouse_id = ?) AND date(created_at) = date('now')`
+      `SELECT COUNT(*) as c FROM audit_log WHERE action = 'order.cancelled_sync' AND entity_id IN (SELECT id FROM orders WHERE warehouse_id = ?) AND created_at >= ${todayStart} AND created_at < ${todayEnd}`
     )
     .bind(warehouseId)
     .first<{ c: number }>();
@@ -71,7 +88,7 @@ export async function getTodaySummary(db: D1Database, warehouseId: string): Prom
        FROM pick_tasks pt
        JOIN order_items oi ON oi.id = pt.order_item_id
        JOIN orders o ON o.id = oi.order_id
-       WHERE o.warehouse_id = ? AND pt.status IN ('picked', 'short') AND date(pt.picked_at) = date('now')`
+       WHERE o.warehouse_id = ? AND pt.status IN ('picked', 'short') AND pt.picked_at >= ${todayStart} AND pt.picked_at < ${todayEnd}`
     )
     .bind(warehouseId)
     .first<{ orders: number; units: number }>();
@@ -82,7 +99,7 @@ export async function getTodaySummary(db: D1Database, warehouseId: string): Prom
               (SELECT COALESCE(SUM(oi.quantity_packed), 0) FROM order_items oi WHERE oi.order_id = ps.order_id) AS units_packed
        FROM pack_sessions ps
        JOIN orders o ON o.id = ps.order_id
-       WHERE o.warehouse_id = ? AND ps.status IN ('completed', 'partial') AND date(ps.completed_at) = date('now')`
+       WHERE o.warehouse_id = ? AND ps.status IN ('completed', 'partial') AND ps.completed_at >= ${todayStart} AND ps.completed_at < ${todayEnd}`
     )
     .bind(warehouseId)
     .all<{ order_id: string; units_packed: number }>();
