@@ -1699,6 +1699,73 @@ rather than silently reversing that earlier decision; they chose to hold it back
   there's no way to know from the data alone whether it's already been physically picked. Flagged to
   the user rather than auto-corrected.
 
+**DEFERRED TO NEXT SESSION — AWB-scan mismatch fix via Amazon's Reports API.** Continuing the item
+right above this (`372690986408` scanned to the wrong order via FIFO fallback, root cause:
+100% of this account's Easy Ship pickups are scheduled directly on Seller Central, never through
+this app, so there's no real AWB→order data anywhere in this system to match against). User chose
+"investigate the Reports API" as the direction. Checked Amazon's own role-mapping docs
+(`developer-docs.amazon.com/sp-api/docs/report-type-values-order`) directly rather than guess:
+- The report that would actually contain tracking/AWB data, `GET_FLAT_FILE_ORDER_REPORT_DATA_SHIPPING`,
+  requires the role **"Direct to Consumer Shipping (Restricted)"** — a *restricted* report type,
+  meaning it also needs a Restricted Data Token and "passing an additional security review," per
+  Amazon's own docs. That role does not appear among the roles already granted to this app in the
+  Solution Provider Portal (Freight/Amazon Logistics, Sellers: Finance and Accounting, Selling
+  Partner Insights, Buyer Communication, Inventory and Order Tracking ✓, Brand Analytics, Amazon
+  Fulfillment, Buyer Solicitation, Product Listing ✓, Amazon Warehousing and Distribution, Shipping:
+  Amazon Logistics ✓) — user was mid-authorization-flow when this was found; told them to check
+  further down that page for it, and that it may need a separate restricted-data application process
+  rather than a simple checkbox, given the extra security review requirement.
+- Found one fallback report that *is* already covered by roles this app has (`Product Listing`,
+  `Inventory and Order Tracking`): `GET_FLAT_FILE_ALL_ORDERS_DATA_BY_LAST_UPDATE_GENERAL`. Amazon's
+  own docs describe it as general-purpose order tracking that explicitly "does not include
+  customer-identifying information," and it's NOT documented as a shipping-specific report — genuinely
+  unclear whether it carries a carrier tracking number at all. Untested; worth requesting live (same
+  create-report → poll → download pattern used for the restricted one) as a first check next session,
+  since it needs no new permission grant.
+- **Next session, in this order**: (1) if the fallback report actually contains tracking numbers,
+  build on that — no permission blocker. (2) If not, this needs the user (and possibly Amazon's
+  review process) to grant "Direct to Consumer Shipping (Restricted)" before any further progress is
+  possible on this specific approach. (3) The other two options from the original direction-choice —
+  schedule labels through this app instead, or a manual "enter a known tracking number" admin field —
+  remain fully available immediately, with no Amazon-side blocker, if the Reports route stalls.
+
+**INCIDENT — D1 free-tier daily row-read quota fully exhausted (not just the 77% flagged earlier
+today).** Discovered mid-session when a routine `wrangler d1 execute --remote` lookup failed outright
+with "Your account has exceeded D1's free tier daily row read limit... wait until tomorrow (midnight
+UTC)" (Cloudflare error code 7500). Confirmed this is a hard per-query block, not a fluke: `SELECT 1`
+(0 rows read) succeeds, but any query touching a real table — including a single indexed lookup by
+external_order_id — is rejected outright. This affects the *entire* production Worker, not just
+CLI/investigation access — since the Worker's own D1 binding hits the same account-wide daily cap,
+any real logged-in user's page load or action that needs a genuine data query (which is nearly
+everything past the login screen) is almost certainly getting a 500 right now too, not just this
+session's own queries. `curl`-testing `/api/auth/me` with no session cookie returned a clean 200
+`{"user":null}` — but that's misleading: with no cookie, `getCurrentUser` short-circuits before ever
+touching D1, so it says nothing about whether a real logged-in session works right now (it almost
+certainly doesn't for anything requiring an actual DB read).
+- Checked the time: this happened at 21:11 UTC (~2:41am IST) — reset is at 00:00 UTC, ~2h50m out.
+  Likely low real floor traffic at that hour in IST, but not confirmed; flagged to the user
+  immediately rather than assumed away. The only way to lift it before reset is a Cloudflare D1 paid
+  plan upgrade (Workers & Pages → D1 → the database → plan) — the user's call, not made unilaterally.
+- **Likely contributing cause, worth being more disciplined about next session**: this same session
+  ran a large number of ad-hoc `wrangler d1 execute --remote` investigation queries throughout the
+  day (checking individual order states repeatedly, auditing all 59 `'shipped'` orders against live
+  Amazon data, etc.) — each one draws from the exact same daily rows_read budget as the live app.
+  Earlier today's indexing/query-rewrite fixes (see the D1 rows_read incident entry above) reduce the
+  *rate* of consumption going forward, but couldn't undo a day's cumulative total that had apparently
+  already been trending toward the cap before those fixes landed, and this session's own remote
+  investigation queries added to that same total on top. Next session: prefer local dev D1 for
+  anything that doesn't specifically require real production data, and batch/limit remote lookups
+  when production data really is needed.
+- **Follow-up still open because of this**: user asked (again) why `404-6655591-3241911` — Pending on
+  Seller Central — is still in the pick list. Could not check its current state (fresh
+  `amazon_order_status`, pick_batch progress) because production D1 was already exhausted by the time
+  this was asked. Last known state (from the entry above, checked before the quota ran out): its
+  pick_batch was `'in_progress'`. Re-check this first thing next session once the quota resets (or
+  sooner if the user upgrades the plan) — if the batch is still untouched (no tasks actually
+  picked), pulling it back to unreserved is safe now that `amazon_order_status` gating exists; if any
+  of its tasks have actually been picked, that needs the user's input before undoing anything, same
+  reasoning as before.
+
 ## Next steps — a prioritized plan
 
 Rewritten 2026-09-20 (twenty-one passes across two days — see "Recently done" entries above for the
