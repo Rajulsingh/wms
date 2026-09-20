@@ -42,7 +42,6 @@ if (redirectTo) return Astro.redirect(redirectTo);
 
   <script>
     import { scanOnce, stopScanning } from '../../lib/scanner-client';
-    import { withLoading } from '../../lib/ui';
     import JsBarcode from 'jsbarcode';
 
     interface Row {
@@ -63,15 +62,32 @@ if (redirectTo) return Astro.redirect(redirectTo);
       id: string;
       status: string;
       created_at: string;
+      activated_at: string | null;
       completed_at: string | null;
       assigned_picker_id: string | null;
       assigned_picker_name: string | null;
     }
-    interface PackerUser {
-      id: string;
-      name: string;
-      role: string;
-      active: number;
+
+    // One order is always exactly one pick_batches row (see lib/orders.ts) —
+    // when a picker activates several at once (one tap, see activateBatches
+    // in lib/picker.ts), they all get the exact same `activated_at` (SQLite
+    // fixes datetime('now') for the whole UPDATE statement). Grouping on
+    // (picker, activated_at) turns what would otherwise be one dropdown row
+    // per order back into one row per actual picking trip — the printed/
+    // downloaded list, barcode, and stepper all now represent the whole
+    // group, not a single order. `orderCount` is just `batchIds.length`
+    // since that one-batch-per-order invariant means no separate query is
+    // needed to know how many orders are in a group.
+    interface Session {
+      key: string;
+      primaryBatchId: string; // barcode/scan/URL identity for the whole group — first batch, deterministically
+      batchIds: string[];
+      pickerName: string | null;
+      activatedAt: string;
+      createdAt: string; // earliest member's created_at
+      completedAt: string | null; // latest member's completed_at, only set once every member is completed
+      status: 'in_progress' | 'completed';
+      orderCount: number;
     }
 
     const app = document.getElementById('app')!;
@@ -80,9 +96,42 @@ if (redirectTo) return Astro.redirect(redirectTo);
     const scanError = document.getElementById('scan-error') as HTMLParagraphElement;
     let warehouseId = '';
     let batches: Batch[] = [];
-    let packers: PackerUser[] = [];
+    let sessions: Session[] = [];
     let currentRows: Row[] = [];
-    let currentBatchId = '';
+    let currentSession: Session | null = null;
+
+    // A batch created before the activated_at column existed (or never
+    // re-activated since) has no shared timestamp to group on — treated as
+    // its own single-order session rather than lumping every such legacy row
+    // with a null key into one giant fake group.
+    function computeSessions(source: Batch[]): Session[] {
+      const groups = new Map<string, Batch[]>();
+      for (const b of source) {
+        const key = `${b.assigned_picker_id ?? 'unassigned'}__${b.activated_at ?? b.id}`;
+        const list = groups.get(key);
+        if (list) list.push(b);
+        else groups.set(key, [b]);
+      }
+      return Array.from(groups.values())
+        .map((members): Session => {
+          const sorted = [...members].sort((a, b) => a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id));
+          const primary = sorted[0];
+          const allCompleted = members.every((m) => m.status === 'completed');
+          const completedAts = members.map((m) => m.completed_at).filter((v): v is string => !!v).sort();
+          return {
+            key: `${primary.assigned_picker_id ?? 'unassigned'}__${primary.activated_at ?? primary.id}`,
+            primaryBatchId: primary.id,
+            batchIds: sorted.map((m) => m.id),
+            pickerName: primary.assigned_picker_name,
+            activatedAt: primary.activated_at ?? primary.created_at,
+            createdAt: sorted[0].created_at,
+            completedAt: allCompleted && completedAts.length ? completedAts[completedAts.length - 1] : null,
+            status: allCompleted ? 'completed' : 'in_progress',
+            orderCount: members.length
+          };
+        })
+        .sort((a, b) => b.activatedAt.localeCompare(a.activatedAt));
+    }
 
     async function api(path: string, body?: unknown) {
       const res = await fetch(path, {
@@ -158,15 +207,14 @@ if (redirectTo) return Astro.redirect(redirectTo);
 
     const CHECK_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m5 13 4 4L19 7"></path></svg>';
 
-    // Batch lifecycle only (pending/assigned/in_progress -> completed) — packing
-    // and shipping happen per order/shipment in this schema, not per batch, so
-    // a literal Create/Pack/Ship stepper would claim a stage that isn't true
-    // for this batch yet. See pick_batches.status CHECK constraint.
-    function renderStepper(batch: Batch): string {
-      const created = new Date(batch.created_at).toLocaleString();
-      const pickingDone = batch.status === 'completed';
-      const picking = { done: pickingDone, current: !pickingDone && batch.status !== 'cancelled' };
-      const picked = { done: pickingDone, current: false };
+    // Lifecycle for the whole group (in_progress -> completed once every
+    // member order is done) — packing and shipping happen per order/
+    // shipment in this schema, not per batch, so a literal Create/Pack/Ship
+    // stepper would claim a stage that isn't true for every order in the
+    // group yet.
+    function renderStepper(session: Session): string {
+      const created = new Date(session.createdAt).toLocaleString();
+      const pickingDone = session.status === 'completed';
 
       const step = (label: string, meta: string, done: boolean, current: boolean, first = false) => `
         <div class="stepper-step ${done ? 'done' : current ? 'current' : ''}">
@@ -178,8 +226,8 @@ if (redirectTo) return Astro.redirect(redirectTo);
 
       return `<div class="stepper-bar">
         ${step('Create', created, true, false, true)}
-        ${step('Picking', picking.done ? 'Complete' : picking.current ? 'In progress' : '—', picking.done, picking.current)}
-        ${step('Picked', picked.done ? new Date(batch.completed_at ?? batch.created_at).toLocaleString() : 'Not yet', picked.done, picked.current)}
+        ${step('Picking', pickingDone ? 'Complete' : 'In progress', pickingDone, !pickingDone)}
+        ${step('Picked', pickingDone ? new Date(session.completedAt ?? session.createdAt).toLocaleString() : 'Not yet', pickingDone, false)}
       </div>`;
     }
 
@@ -202,55 +250,51 @@ if (redirectTo) return Astro.redirect(redirectTo);
       }
       warehouseId = me.user.warehouseId;
 
-      const users: PackerUser[] = await api(`/api/admin/users?warehouseId=${warehouseId}`);
-      packers = users.filter((u) => u.role === 'packer' && u.active);
-
       batches = await api(`/api/admin/batches?warehouseId=${warehouseId}`);
+      sessions = computeSessions(batches);
       const params = new URLSearchParams(window.location.search);
-      const preselect = params.get('batchId');
+      // Kept as `batchId` for backward compatibility with anything that might
+      // still link here by a single order's batch id — resolved to whichever
+      // session that batch now belongs to.
+      const preselectBatchId = params.get('batchId');
+      const preselect = preselectBatchId ? sessions.find((s) => s.batchIds.includes(preselectBatchId))?.key : null;
 
-      select.innerHTML = batches.map((b) => `<option value="${b.id}">${b.created_at} · ${b.status}</option>`).join('');
+      select.innerHTML = sessions
+        .map((s) => `<option value="${s.key}">${s.activatedAt} · ${s.pickerName ?? '—'} · ${s.orderCount} order${s.orderCount === 1 ? '' : 's'} · ${s.status}</option>`)
+        .join('');
       if (preselect) select.value = preselect;
-      select.addEventListener('change', () => loadBatch(select.value));
+      select.addEventListener('change', () => loadSession(select.value));
 
-      if (batches.length) await loadBatch(select.value);
-      else app.innerHTML = '<p>No pick batches yet.</p>';
+      if (sessions.length) await loadSession(select.value);
+      else app.innerHTML = '<p>No pick lists yet — one appears here as soon as a picker activates it.</p>';
     }
 
-    async function loadBatch(batchId: string) {
-      if (!batchId) return;
-      const batch = batches.find((b) => b.id === batchId);
-      currentBatchId = batchId;
-      const rows: Row[] = await api(`/api/picker/pick-list?batchId=${batchId}`);
+    async function loadSession(sessionKey: string) {
+      if (!sessionKey) return;
+      const session = sessions.find((s) => s.key === sessionKey);
+      if (!session) return;
+      currentSession = session;
+      const rows: Row[] = await api(`/api/picker/pick-list?batchIds=${session.batchIds.join(',')}`);
       currentRows = rows;
       const orders = new Set(rows.map((r) => r.external_order_id));
       const skus = new Set(rows.map((r) => r.sku_code));
       const units = rows.reduce((sum, r) => sum + r.quantity_required, 0);
 
       app.innerHTML = `
-        ${batch ? `<div class="card">
+        <div class="card">
           <div class="row" style="justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 16px;">
             <div class="stack" style="gap: 4px;">
               <span class="eyebrow">Pick list ID</span>
-              <span class="big-label" style="font-size: 1.4rem;">${batch.id}</span>
+              <span class="big-label" style="font-size: 1.4rem;">${session.primaryBatchId}</span>
             </div>
-            ${renderBarcode(batch.id)}
+            ${renderBarcode(session.primaryBatchId)}
           </div>
-          ${renderStepper(batch)}
+          ${renderStepper(session)}
           <div class="no-print row" style="margin-top: 14px; gap: 10px; align-items: center; flex-wrap: wrap;">
-            <span class="eyebrow" style="flex: 0 0 auto;">Assigned to</span>
-            ${
-              batch.status === 'pending' || batch.status === 'assigned'
-                ? `<select id="assign-select" style="width: auto; flex: 1; min-width: 200px;">
-                     <option value="">— Unassigned —</option>
-                     ${packers.map((p) => `<option value="${p.id}" ${p.id === batch.assigned_picker_id ? 'selected' : ''}>${p.name}</option>`).join('')}
-                   </select>
-                   <button class="btn btn-primary" id="assign-btn" style="width: auto;">${batch.assigned_picker_id ? 'Update' : 'Assign'}</button>`
-                : `<span class="pill">${batch.assigned_picker_name ?? '—'}</span>`
-            }
+            <span class="eyebrow" style="flex: 0 0 auto;">Picked by</span>
+            <span class="pill">${session.pickerName ?? '—'}</span>
           </div>
-          <p id="assign-error" style="display:none; color: var(--danger); margin: 8px 0 0; font-size: 0.85rem;"></p>
-        </div>` : ''}
+        </div>
         <div class="row no-print" style="gap: 16px;">
           <span class="pill">Orders: ${orders.size}</span>
           <span class="pill">SKUs: ${skus.size}</span>
@@ -282,71 +326,31 @@ if (redirectTo) return Astro.redirect(redirectTo);
           </tbody>
         </table></div>`;
 
-      if (batch) {
-        const svg = document.getElementById('batch-barcode');
-        if (svg) {
-          try {
-            JsBarcode(svg, batch.id, { format: 'CODE128', displayValue: false, height: 40, margin: 0 });
-          } catch {
-            // Batch IDs are UUIDs (any ASCII), Code128 handles them fine — this is just a defensive no-op if it ever can't.
-          }
+      const svg = document.getElementById('batch-barcode');
+      if (svg) {
+        try {
+          JsBarcode(svg, session.primaryBatchId, { format: 'CODE128', displayValue: false, height: 40, margin: 0 });
+        } catch {
+          // Batch IDs are UUIDs (any ASCII), Code128 handles them fine — this is just a defensive no-op if it ever can't.
         }
-
-        // Choosing "— Unassigned —" and submitting clears the assignment
-        // (packerId: null) rather than needing a separate "Unassign" button
-        // — same control either way, the button's label just follows what's
-        // currently selected.
-        document.getElementById('assign-select')?.addEventListener('change', () => {
-          const assignSelect = document.getElementById('assign-select') as unknown as HTMLSelectElement;
-          const assignBtn = document.getElementById('assign-btn') as HTMLButtonElement | null;
-          if (!assignBtn) return;
-          assignBtn.textContent = assignSelect.value ? (batch.assigned_picker_id ? 'Update' : 'Assign') : 'Unassign';
-        });
-
-        document.getElementById('assign-btn')?.addEventListener('click', async (e) => {
-          const assignSelect = document.getElementById('assign-select') as unknown as HTMLSelectElement;
-          const assignError = document.getElementById('assign-error') as HTMLParagraphElement;
-          const packerId = assignSelect.value || null;
-          if (!packerId && !batch.assigned_picker_id) {
-            assignError.textContent = 'Pick a packer to assign this batch to.';
-            assignError.style.display = 'block';
-            return;
-          }
-          const btn = e.currentTarget as HTMLButtonElement;
-          try {
-            await withLoading(btn, packerId ? 'Assigning…' : 'Unassigning…', () =>
-              fetch('/api/admin/batches', {
-                method: 'PATCH',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ warehouseId, batchId: batch.id, packerId })
-              }).then(async (res) => {
-                const data: any = await res.json().catch(() => ({}));
-                if (!res.ok) throw new Error(data.error ?? `Request failed (${res.status})`);
-              })
-            );
-            batches = await api(`/api/admin/batches?warehouseId=${warehouseId}`);
-            select.innerHTML = batches.map((b) => `<option value="${b.id}">${b.created_at} · ${b.status}</option>`).join('');
-            select.value = batch.id;
-            await loadBatch(batch.id);
-          } catch (err) {
-            assignError.textContent = (err as Error).message;
-            assignError.style.display = 'block';
-          }
-        });
       }
     }
 
+    // A scanned/typed barcode is always one specific order's raw batch id
+    // (that's what's printed/encoded — see renderBarcode above), so this
+    // resolves it to whichever session that order ended up grouped into,
+    // not a session key directly.
     function openBatch(rawId: string) {
       const id = rawId.trim();
-      const match = batches.find((b) => b.id === id);
-      if (!match) {
+      const session = sessions.find((s) => s.batchIds.includes(id));
+      if (!session) {
         scanError.textContent = `No pick list found for "${id}".`;
         scanError.style.display = 'block';
         return;
       }
       scanError.style.display = 'none';
-      select.value = match.id;
-      loadBatch(match.id);
+      select.value = session.key;
+      loadSession(session.key);
     }
 
     scanInput.addEventListener('keydown', (e) => {
@@ -387,7 +391,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `pick-list-${currentBatchId}.csv`;
+      a.download = `pick-list-${currentSession?.primaryBatchId ?? 'session'}.csv`;
       a.click();
       URL.revokeObjectURL(url);
     });

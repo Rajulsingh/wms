@@ -1,0 +1,11 @@
+-- Records the moment a picker actually activated a batch (see activateBatches
+-- in lib/picker.ts), separately from `created_at` (when the order was first
+-- reserved, automatic, no human involved). When one picker taps "Activate
+-- pick list" once, every one of their currently-assigned batches gets the
+-- exact same `activated_at` (SQLite fixes `datetime('now')` for the whole
+-- statement) — the admin Pick Lists page (pick-list.astro) uses that shared
+-- timestamp + picker id to group what was really one picking trip back into
+-- one printable list, instead of showing one row per order the way the raw
+-- pick_batches table does. NULL for anything created before this migration
+-- and never re-activated; those are treated as their own single-order group.
+ALTER TABLE pick_batches ADD COLUMN activated_at TEXT;

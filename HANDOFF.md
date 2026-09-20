@@ -1549,6 +1549,42 @@ reachable from here).
   `/api/admin/batches` then returned exactly those 14 (`in_progress`/`completed`), zero `pending`/
   `assigned` noise.
 
+**Pick lists grouped by picking session, not by order.** Follow-on to the activation fix above: once
+that shipped, the admin Pick Lists dropdown was still showing one row per *order* — because
+`reserveOrderForPicking` creates exactly one `pick_batches` row per order — so a picker activating 13
+orders in one tap produced 13 separate entries, all created within the same few-second window, for
+what was really one trip through the warehouse. Confirmed against real production data (all same
+picker, all `in_progress`, timestamps a few seconds apart) before proposing a fix, then asked the
+user directly whether they wanted these combined, kept separate-but-organized, or just defaulted to
+a shorter list — they chose combining.
+- New `pick_batches.activated_at` column (`migrations/0021_pick_batches_activated_at.sql`). Both
+  `activateBatches` and the self-healing `markBatchStarted` (see previous entry) now stamp it
+  alongside the `status` flip. Batches a picker activates in one tap all get the *exact same*
+  `activated_at` — SQLite fixes `datetime('now')` for the whole UPDATE statement, confirmed live (3
+  test batches activated together all got `2026-09-20 20:15:06`, to the second).
+- Admin's pick-list.astro now groups its fetched batches client-side by `(assigned_picker_id,
+  activated_at)` into `Session` objects — one dropdown entry, one barcode, one stepper, one printed/
+  downloaded sheet per *session* instead of per order. `orderCount` is just the group's size (no
+  extra query needed) since one batch is always exactly one order. A batch with no `activated_at`
+  (anything from before this migration, or never re-activated) falls back to grouping on its own id
+  — stays its own single-order session rather than every legacy null-timestamp row getting wrongly
+  lumped into one giant fake group. Verified: 13 pre-existing legacy batches (no `activated_at`)
+  correctly stayed as 13 separate 1-order entries; 3 freshly-activated-together test batches
+  correctly collapsed into one 3-order entry with combined SKU/unit totals.
+- New `getPickListViewForBatches` (lib/picker.ts) + `/api/picker/pick-list?batchIds=a,b,c` (comma-
+  separated, alongside the existing single-`batchId` form) — one query for the whole session's rows
+  instead of looping the single-batch query per member.
+- The barcode/scan-a-pick-list flow now encodes and looks up the *session's* representative batch id
+  (deterministically its earliest member, by `created_at` then `id`) — scanning any printed barcode
+  still resolves correctly since `openBatch` now searches every session's `batchIds` for a match, not
+  session keys directly.
+- Removed the now-fully-unreachable per-order assign/unassign UI from pick-list.astro (a session
+  shown here is always `in_progress`/`completed`, and `assignBatchToPacker` already refused to touch
+  anything past `'assigned'` even before this — so no capability was actually lost). Deliberately did
+  **not** touch `assignBatchToPacker` itself or the `/api/admin/batches` PATCH route — the function is
+  still very much alive, called from `assignSkusToPacker` (pick-assign.astro's "Assign by SKU" bulk
+  flow), which is the real, still-used tool for routing not-yet-claimed work to a specific packer.
+
 ## Next steps — a prioritized plan
 
 Rewritten 2026-09-20 (twenty-one passes across two days — see "Recently done" entries above for the

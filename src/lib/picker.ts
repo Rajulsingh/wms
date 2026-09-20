@@ -93,7 +93,10 @@ async function claimAvailableBatch(db: D1Database, warehouseId: string, pickerId
  */
 export async function activateBatches(db: D1Database, warehouseId: string, pickerId: string): Promise<void> {
   await db
-    .prepare(`UPDATE pick_batches SET status = 'in_progress' WHERE warehouse_id = ? AND assigned_picker_id = ? AND status = 'assigned'`)
+    .prepare(
+      `UPDATE pick_batches SET status = 'in_progress', activated_at = datetime('now')
+       WHERE warehouse_id = ? AND assigned_picker_id = ? AND status = 'assigned'`
+    )
     .bind(warehouseId, pickerId)
     .run();
 }
@@ -107,7 +110,10 @@ export async function activateBatches(db: D1Database, warehouseId: string, picke
  * here instead. A no-op once already past 'assigned'.
  */
 async function markBatchStarted(db: D1Database, pickBatchId: string): Promise<void> {
-  await db.prepare(`UPDATE pick_batches SET status = 'in_progress' WHERE id = ? AND status = 'assigned'`).bind(pickBatchId).run();
+  await db
+    .prepare(`UPDATE pick_batches SET status = 'in_progress', activated_at = datetime('now') WHERE id = ? AND status = 'assigned'`)
+    .bind(pickBatchId)
+    .run();
 }
 
 export interface BatchState {
@@ -225,6 +231,46 @@ export async function getPickListView(db: D1Database, batchId: string): Promise<
        ORDER BY loc.sequence_number ASC, sk.sku_code ASC`
     )
     .bind(batchId)
+    .all<PickListRow>();
+  return rows.results;
+}
+
+/**
+ * Bulk version of `getPickListView` for admin's Pick Lists page (pick-
+ * list.astro), which now groups every batch a picker activated together
+ * (same `activated_at`, see activateBatches) into one printable/downloadable
+ * list instead of showing one order per row — one query for the whole group
+ * rather than looping getPickListView per batch.
+ */
+export async function getPickListViewForBatches(db: D1Database, batchIds: string[]): Promise<PickListRow[]> {
+  if (!batchIds.length) return [];
+  const placeholders = batchIds.map(() => '?').join(',');
+  const rows = await db
+    .prepare(
+      `SELECT
+         pt.id AS pick_task_id,
+         z.name AS zone_name,
+         loc.code AS location_code,
+         loc.sequence_number,
+         sk.sku_code,
+         sk.name AS sku_name,
+         sk.image_url,
+         o.external_order_id,
+         o.source AS order_source,
+         o.notes AS order_notes,
+         pt.quantity_required,
+         pt.quantity_picked,
+         pt.status
+       FROM pick_tasks pt
+       JOIN locations loc ON loc.id = pt.location_id
+       LEFT JOIN zones z ON z.id = loc.zone_id
+       JOIN skus sk ON sk.id = pt.sku_id
+       JOIN order_items oi ON oi.id = pt.order_item_id
+       JOIN orders o ON o.id = oi.order_id
+       WHERE pt.pick_batch_id IN (${placeholders}) AND o.status != 'cancelled'
+       ORDER BY loc.sequence_number ASC, sk.sku_code ASC`
+    )
+    .bind(...batchIds)
     .all<PickListRow>();
   return rows.results;
 }
