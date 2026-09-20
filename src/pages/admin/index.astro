@@ -13,6 +13,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
   <div class="row" style="flex-wrap: wrap;">
     <button class="btn btn-primary" id="import-btn" style="width: auto;">Import from Amazon</button>
     <button class="btn" id="retry-btn" style="width: auto;">Assign orders to pick list</button>
+    <button class="btn btn-ghost" id="sync-now-btn" style="width: auto;">Sync with Amazon now</button>
     <div class="row" style="width: auto; margin-left: auto; align-items: center; gap: 10px;">
       <label class="row" style="width: auto; align-items: center; gap: 6px; font-size: 0.82rem; color: var(--muted);">
         <input type="checkbox" id="reset-include-shipped" style="width: 18px; height: 18px;" />
@@ -329,6 +330,42 @@ if (redirectTo) return Astro.redirect(redirectTo);
         } else {
           showResult(`Assigned all ${result.succeeded} order${result.succeeded === 1 ? '' : 's'} to a pick list — packers will see it automatically.`);
         }
+        await loadOrders();
+      } catch (err) {
+        showResult((err as Error).message, 'danger');
+      }
+    });
+
+    interface SyncJobResult {
+      warehouseId: string;
+      imported: number;
+      skipped: number;
+      newSkusCreated: number;
+      statusChecked: number;
+      statusShipped: number;
+      statusCancelled: number;
+      retried: number;
+      retrySucceeded: number;
+    }
+
+    document.getElementById('sync-now-btn')?.addEventListener('click', async (e) => {
+      const btn = e.currentTarget as HTMLButtonElement;
+      try {
+        const { results } = await withLoading(btn, 'Syncing…', () => api('/api/admin/sync-now', {}));
+        const totals = (results as SyncJobResult[]).reduce(
+          (acc, r) => ({
+            imported: acc.imported + r.imported,
+            statusShipped: acc.statusShipped + r.statusShipped,
+            statusCancelled: acc.statusCancelled + r.statusCancelled,
+            retrySucceeded: acc.retrySucceeded + r.retrySucceeded
+          }),
+          { imported: 0, statusShipped: 0, statusCancelled: 0, retrySucceeded: 0 }
+        );
+        showResult(
+          `Synced with Amazon: ${totals.imported} new order${totals.imported === 1 ? '' : 's'} imported, ` +
+            `${totals.statusShipped} marked shipped, ${totals.statusCancelled} cancelled, ` +
+            `${totals.retrySucceeded} blocked order${totals.retrySucceeded === 1 ? '' : 's'} resolved.`
+        );
         await loadOrders();
       } catch (err) {
         showResult((err as Error).message, 'danger');

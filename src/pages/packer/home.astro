@@ -18,7 +18,7 @@ import TopBar from '../../components/TopBar.astro';
   </div>
 
   <script>
-    import { escapeHtml } from '../../lib/ui';
+    import { escapeHtml, withLoading } from '../../lib/ui';
 
     interface MyBatch {
       batchId: string;
@@ -151,7 +151,11 @@ import TopBar from '../../components/TopBar.astro';
         </div>
 
         <div class="stack" style="gap: 10px; margin-top: 8px;">
-          <span class="eyebrow">Upcoming — pulled, not yet assigned</span>
+          <div class="row" style="justify-content: space-between; align-items: center;">
+            <span class="eyebrow">Upcoming — pulled, not yet assigned</span>
+            <button class="btn btn-ghost" id="sync-now-btn" style="width: auto; min-height: 32px; padding: 0 10px; font-size: 0.78rem;">Sync now</button>
+          </div>
+          <div id="sync-result"></div>
           ${
             // Not always a real stock shortage — this order just hasn't been
             // retried yet. The sync job now retries automatically every
@@ -207,6 +211,40 @@ import TopBar from '../../components/TopBar.astro';
               : `<p>Nothing packed yet today.</p>`
           }
         </div>`;
+
+      // The stock-arriving retry already runs automatically on receiving
+      // (retryBlockedOrdersForSku) and the full pull+status+retry cycle runs
+      // on a cron every ~5min, but only during warehouse hours (8:30am-2:30pm
+      // IST — see wrangler.jsonc) to stay under the account's cron trigger
+      // limit. Outside that window (or if something on Amazon's side just
+      // needs checking right now) this is the manual escape hatch, so a
+      // packer doesn't have to go find an admin or wait for the next tick.
+      document.getElementById('sync-now-btn')?.addEventListener('click', async (e) => {
+        const btn = e.currentTarget as HTMLButtonElement;
+        try {
+          const { results } = await withLoading(btn, 'Syncing…', () => api('/api/picker/sync-now', {}));
+          const totals = (results as Array<{ imported: number; statusShipped: number; statusCancelled: number; retrySucceeded: number }>).reduce(
+            (acc, r) => ({
+              imported: acc.imported + r.imported,
+              statusShipped: acc.statusShipped + r.statusShipped,
+              statusCancelled: acc.statusCancelled + r.statusCancelled,
+              retrySucceeded: acc.retrySucceeded + r.retrySucceeded
+            }),
+            { imported: 0, statusShipped: 0, statusCancelled: 0, retrySucceeded: 0 }
+          );
+          // load() rebuilds #app (and with it #sync-result) via render(), so
+          // the message has to be set on the *new* element afterward — set
+          // before the await, it would just get wiped out by that rebuild.
+          await load();
+          const resultEl = document.getElementById('sync-result');
+          if (resultEl) {
+            resultEl.innerHTML = `<div class="banner banner-success" style="margin-top: 6px; padding: 6px 10px; font-size: 0.78rem;">Synced — ${totals.imported} new, ${totals.statusShipped} shipped, ${totals.statusCancelled} cancelled, ${totals.retrySucceeded} unblocked.</div>`;
+          }
+        } catch (err) {
+          const resultEl = document.getElementById('sync-result');
+          if (resultEl) resultEl.innerHTML = `<div class="banner banner-danger" style="margin-top: 6px; padding: 6px 10px; font-size: 0.78rem;">${(err as Error).message}</div>`;
+        }
+      });
     }
 
     boot();

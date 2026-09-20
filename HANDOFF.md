@@ -1373,6 +1373,35 @@ assembled fully automatically in the background exactly as before.
   (13 orders · 5 SKU lines · 27 units), activated, started picking, picked one line, reloaded — landed
   straight back in the working list with no gate, as intended.
 
+## Recently done (2026-09-20, a thirtieth pass) — MSKU rename, and a manual Amazon sync button
+
+**EFNSKU renamed to MSKU** ("Master SKU") before it saw any real production use — user didn't like
+the original name. Full rename: DB column (`migrations/0018_rename_efnsku_to_msku.sql`), every
+function/type/UI string/CSS class, and the code prefix (`EFN-` → `MSKU-`). No data migration needed
+since nothing in production had the field set yet.
+
+**Real incident that prompted this**: the user reported orders showing as unshipped in the app hours
+after being physically shipped. Investigated live against the real Amazon account (not guessing) —
+turned out **not** a sync bug: Amazon's own OrderStatus API genuinely still said "Unshipped" for the
+affected orders, and no shipment/AWB record existed for them anywhere in this system either. The
+actual gap: those two orders were packed but the Ship step was never completed for them by whoever
+handled them physically that morning — a workflow slip, not a software bug. Confirmed the automatic
+sync logic itself is correct and current.
+
+That said, the *automatic* sync only runs on a cron scoped to warehouse hours (8:30am-2:30pm IST,
+see wrangler.jsonc) to stay under the account's cron-trigger limit — so anything that changes on
+Amazon's side outside that window sits unsynced until the window reopens next day. Added a manual
+escape hatch for exactly that: **`api/admin/sync-now.ts`** and **`api/picker/sync-now.ts`**, both
+thin wrappers around the existing `runAmazonSyncJob` (the same pull+status+retry cycle the cron
+runs) — "Sync with Amazon now" button on `/admin`, "Sync now" button on `/packer/home` next to the
+"Upcoming" section. Neither replaces the cron; both just force a check on demand. **Verified live
+against the real Amazon account**: the admin button pulled in 14 new orders, marked 29 shipped, and
+cancelled 1 — confirming both that the button works end-to-end and that local dev's data really had
+drifted stale exactly as the user described. Also fixed a real, if minor, bug found while testing:
+a `title` attribute on the new admin button was overriding its accessible name in the a11y tree
+(the visible label "Sync with Amazon now" was invisible to `find`/screen readers, which instead saw
+the tooltip text) — removed the `title`, kept the label self-explanatory instead.
+
 ## Next steps — a prioritized plan
 
 Rewritten 2026-09-20 (twenty-one passes across two days — see "Recently done" entries above for the
