@@ -2,6 +2,7 @@ import { fetchUnfulfilledOrders } from './amazon';
 import { importAmazonOrders, retryBlockedOrders } from './orders';
 import { syncOrderStatuses } from './amazon-sync';
 import { syncReturnsReport } from './returns';
+import { backfillTrackingIds } from './shipping';
 import { resolveAmazonCredentials, NOT_CONNECTED } from './org-accounts';
 
 export interface SyncJobResult {
@@ -17,6 +18,8 @@ export interface SyncJobResult {
   shortOrders: Array<{ orderId: string; reason: string }>;
   returnsImported: number;
   returnsStatus: string;
+  trackingChecked: number;
+  trackingFound: number;
 }
 
 /**
@@ -117,6 +120,20 @@ export async function runAmazonSyncJob(db: D1Database, sinceHours = 24): Promise
         returnsStatus = 'error';
       }
 
+      // Same isolation again — an order still waiting on Amazon to assign
+      // its AWB is the normal case, not a failure, so this only ever costs
+      // one cron tick's worth of API calls, capped at 15 orders (see
+      // backfillTrackingIds in lib/shipping.ts).
+      let trackingChecked = 0;
+      let trackingFound = 0;
+      try {
+        const trackingResult = await backfillTrackingIds(db, wh.id, credentials);
+        trackingChecked = trackingResult.checked;
+        trackingFound = trackingResult.found;
+      } catch (err) {
+        console.error(`Tracking id backfill failed for warehouse ${wh.id}:`, err);
+      }
+
       results.push({
         warehouseId: wh.id,
         imported: importSummary.imported,
@@ -129,7 +146,9 @@ export async function runAmazonSyncJob(db: D1Database, sinceHours = 24): Promise
         retrySucceeded: retryResult.succeeded,
         shortOrders: retryResult.shortOrders,
         returnsImported,
-        returnsStatus
+        returnsStatus,
+        trackingChecked,
+        trackingFound
       });
     } catch (err) {
       console.error(`Amazon sync job failed for warehouse ${wh.id}:`, err);

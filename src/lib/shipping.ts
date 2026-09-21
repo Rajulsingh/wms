@@ -7,9 +7,11 @@ import {
   requestEasyShipDocuments,
   checkEasyShipFeed,
   checkEasyShipReport,
+  getScheduledPackage,
   type MfnShipmentRequest,
   type ShipFromAddress,
-  type HandoverSlot
+  type HandoverSlot,
+  type AmazonEnv
 } from './amazon';
 import { stampPackageIdentifier } from './label-stamp';
 import { resolveAmazonCredentialsForWarehouse, NOT_CONNECTED } from './org-accounts';
@@ -566,4 +568,58 @@ export async function scheduleEasyShipBulk(
   });
 
   return { outcomes, labelSplitOk };
+}
+
+/**
+ * Picks up the AWB for an order that's already scheduled ("waiting for
+ * pickup", label generated) but whose shipment never got a tracking id at
+ * schedule time — see getScheduledPackage in amazon.ts for why that
+ * regularly happens with Easy Ship. Runs as a step in the cron sync job
+ * (see sync-job.ts), same as order/returns sync, rather than its own cron
+ * trigger — the account's Workers Free plan caps those at 5 total. Capped
+ * at `limit` orders per tick so one warehouse with a big backlog can't
+ * starve the rest of that tick's time budget; whatever's left over just
+ * gets picked up on the next one.
+ */
+export async function backfillTrackingIds(db: D1Database, warehouseId: string, credentials: Partial<AmazonEnv> | undefined, limit = 15): Promise<{ checked: number; found: number }> {
+  const candidates = await db
+    .prepare(
+      `SELECT o.id AS orderId, o.external_order_id AS externalOrderId, s.id AS shipmentId
+       FROM orders o
+       JOIN packages p ON p.order_id = o.id
+       JOIN shipments s ON s.package_id = p.id
+       WHERE o.warehouse_id = ? AND o.source = 'amazon' AND o.status = 'ready_to_ship' AND s.tracking_id IS NULL
+       ORDER BY o.created_at ASC
+       LIMIT ?`
+    )
+    .bind(warehouseId, limit)
+    .all<{ orderId: string; externalOrderId: string; shipmentId: string }>();
+
+  let checked = 0;
+  let found = 0;
+  for (const row of candidates.results) {
+    checked++;
+    try {
+      const status = await getScheduledPackage(row.externalOrderId, credentials);
+      if (!status.trackingId) continue;
+
+      await db.prepare(`UPDATE shipments SET tracking_id = ? WHERE id = ?`).bind(status.trackingId, row.shipmentId).run();
+      try {
+        // Best-effort — awb_code is UNIQUE, and was seeded at schedule time
+        // with a packageId-fallback placeholder (see the trackingId ??
+        // packageId pattern earlier in this file); a collision here would
+        // mean Amazon reused an id in some unexpected way, not something
+        // worth failing the whole backfill over.
+        await db.prepare(`UPDATE awbs SET awb_code = ? WHERE shipment_id = ?`).bind(status.trackingId, row.shipmentId).run();
+      } catch (err) {
+        console.error(`backfillTrackingIds: could not update awbs.awb_code for shipment ${row.shipmentId}:`, err);
+      }
+      await logAudit(db, { userId: null, action: 'shipping.tracking_backfilled', entityType: 'order', entityId: row.orderId, metadata: { trackingId: status.trackingId } });
+      found++;
+    } catch (err) {
+      console.error(`backfillTrackingIds: getScheduledPackage failed for order ${row.orderId}:`, err);
+    }
+  }
+
+  return { checked, found };
 }

@@ -774,6 +774,32 @@ async function spApiFetch(env: AmazonEnv, path: string, init?: RequestInit): Pro
   });
 }
 
+export interface ScheduledPackageStatus {
+  packageStatus: string;
+  trackingId?: string;
+}
+
+/**
+ * Re-checks an already-scheduled Easy Ship package's current state — GET
+ * /easyShip/2022-03-23/package, confirmed against the SDK's own JSON model
+ * (amzn/selling-partner-api-models/models/easy-ship-model), not just prose
+ * docs, same "trust the model over the docs" approach as the bulk-scheduling
+ * comment below. Distinct from scheduleEasyShipPackage's own response above,
+ * which often comes back with no trackingDetails at all — confirmed live in
+ * this account, both real scheduled orders on file got no tracking id at
+ * schedule time. Amazon evidently assigns the actual AWB sometime after
+ * scheduling, not necessarily synchronously, so this is the reliable way to
+ * pick it up later for an order sitting in "waiting for pickup" with a label
+ * already generated. See backfillTrackingIds in lib/shipping.ts.
+ */
+export async function getScheduledPackage(amazonOrderId: string, credentials?: Partial<AmazonEnv>): Promise<ScheduledPackageStatus> {
+  const env = getEnv(credentials);
+  const res = await spApiFetch(env, `/easyShip/2022-03-23/package?marketplaceId=${encodeURIComponent(env.AMAZON_MARKETPLACE_ID)}&amazonOrderId=${encodeURIComponent(amazonOrderId)}`);
+  if (!res.ok) throw new Error(`EasyShip getScheduledPackage failed: ${res.status} ${await res.text()}`);
+  const data = (await res.json()) as { packageStatus?: string; trackingDetails?: { trackingId?: string } };
+  return { packageStatus: data.packageStatus ?? '', trackingId: data.trackingDetails?.trackingId };
+}
+
 /** Kicks off label/invoice retrieval — submits a POST_EASYSHIP_DOCUMENTS feed for this order. Returns the feed id to poll with `checkEasyShipFeed`. */
 export async function requestEasyShipDocuments(amazonOrderId: string, credentials?: Partial<AmazonEnv>): Promise<{ feedId: string }> {
   const env = getEnv(credentials);
