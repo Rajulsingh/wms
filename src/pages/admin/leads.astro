@@ -17,6 +17,8 @@ if (redirectTo) return Astro.redirect(redirectTo);
   </div>
 
   <script>
+    import { escapeHtml } from '../../lib/ui';
+
     const list = document.getElementById('leads-list') as HTMLDivElement;
 
     async function load() {
@@ -34,10 +36,10 @@ if (redirectTo) return Astro.redirect(redirectTo);
         row.innerHTML = `
           <div class="row" style="justify-content: space-between; align-items: flex-start;">
             <div>
-              <strong>${lead.name}</strong> — ${lead.email}
-              ${lead.company ? `<div>${lead.company}</div>` : ''}
-              ${lead.phone ? `<div>${lead.phone}</div>` : ''}
-              ${lead.message ? `<div style="color: var(--muted);">${lead.message}</div>` : ''}
+              <strong>${escapeHtml(lead.name)}</strong> — ${escapeHtml(lead.email)}
+              ${lead.company ? `<div>${escapeHtml(lead.company)}</div>` : ''}
+              ${lead.phone ? `<div>${escapeHtml(lead.phone)}</div>` : ''}
+              ${lead.message ? `<div style="color: var(--muted);">${escapeHtml(lead.message)}</div>` : ''}
               <div style="font-size: 0.8rem; color: var(--muted);">${new Date(lead.created_at).toLocaleString()}</div>
             </div>
             <select data-id="${lead.id}" class="lead-status" style="width: auto; min-height: auto; padding: 6px 10px;">

@@ -45,6 +45,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
   </div>
 
   <script>
+    import { escapeHtml } from '../../lib/ui';
     let warehouseId = '';
 
     async function api(path: string, body?: unknown, method?: string) {
@@ -81,10 +82,10 @@ if (redirectTo) return Astro.redirect(redirectTo);
     async function loadZones() {
       zones = await api(`/api/admin/zones?warehouseId=${warehouseId}`);
       const list = document.getElementById('zone-list')!;
-      list.innerHTML = zones.length ? zones.map((z) => `<div class="item-row"><span class="name">${z.name}</span></div>`).join('') : '<p>No zones yet.</p>';
+      list.innerHTML = zones.length ? zones.map((z) => `<div class="item-row"><span class="name">${escapeHtml(z.name)}</span></div>`).join('') : '<p>No zones yet.</p>';
 
       const zoneSelect = document.getElementById('locZone') as unknown as HTMLSelectElement;
-      zoneSelect.innerHTML = `<option value="">— No zone —</option>` + zones.map((z) => `<option value="${z.id}">${z.name}</option>`).join('');
+      zoneSelect.innerHTML = `<option value="">— No zone —</option>` + zones.map((z) => `<option value="${z.id}">${escapeHtml(z.name)}</option>`).join('');
     }
 
     async function loadLocations() {
@@ -94,7 +95,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
         ? locations
             .map(
               (l) =>
-                `<div class="item-row"><span class="name">${l.zone_name ? l.zone_name + ' · ' : ''}${l.code}</span><span class="status-pill ${l.type === 'pickable' ? 'status-progress' : 'status-neutral'}">${l.type}</span></div>`
+                `<div class="item-row"><span class="name">${l.zone_name ? escapeHtml(l.zone_name) + ' · ' : ''}${escapeHtml(l.code)}</span><span class="status-pill ${l.type === 'pickable' ? 'status-progress' : 'status-neutral'}">${l.type}</span></div>`
             )
             .join('')
         : '<p>No locations yet.</p>';
@@ -108,7 +109,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
             .map(
               (s) => `
         <div class="item-row">
-          <span class="name">${s.code}</span>
+          <span class="name">${escapeHtml(s.code)}</span>
           <span class="status-pill ${s.active ? 'status-success' : 'status-neutral'}">${s.active ? 'active' : 'inactive'}</span>
           <button class="btn btn-ghost" style="width: auto; min-height: 36px;" data-id="${s.id}" data-active="${s.active}">${s.active ? 'Deactivate' : 'Reactivate'}</button>
         </div>`

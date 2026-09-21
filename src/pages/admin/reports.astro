@@ -41,6 +41,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
   </div>
 
   <script>
+    import { escapeHtml } from '../../lib/ui';
     interface StockRow {
       sku_id: string;
       sku_code: string;
@@ -82,7 +83,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
       el.innerHTML = `
         <div class="banner banner-warning">
           <strong>${lowStock.length} SKU${lowStock.length > 1 ? 's' : ''} at or below reorder point:</strong>
-          ${lowStock.map((r) => `${r.sku_code} (${r.available} left)`).join(', ')}
+          ${lowStock.map((r) => `${escapeHtml(r.sku_code)} (${r.available} left)`).join(', ')}
           — <a href="/admin/inbound">receive more stock</a>.
         </div>`;
     }
@@ -94,7 +95,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
             .map(
               (r) => `
         <tr data-sku-id="${r.sku_id}">
-          <td>${r.sku_code}<br /><span style="font-size: 0.75rem; color: var(--muted);">${r.sku_name}</span></td>
+          <td>${escapeHtml(r.sku_code)}<br /><span style="font-size: 0.75rem; color: var(--muted);">${escapeHtml(r.sku_name)}</span></td>
           <td>${r.available}${r.lowStock ? ' <span class="status-pill status-warning">low</span>' : ''}</td>
           <td>${r.reserved}</td>
           <td>${r.units_7d}</td>
@@ -123,7 +124,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
     function renderDailyRows(rows: DailyPick[]) {
       const tbody = document.getElementById('daily-rows')!;
       tbody.innerHTML = rows.length
-        ? rows.map((r) => `<tr><td>${r.pick_date}</td><td>${r.sku_code}</td><td>${r.units}</td></tr>`).join('')
+        ? rows.map((r) => `<tr><td>${r.pick_date}</td><td>${escapeHtml(r.sku_code)}</td><td>${r.units}</td></tr>`).join('')
         : '<tr><td colspan="3">No picks in the last 30 days.</td></tr>';
     }
 

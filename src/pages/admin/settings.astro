@@ -41,6 +41,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
   </div>
 
   <script>
+    import { escapeHtml } from '../../lib/ui';
     let warehouseId = '';
 
     async function api(path: string, body?: unknown) {
@@ -76,7 +77,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
       );
       const list = document.getElementById('box-list')!;
       list.innerHTML = boxes.length
-        ? boxes.map((b) => `<div class="item-row"><span class="name">${b.name}</span><span class="qty">${b.length}×${b.width}×${b.height} ${b.dimension_unit}</span></div>`).join('')
+        ? boxes.map((b) => `<div class="item-row"><span class="name">${escapeHtml(b.name)}</span><span class="qty">${b.length}×${b.width}×${b.height} ${escapeHtml(b.dimension_unit)}</span></div>`).join('')
         : '<p>No box sizes yet.</p>';
     }
 

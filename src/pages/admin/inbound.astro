@@ -62,6 +62,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
   </div>
 
   <script>
+    import { escapeHtml } from '../../lib/ui';
     interface SkuOption {
       id: string;
       sku_code: string;
@@ -202,8 +203,8 @@ if (redirectTo) return Astro.redirect(redirectTo);
         newSkuFields.style.display = 'none';
         previewEl.style.display = 'flex';
         previewEl.innerHTML = `
-          ${sku.image_url ? `<img class="thumb" src="${sku.image_url}" alt="" />` : '<div class="thumb"></div>'}
-          <span class="name">${sku.name}<br /><span style="font-size: 0.75rem; color: var(--muted);">${sku.sku_code} · ${priceLabel(sku.price)}${sku.msku ? ` · <strong>${sku.msku}</strong>` : ''}</span></span>
+          ${sku.image_url ? `<img class="thumb" src="${escapeHtml(sku.image_url)}" alt="" />` : '<div class="thumb"></div>'}
+          <span class="name">${escapeHtml(sku.name)}<br /><span style="font-size: 0.75rem; color: var(--muted);">${escapeHtml(sku.sku_code)} · ${priceLabel(sku.price)}${sku.msku ? ` · <strong>${escapeHtml(sku.msku)}</strong>` : ''}</span></span>
           <button class="btn btn-ghost change-sku" style="width: auto; min-height: 36px;">Change</button>`;
         previewEl.querySelector('.change-sku')?.addEventListener('click', showSearch);
         if (sku.msku) hideMskuField();
@@ -223,8 +224,8 @@ if (redirectTo) return Astro.redirect(redirectTo);
           .map(
             (s) => `
           <div class="item-row sku-result" data-sku-id="${s.id}" style="cursor: pointer;">
-            ${s.image_url ? `<img class="thumb" src="${s.image_url}" alt="" />` : '<div class="thumb"></div>'}
-            <span class="name">${s.name}<br /><span style="font-size: 0.75rem; color: var(--muted);">${s.sku_code} · ${priceLabel(s.price)}</span></span>
+            ${s.image_url ? `<img class="thumb" src="${escapeHtml(s.image_url)}" alt="" />` : '<div class="thumb"></div>'}
+            <span class="name">${escapeHtml(s.name)}<br /><span style="font-size: 0.75rem; color: var(--muted);">${escapeHtml(s.sku_code)} · ${priceLabel(s.price)}</span></span>
           </div>`
           )
           .join('');
@@ -290,8 +291,8 @@ if (redirectTo) return Astro.redirect(redirectTo);
             .map(
               (r) => `
         <tr>
-          <td>${r.sku_code}<br><span style="font-size: 0.75rem; color: var(--muted);">${r.name}</span></td>
-          <td>${r.asin ?? '—'}</td>
+          <td>${escapeHtml(r.sku_code)}<br><span style="font-size: 0.75rem; color: var(--muted);">${escapeHtml(r.name)}</span></td>
+          <td>${r.asin ? escapeHtml(r.asin) : '—'}</td>
           <td><span class="status-pill ${r.is_parent_asin ? 'status-neutral' : 'status-success'}">${r.is_parent_asin ? 'Inactive' : 'Active'}</span></td>
         </tr>`
             )
@@ -306,7 +307,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
             .map(
               (r) => `
         <div class="item-row">
-          <span class="name">${r.reference ?? '(no reference)'}<br/><span style="font-size:0.75rem; color: var(--muted);">${r.received_by_name ?? 'Unknown'} · ${r.created_at}</span></span>
+          <span class="name">${r.reference ? escapeHtml(r.reference) : '(no reference)'}<br/><span style="font-size:0.75rem; color: var(--muted);">${escapeHtml(r.received_by_name ?? 'Unknown')} · ${r.created_at}</span></span>
           <span class="qty">${r.line_count} lines / ${r.total_quantity} units</span>
         </div>`
             )

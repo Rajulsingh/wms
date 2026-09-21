@@ -39,6 +39,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
   </div>
 
   <script>
+    import { escapeHtml } from '../../lib/ui';
     interface UserRow {
       id: string;
       name: string;
@@ -85,7 +86,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
         .map(
           (u) => `
         <div class="item-row" data-user-id="${u.id}">
-          <span class="name">${u.name}</span>
+          <span class="name">${escapeHtml(u.name)}</span>
           <span class="status-pill ${u.role === 'admin' ? 'status-warning' : 'status-progress'}">${u.role}</span>
           <span class="status-pill ${u.active ? 'status-success' : 'status-neutral'}">${u.active ? 'active' : 'inactive'}</span>
           ${
