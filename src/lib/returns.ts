@@ -169,7 +169,17 @@ export async function syncReturnsReport(db: D1Database, warehouseId: string, cre
     return { imported: 0, status: result.status };
   }
 
-  const since = wh.amazon_returns_synced_through ? new Date(wh.amazon_returns_synced_through) : new Date(Date.now() - 48 * 60 * 60 * 1000);
+  // First sync ever for this warehouse (no watermark yet) looks back 30
+  // days, not just 48h — this is a brand new feature being turned on
+  // against an account that may already have open returns sitting in
+  // Seller Central from before it existed. 48h would be right for a
+  // steady-state gap (cron was down, nobody logged in), but wrong for a
+  // cold start: since the window only ever moves forward from here, a
+  // return older than the first run's lookback would never be caught by
+  // any later run either. 30 days matches Seller Central's own default
+  // "Manage Returns" filter, so a fresh sync sees everything a human
+  // checking that page would see right now.
+  const since = wh.amazon_returns_synced_through ? new Date(wh.amazon_returns_synced_through) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
   const { reportId } = await requestReturnsReport(since.toISOString(), new Date().toISOString(), credentials);
   await db.prepare(`UPDATE warehouses SET returns_report_pending_id = ?, returns_report_requested_at = datetime('now') WHERE id = ?`).bind(reportId, warehouseId).run();
   return { imported: 0, status: 'REQUESTED' };
