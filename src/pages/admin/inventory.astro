@@ -61,14 +61,20 @@ if (redirectTo) return Astro.redirect(redirectTo);
 
   <div class="card stack">
     <h2>Stock by location</h2>
-    <p>On-hand and reserved units per SKU per bin. Edit on-hand directly to correct a miscount or write off damage — this doesn't go through the reservation flow.</p>
+    <p>
+      On-hand and reserved units per SKU per bin. Edit on-hand directly to correct a miscount, write off damage or
+      spoilage found outside an active pick, or fix a receiving error — this doesn't go through the reservation
+      flow. A reason is required so a correction is explainable later, not a silent number change. Reserved units
+      can't be adjusted away — resolve the order or pick first. "Retire" removes a bin/SKU combination entirely
+      (discontinued, decommissioned, or created by mistake) rather than leaving a stale zero sitting in the list.
+    </p>
     <div class="table-scroll">
       <table id="inventory-table">
         <thead>
-          <tr><th>SKU</th><th>MSKU</th><th>Location</th><th>On hand</th><th>Reserved</th><th>Price</th><th></th></tr>
+          <tr><th>SKU</th><th>MSKU</th><th>Location</th><th>On hand</th><th>Reserved</th><th>Price</th><th>Reason for change</th><th></th><th></th></tr>
         </thead>
         <tbody id="inventory-rows">
-          <tr><td colspan="7">Loading…</td></tr>
+          <tr><td colspan="9">Loading…</td></tr>
         </tbody>
       </table>
     </div>
@@ -111,32 +117,62 @@ if (redirectTo) return Astro.redirect(redirectTo);
         ? rows
             .map(
               (r) => `
-        <tr data-inv-id="${r.id}" data-sku-id="${r.sku_id}">
-          <td>${r.sku_code}<br><span style="font-size: 0.75rem; color: var(--muted);">${r.sku_name}</span></td>
+        <tr data-inv-id="${r.id}" data-sku-id="${r.sku_id}" data-original-onhand="${r.quantity_on_hand}">
+          <td>${escapeHtml(r.sku_code)}<br><span style="font-size: 0.75rem; color: var(--muted);">${escapeHtml(r.sku_name)}</span></td>
           <td>${r.msku ? `<strong>${escapeHtml(r.msku)}</strong>` : '<span style="color: var(--muted);">—</span>'}</td>
-          <td>${r.zone_name ? r.zone_name + ' · ' : ''}${r.location_code}</td>
-          <td><input type="number" class="onhand-input" value="${r.quantity_on_hand}" min="0" style="width: 90px; min-height: 40px; padding: 6px 8px;" /></td>
+          <td>${r.zone_name ? escapeHtml(r.zone_name) + ' · ' : ''}${escapeHtml(r.location_code)}</td>
+          <td><input type="number" class="onhand-input" value="${r.quantity_on_hand}" min="${r.quantity_reserved}" style="width: 90px; min-height: 40px; padding: 6px 8px;" /></td>
           <td>${r.quantity_reserved}</td>
           <td><input type="number" class="price-input" value="${r.price ?? ''}" min="0" step="0.01" placeholder="—" style="width: 90px; min-height: 40px; padding: 6px 8px;" /></td>
+          <td><input type="text" class="reason-input" placeholder="Required if changing on-hand" style="width: 100%; min-width: 160px; min-height: 40px; padding: 6px 8px;" /></td>
           <td><button class="btn btn-ghost save-btn" style="width: auto; min-height: 36px;">Save</button></td>
+          <td><button class="btn btn-ghost retire-btn" style="width: auto; min-height: 36px; color: var(--danger);">Retire</button></td>
         </tr>`
             )
             .join('')
-        : '<tr><td colspan="7">No inventory yet — <a href="/admin/inbound">receive some stock</a> to get started.</td></tr>';
+        : '<tr><td colspan="9">No inventory yet — <a href="/admin/inbound">receive some stock</a> to get started.</td></tr>';
 
       tbody.querySelectorAll('tr[data-inv-id]').forEach((tr) => {
         const row = tr as HTMLTableRowElement;
         const invId = row.dataset.invId!;
         const skuId = row.dataset.skuId!;
-        row.querySelector('.save-btn')?.addEventListener('click', async () => {
+        const originalOnHand = Number(row.dataset.originalOnhand);
+
+        row.querySelector('.save-btn')?.addEventListener('click', async (e) => {
           const onHand = Number((row.querySelector('.onhand-input') as HTMLInputElement).value);
+          const reason = (row.querySelector('.reason-input') as HTMLInputElement).value.trim();
           const priceRaw = (row.querySelector('.price-input') as HTMLInputElement).value;
           const price = priceRaw === '' ? null : Number(priceRaw);
+          const quantityChanged = onHand !== originalOnHand;
+          if (quantityChanged && !reason) {
+            alert('A reason is required to change the on-hand count.');
+            return;
+          }
+          const btn = e.currentTarget as HTMLButtonElement;
           try {
-            await Promise.all([
-              api('/api/admin/inventory', { inventoryId: invId, quantityOnHand: onHand }, 'PATCH'),
-              api('/api/admin/skus', { skuId, price, warehouseId }, 'PATCH')
-            ]);
+            await withLoading(btn, 'Saving…', () =>
+              Promise.all([
+                quantityChanged ? api('/api/admin/inventory', { inventoryId: invId, quantityOnHand: onHand, reason }, 'PATCH') : Promise.resolve(),
+                api('/api/admin/skus', { skuId, price, warehouseId }, 'PATCH')
+              ])
+            );
+            if (quantityChanged) await loadInventory();
+          } catch (err) {
+            alert((err as Error).message);
+          }
+        });
+
+        row.querySelector('.retire-btn')?.addEventListener('click', async (e) => {
+          const btn = e.currentTarget as HTMLButtonElement;
+          const ok = await confirmDangerousAction({
+            title: 'Retire this stock line?',
+            message: 'Removes this SKU/location combination from inventory entirely — it stops showing here and in receiving\'s location picker. Only allowed when nothing is reserved against it. This does not delete the SKU itself.',
+            continueLabel: 'Retire'
+          });
+          if (!ok) return;
+          try {
+            await withLoading(btn, 'Retiring…', () => api('/api/admin/inventory', { inventoryId: invId }, 'DELETE'));
+            await loadInventory();
           } catch (err) {
             alert((err as Error).message);
           }
