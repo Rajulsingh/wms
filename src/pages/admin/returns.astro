@@ -19,6 +19,8 @@ if (redirectTo) return Astro.redirect(redirectTo);
       id: string;
       externalOrderId: string;
       amazonRmaId: string | null;
+      merchantSku: string | null;
+      asin: string | null;
       itemName: string | null;
       returnReason: string | null;
       trackingId: string | null;
@@ -31,6 +33,14 @@ if (redirectTo) return Astro.redirect(redirectTo);
       productImageKey: string | null;
     }
 
+    interface ReceiptRow {
+      receiptDate: string;
+      expectedCount: number;
+      receivedCount: number;
+      confirmedAt: string;
+      confirmedByName: string | null;
+    }
+
     const STATUS_LABELS: Record<string, string> = {
       expected: 'Expected',
       ready_to_repack: 'Ready to repack',
@@ -41,8 +51,17 @@ if (redirectTo) return Astro.redirect(redirectTo);
 
     const app = document.getElementById('app')!;
     let warehouseId = '';
-    let statusFilter = 'safe_to_claim';
-    let rows: ReturnRow[] = [];
+    // Two views on the same underlying data — what Amazon says (synced
+    // as-is, every status, every field their report gave us) vs what the
+    // floor has actually reported back (headcount confirmations +
+    // inspection outcomes). Conflating them into one list was the original
+    // version of this page; splitting them is what the seller actually
+    // asked for.
+    let activeTab: 'amazon' | 'packer' = 'amazon';
+    let amazonRows: ReturnRow[] = [];
+    let packerStatusFilter = 'safe_to_claim';
+    let packerRows: ReturnRow[] = [];
+    let receipts: ReceiptRow[] = [];
     let otp: { otp: string; setAt: string } | null = null;
 
     async function api(path: string, body?: unknown, method?: string) {
@@ -63,13 +82,23 @@ if (redirectTo) return Astro.redirect(redirectTo);
         return;
       }
       warehouseId = me.user.warehouseId;
-      await Promise.all([loadReturns(), loadOtp()]);
+      await Promise.all([loadAmazonRows(), loadPackerRows(), loadReceipts(), loadOtp()]);
       render();
     }
 
-    async function loadReturns() {
-      const data = await api(`/api/admin/returns?warehouseId=${warehouseId}&status=${statusFilter}`);
-      rows = data.returns ?? [];
+    async function loadAmazonRows() {
+      const data = await api(`/api/admin/returns?warehouseId=${warehouseId}`);
+      amazonRows = data.returns ?? [];
+    }
+
+    async function loadPackerRows() {
+      const data = await api(`/api/admin/returns?warehouseId=${warehouseId}&status=${packerStatusFilter}`);
+      packerRows = data.returns ?? [];
+    }
+
+    async function loadReceipts() {
+      const data = await api(`/api/admin/returns/receipts?warehouseId=${warehouseId}`);
+      receipts = data.receipts ?? [];
     }
 
     async function loadOtp() {
@@ -91,33 +120,110 @@ if (redirectTo) return Astro.redirect(redirectTo);
           </div>
         </div>
 
-        <div class="row" style="justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 18px;">
-          <span class="eyebrow">Returns</span>
+        <div class="row" style="gap: 8px; margin-top: 18px;">
+          <button class="pill tab-pill ${activeTab === 'amazon' ? 'active' : ''}" id="tab-amazon" style="border: none; cursor: pointer;">From Amazon (${amazonRows.length})</button>
+          <button class="pill tab-pill ${activeTab === 'packer' ? 'active' : ''}" id="tab-packer" style="border: none; cursor: pointer;">Reported by packers</button>
+        </div>
+
+        <div style="margin-top: 14px;" data-tab-content></div>`;
+
+      document.getElementById('save-otp')?.addEventListener('click', (e) => saveOtp(e.currentTarget as HTMLButtonElement));
+      document.getElementById('tab-amazon')?.addEventListener('click', () => {
+        activeTab = 'amazon';
+        render();
+      });
+      document.getElementById('tab-packer')?.addEventListener('click', () => {
+        activeTab = 'packer';
+        render();
+      });
+
+      const content = document.querySelector('[data-tab-content]') as HTMLElement;
+      if (activeTab === 'amazon') renderAmazonTab(content);
+      else renderPackerTab(content);
+    }
+
+    // The raw sync — every return Amazon has told us about, whatever its
+    // status, with the fields their report actually gives (order id, MSKU/
+    // ASIN, reason, request date, tracking id). A dense table rather than
+    // cards, since this is a reference/lookup list, not an action queue.
+    function renderAmazonTab(container: HTMLElement) {
+      container.innerHTML = amazonRows.length
+        ? `<div class="table-scroll">
+             <table>
+               <thead><tr><th>Order ID</th><th>Item</th><th>MSKU / ASIN</th><th>Reason</th><th>Request date</th><th>Tracking</th><th>Status</th></tr></thead>
+               <tbody>${amazonRows.map((r) => amazonRowHtml(r)).join('')}</tbody>
+             </table>
+           </div>`
+        : `<p>No returns synced from Amazon yet.</p>`;
+    }
+
+    function amazonRowHtml(r: ReturnRow): string {
+      return `<tr>
+        <td style="font-weight: 700;">${escapeHtml(r.externalOrderId)}</td>
+        <td>${escapeHtml(r.itemName || r.skuName || '—')}</td>
+        <td style="font-size: 0.82rem; color: var(--muted);">${escapeHtml(r.merchantSku || r.asin || '—')}</td>
+        <td>${escapeHtml(r.returnReason || '—')}</td>
+        <td>${r.returnRequestDate ? escapeHtml(r.returnRequestDate.slice(0, 10)) : '—'}</td>
+        <td style="font-size: 0.82rem; color: var(--muted);">${escapeHtml(r.trackingId || '—')}</td>
+        <td><span class="pill">${STATUS_LABELS[r.status] ?? r.status}</span></td>
+      </tr>`;
+    }
+
+    // What the floor has actually reported: daily headcount confirmations
+    // (see confirmTodayReceipt in lib/returns.ts) plus the inspection
+    // outcome queue, still with the claim-filing action for safe_to_claim.
+    function renderPackerTab(container: HTMLElement) {
+      container.innerHTML = `
+        <span class="eyebrow">Daily receiving confirmations</span>
+        ${
+          receipts.length
+            ? `<div class="table-scroll" style="margin-top: 8px;">
+                 <table>
+                   <thead><tr><th>Date</th><th>Expected</th><th>Received</th><th>Confirmed by</th><th>Confirmed at</th></tr></thead>
+                   <tbody>${receipts.map((r) => receiptRowHtml(r)).join('')}</tbody>
+                 </table>
+               </div>`
+            : `<p style="margin: 8px 0 0;">No receiving counts confirmed yet.</p>`
+        }
+
+        <div class="row" style="justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 22px;">
+          <span class="eyebrow">Inspection outcomes</span>
           <select id="status-filter" style="max-width: 220px;">
             ${Object.entries(STATUS_LABELS)
-              .map(([value, label]) => `<option value="${value}" ${value === statusFilter ? 'selected' : ''}>${label}</option>`)
+              .filter(([value]) => value !== 'expected')
+              .map(([value, label]) => `<option value="${value}" ${value === packerStatusFilter ? 'selected' : ''}>${label}</option>`)
               .join('')}
           </select>
         </div>
+        <div class="stack" style="gap: 10px; margin-top: 10px;" data-packer-list></div>`;
 
-        <div class="stack" style="gap: 10px; margin-top: 10px;">
-          ${rows.length ? rows.map((r) => rowHtml(r)).join('') : '<p>No returns in this status.</p>'}
-        </div>`;
+      const list = container.querySelector('[data-packer-list]') as HTMLElement;
+      list.innerHTML = packerRows.length ? packerRows.map((r) => packerRowHtml(r)).join('') : '<p>No returns in this status.</p>';
 
-      document.getElementById('save-otp')?.addEventListener('click', (e) => saveOtp(e.currentTarget as HTMLButtonElement));
-      document.getElementById('status-filter')?.addEventListener('change', async (e) => {
-        statusFilter = (e.currentTarget as HTMLSelectElement).value;
-        await loadReturns();
+      container.querySelector('#status-filter')?.addEventListener('change', async (e) => {
+        packerStatusFilter = (e.currentTarget as HTMLSelectElement).value;
+        await loadPackerRows();
         render();
       });
-      rows.forEach((r) => {
+      packerRows.forEach((r) => {
         if (r.status === 'safe_to_claim') {
-          document.getElementById(`file-claim-${r.id}`)?.addEventListener('click', (e) => fileClaim(r, e.currentTarget as HTMLButtonElement));
+          container.querySelector(`#file-claim-${r.id}`)?.addEventListener('click', (e) => fileClaim(r, e.currentTarget as HTMLButtonElement));
         }
       });
     }
 
-    function rowHtml(r: ReturnRow): string {
+    function receiptRowHtml(r: ReceiptRow): string {
+      const short = r.receivedCount < r.expectedCount;
+      return `<tr>
+        <td>${escapeHtml(r.receiptDate)}</td>
+        <td>${r.expectedCount}</td>
+        <td style="${short ? 'color: var(--warning-fg); font-weight: 700;' : ''}">${r.receivedCount}</td>
+        <td>${escapeHtml(r.confirmedByName || '—')}</td>
+        <td style="font-size: 0.82rem; color: var(--muted);">${new Date(r.confirmedAt).toLocaleString(undefined, { day: '2-digit', month: 'short', hour: 'numeric', minute: '2-digit' })}</td>
+      </tr>`;
+    }
+
+    function packerRowHtml(r: ReturnRow): string {
       return `<div class="card row" style="gap: 12px; align-items: flex-start; flex-wrap: wrap;">
         ${r.imageUrl ? `<img class="thumb" src="${r.imageUrl}" alt="" />` : '<div class="thumb"></div>'}
         <div class="stack" style="gap: 2px; flex: 1; min-width: 180px;">
@@ -151,7 +257,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
     async function fileClaim(r: ReturnRow, btn: HTMLButtonElement) {
       await withLoading(btn, 'Saving…', async () => {
         await api('/api/admin/returns', { returnId: r.id }, 'PATCH');
-        await loadReturns();
+        await loadPackerRows();
         render();
       });
     }

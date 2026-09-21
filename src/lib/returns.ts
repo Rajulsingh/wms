@@ -68,13 +68,80 @@ export async function findReturnByScan(db: D1Database, warehouseId: string, code
     .first<ReturnRow>();
 }
 
+export interface ReturnReceipt {
+  expectedCount: number;
+  receivedCount: number;
+  confirmedAt: string;
+}
+
+export async function getTodayReceipt(db: D1Database, warehouseId: string): Promise<ReturnReceipt | null> {
+  const row = await db
+    .prepare(`SELECT expected_count AS expectedCount, received_count AS receivedCount, confirmed_at AS confirmedAt FROM return_receipts WHERE warehouse_id = ? AND receipt_date = ?`)
+    .bind(warehouseId, istDateString())
+    .first<ReturnReceipt>();
+  return row ?? null;
+}
+
+/**
+ * The packer's headcount reconciliation, separate from inspecting any one
+ * return — see migration 0031. `expectedCount` is never taken from the
+ * client: it's the same live count `getExpectedReturns` shows right before
+ * this is called, computed here again so it can't be spoofed to make a
+ * shortfall look clean. `receivedCount` is the only real input — whatever
+ * the packer actually counted coming off the courier.
+ */
+export async function confirmTodayReceipt(db: D1Database, warehouseId: string, userId: string, receivedCount: number): Promise<ReturnReceipt> {
+  if (!Number.isFinite(receivedCount) || receivedCount < 0) throw new Error('Received count must be a non-negative number');
+  const expected = await getExpectedReturns(db, warehouseId);
+  const expectedCount = expected.length;
+  const receiptDate = istDateString();
+
+  await db
+    .prepare(
+      `INSERT INTO return_receipts (warehouse_id, receipt_date, expected_count, received_count, confirmed_by, confirmed_at) VALUES (?, ?, ?, ?, ?, datetime('now'))
+       ON CONFLICT (warehouse_id, receipt_date) DO UPDATE SET expected_count = excluded.expected_count, received_count = excluded.received_count, confirmed_by = excluded.confirmed_by, confirmed_at = datetime('now')`
+    )
+    .bind(warehouseId, receiptDate, expectedCount, receivedCount, userId)
+    .run();
+  await logAudit(db, { userId, action: 'return.receipt_confirmed', entityType: 'warehouse', entityId: warehouseId, metadata: { expectedCount, receivedCount } });
+
+  const confirmed = await getTodayReceipt(db, warehouseId);
+  return confirmed!;
+}
+
+export async function hasConfirmedReceiptToday(db: D1Database, warehouseId: string): Promise<boolean> {
+  return (await getTodayReceipt(db, warehouseId)) !== null;
+}
+
+export interface ReturnReceiptHistoryRow extends ReturnReceipt {
+  receiptDate: string;
+  confirmedByName: string | null;
+}
+
+/** Admin-facing history of the packer's daily headcount confirmations — the "as reported by packers" side of the Returns page, alongside the inspection queue. */
+export async function listRecentReceipts(db: D1Database, warehouseId: string, limit = 14): Promise<ReturnReceiptHistoryRow[]> {
+  const rows = await db
+    .prepare(
+      `SELECT rr.receipt_date AS receiptDate, rr.expected_count AS expectedCount, rr.received_count AS receivedCount, rr.confirmed_at AS confirmedAt, u.name AS confirmedByName
+       FROM return_receipts rr LEFT JOIN users u ON u.id = rr.confirmed_by
+       WHERE rr.warehouse_id = ? ORDER BY rr.receipt_date DESC LIMIT ?`
+    )
+    .bind(warehouseId, limit)
+    .all<ReturnReceiptHistoryRow>();
+  return rows.results;
+}
+
 const INSPECTION_STATUSES = ['ready_to_repack', 'unsellable', 'safe_to_claim'] as const;
 export type InspectionStatus = (typeof INSPECTION_STATUSES)[number];
 
 /**
- * Records the packer's inspection outcome. `safe_to_claim` requires both
- * images (label + product) — that's what lets the admin actually file the
- * SAFE-T claim afterward; the other two outcomes need neither.
+ * Records the packer's inspection outcome. Requires today's receiving
+ * headcount to already be confirmed (see confirmTodayReceipt) — inspecting
+ * individual returns before that reconciliation happens is exactly the
+ * "quietly missing three of them" gap the headcount step exists to catch.
+ * `safe_to_claim` requires both images (label + product) — that's what lets
+ * the admin actually file the SAFE-T claim afterward; the other two
+ * outcomes need neither.
  */
 export async function recordReturnInspection(
   db: D1Database,
@@ -86,6 +153,11 @@ export async function recordReturnInspection(
   if (!INSPECTION_STATUSES.includes(status)) throw new Error(`Invalid inspection status: ${status}`);
   if (status === 'safe_to_claim' && (!images.labelImageKey || !images.productImageKey)) {
     throw new Error('Safe-to-claim requires both a label photo and a product photo');
+  }
+  const row = await db.prepare(`SELECT warehouse_id AS warehouseId FROM returns WHERE id = ?`).bind(returnId).first<{ warehouseId: string }>();
+  if (!row) throw new Error('Return not found');
+  if (!(await hasConfirmedReceiptToday(db, row.warehouseId))) {
+    throw new Error("Confirm how many returns you received today before inspecting — see the count above the OTP.");
   }
   await db
     .prepare(

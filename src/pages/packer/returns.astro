@@ -4,7 +4,7 @@ import TopBar from '../../components/TopBar.astro';
 import PackerSidebar from '../../components/PackerSidebar.astro';
 import { getDb } from '../../lib/db';
 import { getCurrentUser, toClientUser } from '../../lib/auth';
-import { getExpectedReturns, getTodayOtp } from '../../lib/returns';
+import { getExpectedReturns, getTodayOtp, getTodayReceipt } from '../../lib/returns';
 
 const db = getDb();
 const user = await getCurrentUser(Astro, db);
@@ -13,7 +13,11 @@ const serverUser = toClientUser(user);
 
 const initialData =
   user.role === 'packer' && user.warehouse_id
-    ? { expected: await getExpectedReturns(db, user.warehouse_id), otp: await getTodayOtp(db, user.warehouse_id) }
+    ? {
+        expected: await getExpectedReturns(db, user.warehouse_id),
+        otp: await getTodayOtp(db, user.warehouse_id),
+        receipt: await getTodayReceipt(db, user.warehouse_id)
+      }
     : null;
 ---
 
@@ -57,9 +61,17 @@ const initialData =
       customerName: string | null;
     }
 
+    interface Receipt {
+      expectedCount: number;
+      receivedCount: number;
+      confirmedAt: string;
+    }
+
     const app = document.getElementById('app')!;
     let expected: ReturnRow[] = [];
     let otp: { otp: string; setAt: string } | null = null;
+    let receipt: Receipt | null = null;
+    let editingReceipt = false;
     let scanning = false;
     let active: ReturnRow | null = null; // the return currently being inspected
     let flash: { kind: 'success' | 'danger'; message: string } | null = null;
@@ -85,6 +97,7 @@ const initialData =
       if (initial) {
         expected = initial.expected ?? [];
         otp = initial.otp ?? null;
+        receipt = initial.receipt ?? null;
       } else {
         await refresh();
       }
@@ -101,6 +114,7 @@ const initialData =
         const data = await api(`/api/packer/returns`);
         expected = data.expected ?? [];
         otp = data.otp ?? null;
+        receipt = data.receipt ?? null;
       } catch {
         // Transient — keep whatever we already had.
       }
@@ -125,10 +139,23 @@ const initialData =
       return renderQueue();
     }
 
+    // The sequence is deliberate, per how the floor actually works: know the
+    // headcount before asking for the OTP (so you can sanity-check what the
+    // courier hands over against what Amazon expects), get the OTP, confirm
+    // what actually arrived, and only then does inspecting/updating any one
+    // return become available — see hasConfirmedReceiptToday in
+    // lib/returns.ts, which enforces this server-side too, not just here.
     function renderQueue() {
+      const confirmed = !!receipt;
       app.innerHTML = `
         ${flashHtml()}
-        <div class="card stack" style="gap: 10px;">
+        <div class="card stack" style="gap: 8px;">
+          <span class="eyebrow">Expected returns today</span>
+          <p style="margin: 0; font-size: 1.3rem; font-weight: 800;">${expected.length}</p>
+          <div class="stack" style="gap: 10px; margin-top: 4px;" data-expected-list></div>
+        </div>
+
+        <div class="card stack" style="gap: 10px; margin-top: 14px;">
           <span class="eyebrow">Today's return OTP</span>
           ${
             otp
@@ -140,27 +167,103 @@ const initialData =
           }
         </div>
 
-        <div class="row" style="justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 14px;">
-          <span class="pill">${expected.length} return${expected.length === 1 ? '' : 's'} to inspect</span>
-          <button class="btn btn-primary" id="start-scan" style="width: auto;">Scan a return</button>
-        </div>
-        <div id="scan-area"></div>
+        <div class="card stack" style="gap: 10px; margin-top: 14px;" data-receipt></div>
 
-        <div class="stack" style="gap: 10px; margin-top: 16px;">
-          ${
-            expected.length
-              ? expected.map((r) => queueRowHtml(r)).join('')
-              : `<p>No returns waiting to be inspected.</p>`
-          }
-        </div>`;
+        ${
+          confirmed
+            ? `<div class="row" style="justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 18px;">
+                 <span class="eyebrow">Inspect &amp; update status</span>
+                 <button class="btn btn-primary" id="start-scan" style="width: auto;">Scan a return</button>
+               </div>
+               <div id="scan-area"></div>
+               <div class="stack" style="gap: 10px; margin-top: 10px;">
+                 ${expected.length ? expected.map((r) => queueRowHtml(r)).join('') : `<p>No returns waiting to be inspected.</p>`}
+               </div>`
+            : `<div class="banner banner-warning" style="margin-top: 18px;">Confirm how many returns you received above to unlock inspecting them.</div>`
+        }`;
 
-      document.getElementById('start-scan')?.addEventListener('click', beginScanning);
-      expected.forEach((r) => {
-        document.getElementById(`open-${r.id}`)?.addEventListener('click', () => {
-          active = r;
-          flash = null;
-          render();
+      renderExpectedList();
+      renderReceiptCard();
+
+      if (confirmed) {
+        document.getElementById('start-scan')?.addEventListener('click', beginScanning);
+        expected.forEach((r) => {
+          document.getElementById(`open-${r.id}`)?.addEventListener('click', () => {
+            active = r;
+            flash = null;
+            render();
+          });
         });
+      }
+    }
+
+    // Read-only — no click handlers. This list is here so a packer knows
+    // what to expect *before* asking for the OTP, not as another way into
+    // inspecting (that only opens up after the receiving count is
+    // confirmed, below).
+    function renderExpectedList() {
+      const container = document.querySelector('[data-expected-list]') as HTMLElement | null;
+      if (!container) return;
+      container.innerHTML = expected.length
+        ? expected.map((r) => expectedRowHtml(r)).join('')
+        : `<p style="margin: 0; font-size: 0.85rem; color: var(--muted);">Nothing expected today.</p>`;
+    }
+
+    function expectedRowHtml(r: ReturnRow): string {
+      return `<div class="item-row">
+        ${r.imageUrl ? `<img class="thumb" src="${r.imageUrl}" alt="" />` : '<div class="thumb"></div>'}
+        <div class="stack" style="gap: 2px; flex: 1; min-width: 0;">
+          <span style="font-weight: 700;">${escapeHtml(r.itemName || r.skuName || r.merchantSku || 'Unknown item')}</span>
+          <span style="font-size: 0.78rem; color: var(--muted);">${escapeHtml(r.externalOrderId)} · ${escapeHtml(r.returnReason || 'No reason given')}</span>
+          ${r.trackingId ? `<span style="font-size: 0.75rem; color: var(--muted);">AWB ${escapeHtml(r.trackingId)}</span>` : ''}
+        </div>
+      </div>`;
+    }
+
+    function renderReceiptCard() {
+      const container = document.querySelector('[data-receipt]') as HTMLElement | null;
+      if (!container) return;
+
+      if (receipt && !editingReceipt) {
+        const time = new Date(receipt.confirmedAt).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+        const short = receipt.receivedCount < receipt.expectedCount;
+        container.innerHTML = `
+          <span class="eyebrow">Returns received today</span>
+          <div class="row" style="align-items: baseline; gap: 10px;">
+            <span style="font-size: 1.3rem; font-weight: 800;">${receipt.receivedCount} of ${receipt.expectedCount}</span>
+            ${short ? `<span class="status-pill status-warning">${receipt.expectedCount - receipt.receivedCount} short</span>` : `<span class="status-pill status-success">All accounted for</span>`}
+          </div>
+          <p style="margin: 0; font-size: 0.78rem; color: var(--muted);">Confirmed at ${time}</p>
+          <button class="btn btn-ghost" id="edit-receipt" style="width: auto; align-self: flex-start;">Update count</button>`;
+        document.getElementById('edit-receipt')?.addEventListener('click', () => {
+          editingReceipt = true;
+          renderReceiptCard();
+        });
+        return;
+      }
+
+      container.innerHTML = `
+        <span class="eyebrow">Confirm returns received</span>
+        <p style="margin: 0; font-size: 0.85rem; color: var(--muted);">How many did the courier actually hand over? Amazon expects ${expected.length} today.</p>
+        <div class="row" style="gap: 8px; align-items: center;">
+          <input type="number" id="received-count" min="0" value="${receipt ? receipt.receivedCount : expected.length}" style="width: 90px;" />
+          <button class="btn btn-primary" id="confirm-receipt" style="width: auto;">Confirm</button>
+        </div>`;
+      document.getElementById('confirm-receipt')?.addEventListener('click', (e) => confirmReceipt(e.currentTarget as HTMLButtonElement));
+    }
+
+    async function confirmReceipt(btn: HTMLButtonElement) {
+      const input = document.getElementById('received-count') as HTMLInputElement;
+      const receivedCount = Number(input.value);
+      await withLoading(btn, 'Saving…', async () => {
+        try {
+          const data = await api('/api/packer/returns/confirm-receipt', { receivedCount });
+          receipt = data.receipt;
+          editingReceipt = false;
+          render();
+        } catch (err) {
+          showFlash('danger', (err as Error).message);
+        }
       });
     }
 
