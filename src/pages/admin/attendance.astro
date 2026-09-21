@@ -1,0 +1,142 @@
+---
+import AdminShell from '../../components/AdminShell.astro';
+import { getDb } from '../../lib/db';
+import { requireAdminPage } from '../../lib/auth';
+
+const redirectTo = await requireAdminPage(Astro, getDb());
+if (redirectTo) return Astro.redirect(redirectTo);
+---
+
+<AdminShell title="Attendance" current="attendance">
+  <div id="app" class="stack">
+    <p>Loading…</p>
+  </div>
+
+  <script>
+    import { escapeHtml } from '../../lib/ui';
+
+    interface TodayRow {
+      userId: string;
+      name: string;
+      role: string;
+      checkInAt: string | null;
+      checkOutAt: string | null;
+      present: boolean;
+    }
+    interface HistoryRow {
+      userId: string;
+      name: string;
+      workDate: string;
+      checkInAt: string;
+      checkOutAt: string | null;
+      sessions: number;
+    }
+
+    const app = document.getElementById('app')!;
+    let warehouseId = '';
+    let days = 14;
+    let today: TodayRow[] = [];
+    let history: HistoryRow[] = [];
+
+    async function api(path: string) {
+      const res = await fetch(path);
+      const data: any = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error ?? `Request failed (${res.status})`);
+      return data;
+    }
+
+    async function boot() {
+      const me = await api('/api/auth/me');
+      if (!me.user || me.user.role !== 'admin') {
+        app.innerHTML = '<p>Admin access required.</p>';
+        return;
+      }
+      warehouseId = me.user.warehouseId;
+      await load();
+      render();
+    }
+
+    async function load() {
+      const data = await api(`/api/admin/attendance?warehouseId=${warehouseId}&days=${days}`);
+      today = data.today ?? [];
+      history = data.history ?? [];
+    }
+
+    function fmtTime(iso: string): string {
+      return new Date(iso.replace(' ', 'T') + 'Z').toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+    }
+
+    function fmtDate(dateStr: string): string {
+      const [y, m, d] = dateStr.split('-').map(Number);
+      return new Date(y, m - 1, d).toLocaleDateString('en-IN', { weekday: 'short', day: '2-digit', month: 'short' });
+    }
+
+    function hoursBetween(a: string, b: string): string {
+      const ms = new Date(b.replace(' ', 'T') + 'Z').getTime() - new Date(a.replace(' ', 'T') + 'Z').getTime();
+      if (ms <= 0) return '—';
+      return (ms / (1000 * 60 * 60)).toFixed(1) + 'h';
+    }
+
+    function render() {
+      app.innerHTML = `
+        <div class="stack" style="gap: 10px;">
+          <span class="eyebrow">Today</span>
+          <div class="stack" style="gap: 8px;" data-today></div>
+        </div>
+
+        <div class="row" style="justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 24px;">
+          <span class="eyebrow">History</span>
+          <select id="days-filter" style="max-width: 160px;">
+            <option value="7" ${days === 7 ? 'selected' : ''}>Last 7 days</option>
+            <option value="14" ${days === 14 ? 'selected' : ''}>Last 14 days</option>
+            <option value="30" ${days === 30 ? 'selected' : ''}>Last 30 days</option>
+          </select>
+        </div>
+        <div style="margin-top: 8px;" data-history></div>`;
+
+      const todayContainer = document.querySelector('[data-today]') as HTMLElement;
+      todayContainer.innerHTML = today.length ? today.map((r) => todayRowHtml(r)).join('') : '<p>No warehouse staff set up yet.</p>';
+
+      const historyContainer = document.querySelector('[data-history]') as HTMLElement;
+      historyContainer.innerHTML = history.length
+        ? `<div class="table-scroll">
+             <table>
+               <thead><tr><th>Date</th><th>Staff</th><th>Check-in</th><th>Check-out</th><th>Hours</th><th>Sessions</th></tr></thead>
+               <tbody>${history.map((r) => historyRowHtml(r)).join('')}</tbody>
+             </table>
+           </div>`
+        : '<p>No attendance recorded yet.</p>';
+
+      document.getElementById('days-filter')?.addEventListener('change', async (e) => {
+        days = Number((e.currentTarget as HTMLSelectElement).value);
+        await load();
+        render();
+      });
+    }
+
+    function todayRowHtml(r: TodayRow): string {
+      const status = r.present
+        ? `<span class="status-pill status-success">Present since ${fmtTime(r.checkInAt!)}</span>`
+        : r.checkOutAt
+          ? `<span class="status-pill">Checked out at ${fmtTime(r.checkOutAt)}</span>`
+          : `<span class="status-pill status-warning">Not checked in</span>`;
+      return `<div class="card row" style="justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+        <span style="font-weight: 700;">${escapeHtml(r.name)}</span>
+        ${status}
+      </div>`;
+    }
+
+    function historyRowHtml(r: HistoryRow): string {
+      return `<tr>
+        <td>${fmtDate(r.workDate)}</td>
+        <td style="font-weight: 700;">${escapeHtml(r.name)}</td>
+        <td>${fmtTime(r.checkInAt)}</td>
+        <td>${r.checkOutAt ? fmtTime(r.checkOutAt) : '—'}</td>
+        <td>${r.checkOutAt ? hoursBetween(r.checkInAt, r.checkOutAt) : '—'}</td>
+        <td>${r.sessions}</td>
+      </tr>`;
+    }
+
+    boot();
+  </script>
+</AdminShell>

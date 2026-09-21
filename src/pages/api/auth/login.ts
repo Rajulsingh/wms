@@ -1,6 +1,7 @@
 import type { APIRoute } from 'astro';
 import { getDb } from '../../../lib/db';
 import { assertLoginNotRateLimited, createSession, getClientIp, recordFailedLogin, verifyPin, AuthError } from '../../../lib/auth';
+import { recordAttendanceEvent } from '../../../lib/attendance';
 import type { User } from '../../../lib/types';
 
 export const POST: APIRoute = async (context) => {
@@ -27,6 +28,7 @@ export const POST: APIRoute = async (context) => {
   }
 
   await createSession(context, user.id);
+  if (user.warehouse_id) await recordAttendanceEvent(db, user.id, user.warehouse_id, 'login');
   return new Response(JSON.stringify({ id: user.id, name: user.name, role: user.role, warehouseId: user.warehouse_id }), {
     status: 200,
     headers: { 'Content-Type': 'application/json' }
