@@ -50,8 +50,14 @@ export async function resetPickPackData(db: D1Database, warehouseId: string, use
 
   // Undo each pick_task's effect on inventory before deleting it — a
   // still-open task holds a reservation to release, a resolved 'picked'/
-  // 'short' task consumed real on-hand units to put back, a 'damaged' task
-  // flagged its whole bin unavailable to lift.
+  // 'short' task consumed real on-hand units to put back. A 'damaged' task
+  // now removes units via confirmPick too (see reportDamaged in picker.ts —
+  // it no longer blanket-flags the whole bin 'damaged', it CAS-decrements
+  // exactly the reported quantity the same way a real pick does), so
+  // reverting it means putting `quantity_required` back on-hand, the same
+  // shape as the picked/short branch just with a different source column
+  // (a damaged task's own `quantity_picked` is always 0 — nothing was
+  // actually picked when the whole task was reported damaged).
   for (const t of pickTasks.results) {
     const inv = await db.prepare(`SELECT id FROM inventory WHERE sku_id = ? AND location_id = ?`).bind(t.sku_id, t.location_id).first<{ id: string }>();
     if (!inv) continue;
@@ -63,7 +69,10 @@ export async function resetPickPackData(db: D1Database, warehouseId: string, use
         .bind(t.quantity_picked, inv.id)
         .run();
     } else if (t.status === 'damaged') {
-      await db.prepare(`UPDATE inventory SET status = 'available', version = version + 1, updated_at = datetime('now') WHERE id = ?`).bind(inv.id).run();
+      await db
+        .prepare(`UPDATE inventory SET quantity_on_hand = quantity_on_hand + ?, version = version + 1, updated_at = datetime('now') WHERE id = ?`)
+        .bind(t.quantity_required, inv.id)
+        .run();
     }
   }
 

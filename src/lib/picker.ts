@@ -485,7 +485,23 @@ export async function reportGroupDamaged(db: D1Database, userId: string, pickTas
   }
 }
 
-/** Damaged-item report (§6): pulls the item from sellable inventory and releases its reservation, without blocking the rest of the order. */
+/**
+ * Damaged-item report (§6): pulls exactly the damaged quantity out of
+ * sellable inventory and releases its reservation, without blocking the
+ * rest of the order — or the rest of that bin's stock.
+ *
+ * Used to blanket-flag the whole (sku, location) row `status = 'damaged'`
+ * instead of removing only the reported quantity — a real incident: a
+ * picker reporting 1 unit damaged out of a 50-unit bin marked the entire 50
+ * units unreservable, and stayed that way for every future order needing
+ * that SKU until someone happened to notice (see HANDOFF.md, the COFFEE2
+ * incident). `confirmPick` already does exactly the right bookkeeping for
+ * "these N units are no longer real stock" — it CAS-decrements both
+ * `quantity_on_hand` and `quantity_reserved` together, which is the correct
+ * inventory effect whether those units left the building on a truck or in
+ * the trash. Reusing it here means damaged units are removed precisely,
+ * and everything else in the bin stays exactly as reservable as it was.
+ */
 export async function reportDamaged(db: D1Database, userId: string, pickTaskId: string, notes?: string): Promise<void> {
   const task = await db
     .prepare(`SELECT id, pick_batch_id, order_item_id, sku_id, location_id, quantity_required FROM pick_tasks WHERE id = ?`)
@@ -500,11 +516,7 @@ export async function reportDamaged(db: D1Database, userId: string, pickTaskId: 
     .bind(task.sku_id, task.location_id)
     .first<{ id: string }>();
   if (inventory) {
-    await releaseReservation(db, inventory.id, task.quantity_required);
-    await db
-      .prepare(`UPDATE inventory SET status = 'damaged', version = version + 1 WHERE id = ? AND quantity_reserved = 0`)
-      .bind(inventory.id)
-      .run();
+    await confirmPick(db, inventory.id, task.quantity_required);
   }
 
   await db.prepare(`UPDATE pick_tasks SET status = 'damaged' WHERE id = ?`).bind(pickTaskId).run();
