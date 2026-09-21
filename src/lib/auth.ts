@@ -97,6 +97,46 @@ export class AuthError extends Error {
   }
 }
 
+const LOGIN_ATTEMPT_WINDOW_MINUTES = 15;
+const MAX_ATTEMPTS_PER_IDENTIFIER = 5;
+const MAX_ATTEMPTS_PER_IP = 30;
+
+/** Cloudflare always sets this on requests reaching a Worker — the actual client IP, not spoofable by the request itself. */
+export function getClientIp(context: APIContext): string {
+  return context.request.headers.get('CF-Connecting-IP') ?? 'unknown';
+}
+
+/**
+ * Rate limiting for both login endpoints (floor PIN, org owner email/
+ * password) — neither had any throttling before this (migrations/
+ * 0028_login_attempts.sql). Two thresholds: a tight per-identifier one (the
+ * actual account being brute-forced) and a looser per-IP one (catches
+ * someone iterating many usernames from one source) — identifier-based is
+ * primary so one bad login doesn't lock out an entire shared warehouse IP.
+ * Call before verifying credentials; call `recordFailedLogin` only after a
+ * verified failure, never on success.
+ */
+export async function assertLoginNotRateLimited(db: D1Database, identifier: string, ip: string): Promise<void> {
+  // `created_at` is SQLite `datetime('now')` text (space-separated, no `Z`)
+  // — the cutoff must be built the same way (not JS `toISOString()`, which
+  // uses `T`/`Z` and silently breaks the string comparison; see the same
+  // lesson already learned once in dashboard.ts).
+  const windowExpr = `datetime('now', '-${LOGIN_ATTEMPT_WINDOW_MINUTES} minutes')`;
+  const [byIdentifier, byIp] = await Promise.all([
+    db.prepare(`SELECT COUNT(*) AS n FROM login_attempts WHERE identifier = ? AND created_at > ${windowExpr}`).bind(identifier).first<{ n: number }>(),
+    db.prepare(`SELECT COUNT(*) AS n FROM login_attempts WHERE ip = ? AND created_at > ${windowExpr}`).bind(ip).first<{ n: number }>()
+  ]);
+  if ((byIdentifier?.n ?? 0) >= MAX_ATTEMPTS_PER_IDENTIFIER || (byIp?.n ?? 0) >= MAX_ATTEMPTS_PER_IP) {
+    throw new AuthError(429, 'Too many login attempts — try again in a few minutes.');
+  }
+}
+
+/** Records one failed login attempt, and opportunistically prunes attempts well outside the window — no cron needed for a table this small and short-lived. */
+export async function recordFailedLogin(db: D1Database, identifier: string, ip: string): Promise<void> {
+  await db.prepare(`INSERT INTO login_attempts (id, identifier, ip) VALUES (?, ?, ?)`).bind(crypto.randomUUID(), identifier, ip).run();
+  await db.prepare(`DELETE FROM login_attempts WHERE created_at < datetime('now', '-${LOGIN_ATTEMPT_WINDOW_MINUTES * 4} minutes')`).run();
+}
+
 /**
  * Verifies a client-supplied `warehouseId` actually belongs to the calling
  * session — `requireUser` only checks *role* ("is this an admin/packer"),
