@@ -1,6 +1,6 @@
 import type { APIRoute } from 'astro';
 import { getDb } from '../../../lib/db';
-import { requireUser, AuthError } from '../../../lib/auth';
+import { requireUser, requireOwnWarehouse, AuthError } from '../../../lib/auth';
 import { getUnassignedSkuDemand } from '../../../lib/picker';
 
 // No role restriction, deliberately — the packer dashboard's read-only
@@ -10,9 +10,9 @@ import { getUnassignedSkuDemand } from '../../../lib/picker';
 export const GET: APIRoute = async (context) => {
   const db = getDb();
   try {
-    await requireUser(context, db);
+    const user = await requireUser(context, db);
     const warehouseId = new URL(context.request.url).searchParams.get('warehouseId');
-    if (!warehouseId) return new Response(JSON.stringify({ error: 'warehouseId is required' }), { status: 400 });
+    requireOwnWarehouse(user, warehouseId);
 
     const demand = await getUnassignedSkuDemand(db, warehouseId);
     return new Response(JSON.stringify(demand), { status: 200, headers: { 'Content-Type': 'application/json' } });

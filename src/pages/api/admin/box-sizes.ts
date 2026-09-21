@@ -1,12 +1,13 @@
 import type { APIRoute } from 'astro';
 import { getDb, newId } from '../../../lib/db';
-import { requireUser, AuthError } from '../../../lib/auth';
+import { requireUser, requireOwnWarehouse, AuthError } from '../../../lib/auth';
 
 export const GET: APIRoute = async (context) => {
   const db = getDb();
   try {
-    await requireUser(context, db, ['admin']);
+    const user = await requireUser(context, db, ['admin']);
     const warehouseId = new URL(context.request.url).searchParams.get('warehouseId');
+    requireOwnWarehouse(user, warehouseId);
     const rows = await db
       .prepare(`SELECT * FROM box_sizes WHERE warehouse_id = ? AND active = 1 ORDER BY name`)
       .bind(warehouseId)
@@ -21,7 +22,7 @@ export const GET: APIRoute = async (context) => {
 export const POST: APIRoute = async (context) => {
   const db = getDb();
   try {
-    await requireUser(context, db, ['admin']);
+    const user = await requireUser(context, db, ['admin']);
     const body = await context.request.json<{
       warehouseId: string;
       name: string;
@@ -30,6 +31,7 @@ export const POST: APIRoute = async (context) => {
       height: number;
       dimensionUnit?: 'centimeters' | 'inches';
     }>();
+    requireOwnWarehouse(user, body.warehouseId);
 
     const id = newId();
     await db

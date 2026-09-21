@@ -1,6 +1,6 @@
 import type { APIRoute } from 'astro';
 import { getDb } from '../../../lib/db';
-import { requireUser, AuthError } from '../../../lib/auth';
+import { requireUser, requireOwnWarehouse, AuthError } from '../../../lib/auth';
 import { receiveStock, listReceipts, InboundError, type ReceiveLine } from '../../../lib/inbound';
 import { suggestNextMsku } from '../../../lib/skus';
 import { getOrganizationIdForWarehouse } from '../../../lib/org-accounts';
@@ -8,10 +8,10 @@ import { getOrganizationIdForWarehouse } from '../../../lib/org-accounts';
 export const GET: APIRoute = async (context) => {
   const db = getDb();
   try {
-    await requireUser(context, db, ['admin']);
+    const user = await requireUser(context, db, ['admin']);
     const warehouseId = new URL(context.request.url).searchParams.get('warehouseId');
-    if (!warehouseId) return new Response(JSON.stringify({ error: 'warehouseId is required' }), { status: 400 });
-    const organizationId = await getOrganizationIdForWarehouse(db, warehouseId);
+    requireOwnWarehouse(user, warehouseId);
+    const organizationId = await getOrganizationIdForWarehouse(db, warehouseId!);
 
     const [skus, locations, receipts, nextMsku] = await Promise.all([
       // Only active (buyable) listings are selectable here — a parent/inactive
@@ -53,6 +53,7 @@ export const POST: APIRoute = async (context) => {
   try {
     const user = await requireUser(context, db, ['admin']);
     const body = await context.request.json<{ warehouseId: string; reference?: string; lines: ReceiveLine[] }>();
+    requireOwnWarehouse(user, body.warehouseId);
 
     const result = await receiveStock(db, user.id, body.warehouseId, body.reference?.trim() || null, body.lines);
     return new Response(JSON.stringify(result), { status: 201, headers: { 'Content-Type': 'application/json' } });

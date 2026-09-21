@@ -1,6 +1,6 @@
 import type { APIRoute } from 'astro';
 import { getDb, logAudit, newId } from '../../../lib/db';
-import { requireUser, AuthError } from '../../../lib/auth';
+import { requireUser, requireOwnWarehouse, AuthError } from '../../../lib/auth';
 import { resolveSkuIdByCode } from '../../../lib/skus';
 import { reserveOrderForPicking } from '../../../lib/orders';
 import { getAdminOrders, type AdminOrderTab, type SentFilter, type SearchField, type SortOption } from '../../../lib/admin-orders';
@@ -19,6 +19,7 @@ export const POST: APIRoute = async (context) => {
       priority?: number;
       items: Array<{ skuCode: string; quantity: number }>;
     }>();
+    requireOwnWarehouse(user, body.warehouseId);
 
     const orderId = newId();
     await db
@@ -68,12 +69,12 @@ export const POST: APIRoute = async (context) => {
 export const GET: APIRoute = async (context) => {
   const db = getDb();
   try {
-    await requireUser(context, db, ['admin']);
+    const user = await requireUser(context, db, ['admin']);
     const params = new URL(context.request.url).searchParams;
     const warehouseId = params.get('warehouseId');
-    if (!warehouseId) return new Response(JSON.stringify({ error: 'warehouseId is required' }), { status: 400 });
+    requireOwnWarehouse(user, warehouseId);
 
-    const result = await getAdminOrders(db, warehouseId, {
+    const result = await getAdminOrders(db, warehouseId!, {
       tab: (params.get('tab') as AdminOrderTab) ?? 'all',
       sentFilter: (params.get('sentFilter') as SentFilter) ?? undefined,
       searchField: (params.get('searchField') as SearchField) ?? undefined,
@@ -95,6 +96,13 @@ export const PATCH: APIRoute = async (context) => {
   try {
     const user = await requireUser(context, db, ['admin']);
     const body = await context.request.json<{ orderId: string; notes: string | null }>();
+
+    // orderId alone isn't enough — verify it belongs to this admin's own
+    // warehouse before mutating it (same class of bug as the warehouseId
+    // checks elsewhere: a bare id from the client is never trusted alone).
+    const order = await db.prepare(`SELECT warehouse_id FROM orders WHERE id = ?`).bind(body.orderId).first<{ warehouse_id: string }>();
+    if (!order) return new Response(JSON.stringify({ error: 'Order not found' }), { status: 404 });
+    requireOwnWarehouse(user, order.warehouse_id);
 
     const notes = body.notes?.trim() || null;
     await db.prepare(`UPDATE orders SET notes = ? WHERE id = ?`).bind(notes, body.orderId).run();

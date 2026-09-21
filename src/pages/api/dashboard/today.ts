@@ -1,6 +1,6 @@
 import type { APIRoute } from 'astro';
 import { getDb } from '../../../lib/db';
-import { requireUser, AuthError } from '../../../lib/auth';
+import { requireUser, requireOwnWarehouse, AuthError } from '../../../lib/auth';
 import { getTodaySummary } from '../../../lib/dashboard';
 
 // No role restriction — deliberately every logged-in user (packer or admin)
@@ -8,9 +8,9 @@ import { getTodaySummary } from '../../../lib/dashboard';
 export const GET: APIRoute = async (context) => {
   const db = getDb();
   try {
-    await requireUser(context, db);
+    const user = await requireUser(context, db);
     const warehouseId = new URL(context.request.url).searchParams.get('warehouseId');
-    if (!warehouseId) return new Response(JSON.stringify({ error: 'warehouseId is required' }), { status: 400 });
+    requireOwnWarehouse(user, warehouseId);
 
     const summary = await getTodaySummary(db, warehouseId);
     return new Response(JSON.stringify(summary), { status: 200, headers: { 'Content-Type': 'application/json' } });

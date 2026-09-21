@@ -1,6 +1,6 @@
 import type { APIRoute } from 'astro';
 import { getDb } from '../../../../lib/db';
-import { requireUser, AuthError } from '../../../../lib/auth';
+import { requireUser, requireOwnWarehouse, AuthError } from '../../../../lib/auth';
 import { processUploadedLabelPdf, base64ToBytes, SchedulePickupError } from '../../../../lib/schedule-pickup';
 
 export const POST: APIRoute = async (context) => {
@@ -8,6 +8,7 @@ export const POST: APIRoute = async (context) => {
   try {
     const user = await requireUser(context, db, ['admin']);
     const body = await context.request.json<{ warehouseId: string; batchId: string; pdfBase64: string }>();
+    requireOwnWarehouse(user, body.warehouseId);
 
     if (!body.pdfBase64) {
       return new Response(JSON.stringify({ error: 'No PDF provided' }), { status: 400 });

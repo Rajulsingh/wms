@@ -1,12 +1,13 @@
 import type { APIRoute } from 'astro';
 import { getDb, newId } from '../../../lib/db';
-import { requireUser, AuthError } from '../../../lib/auth';
+import { requireUser, requireOwnWarehouse, AuthError } from '../../../lib/auth';
 
 export const GET: APIRoute = async (context) => {
   const db = getDb();
   try {
-    await requireUser(context, db, ['admin']);
+    const user = await requireUser(context, db, ['admin']);
     const warehouseId = new URL(context.request.url).searchParams.get('warehouseId');
+    requireOwnWarehouse(user, warehouseId);
     const rows = await db.prepare(`SELECT * FROM zones WHERE warehouse_id = ? ORDER BY sequence_number`).bind(warehouseId).all();
     return new Response(JSON.stringify(rows.results), { status: 200, headers: { 'Content-Type': 'application/json' } });
   } catch (err) {
@@ -18,8 +19,9 @@ export const GET: APIRoute = async (context) => {
 export const POST: APIRoute = async (context) => {
   const db = getDb();
   try {
-    await requireUser(context, db, ['admin']);
+    const user = await requireUser(context, db, ['admin']);
     const body = await context.request.json<{ warehouseId: string; name: string; sequenceNumber?: number }>();
+    requireOwnWarehouse(user, body.warehouseId);
     const name = body.name.trim();
     if (!name) return new Response(JSON.stringify({ error: 'Zone name is required' }), { status: 400 });
 

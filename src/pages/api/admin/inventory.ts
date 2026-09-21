@@ -1,12 +1,13 @@
 import type { APIRoute } from 'astro';
 import { getDb, newId, logAudit } from '../../../lib/db';
-import { requireUser, AuthError } from '../../../lib/auth';
+import { requireUser, requireOwnWarehouse, AuthError } from '../../../lib/auth';
 
 export const GET: APIRoute = async (context) => {
   const db = getDb();
   try {
-    await requireUser(context, db, ['admin']);
+    const user = await requireUser(context, db, ['admin']);
     const warehouseId = new URL(context.request.url).searchParams.get('warehouseId');
+    requireOwnWarehouse(user, warehouseId);
     const rows = await db
       .prepare(
         `SELECT inv.id, inv.sku_id, inv.location_id, inv.quantity_on_hand, inv.quantity_reserved, inv.status,
@@ -38,8 +39,12 @@ export const PATCH: APIRoute = async (context) => {
       return new Response(JSON.stringify({ error: 'Quantity must be a non-negative number' }), { status: 400 });
     }
 
-    const before = await db.prepare(`SELECT quantity_on_hand FROM inventory WHERE id = ?`).bind(body.inventoryId).first<{ quantity_on_hand: number }>();
+    const before = await db
+      .prepare(`SELECT inv.quantity_on_hand, loc.warehouse_id FROM inventory inv JOIN locations loc ON loc.id = inv.location_id WHERE inv.id = ?`)
+      .bind(body.inventoryId)
+      .first<{ quantity_on_hand: number; warehouse_id: string }>();
     if (!before) return new Response(JSON.stringify({ error: 'Inventory row not found' }), { status: 404 });
+    requireOwnWarehouse(user, before.warehouse_id);
 
     await db
       .prepare(`UPDATE inventory SET quantity_on_hand = ?, version = version + 1, updated_at = datetime('now') WHERE id = ?`)
@@ -63,8 +68,12 @@ export const PATCH: APIRoute = async (context) => {
 export const POST: APIRoute = async (context) => {
   const db = getDb();
   try {
-    await requireUser(context, db, ['admin']);
+    const user = await requireUser(context, db, ['admin']);
     const body = await context.request.json<{ skuId: string; locationId: string; quantityOnHand?: number }>();
+
+    const location = await db.prepare(`SELECT warehouse_id FROM locations WHERE id = ?`).bind(body.locationId).first<{ warehouse_id: string }>();
+    if (!location) return new Response(JSON.stringify({ error: 'Location not found' }), { status: 404 });
+    requireOwnWarehouse(user, location.warehouse_id);
 
     const existing = await db.prepare(`SELECT id FROM inventory WHERE sku_id = ? AND location_id = ?`).bind(body.skuId, body.locationId).first<{ id: string }>();
     if (existing) return new Response(JSON.stringify({ error: 'This SKU already has an inventory row at that location' }), { status: 409 });

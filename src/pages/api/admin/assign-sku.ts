@@ -1,6 +1,6 @@
 import type { APIRoute } from 'astro';
 import { getDb, logAudit } from '../../../lib/db';
-import { requireUser, AuthError } from '../../../lib/auth';
+import { requireUser, requireOwnWarehouse, AuthError } from '../../../lib/auth';
 import { assignSkusToPacker, PickerFlowError } from '../../../lib/picker';
 
 export const POST: APIRoute = async (context) => {
@@ -8,6 +8,7 @@ export const POST: APIRoute = async (context) => {
   try {
     const admin = await requireUser(context, db, ['admin']);
     const body = await context.request.json<{ warehouseId: string; skuIds: string[]; packerId: string }>();
+    requireOwnWarehouse(admin, body.warehouseId);
 
     if (!body.skuIds?.length) return new Response(JSON.stringify({ error: 'Select at least one SKU' }), { status: 400 });
     if (!body.packerId) return new Response(JSON.stringify({ error: 'Select a packer' }), { status: 400 });

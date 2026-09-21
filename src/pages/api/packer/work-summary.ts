@@ -1,6 +1,6 @@
 import type { APIRoute } from 'astro';
 import { getDb } from '../../../lib/db';
-import { requireUser, AuthError } from '../../../lib/auth';
+import { requireUser, requireOwnWarehouse, AuthError } from '../../../lib/auth';
 
 /**
  * Lightweight poll target for the pick/pack tab notification dots — counts
@@ -11,8 +11,9 @@ import { requireUser, AuthError } from '../../../lib/auth';
 export const GET: APIRoute = async (context) => {
   const db = getDb();
   try {
-    await requireUser(context, db, ['packer']);
+    const user = await requireUser(context, db, ['packer']);
     const warehouseId = new URL(context.request.url).searchParams.get('warehouseId');
+    requireOwnWarehouse(user, warehouseId);
 
     const pickable = await db
       .prepare(`SELECT COUNT(*) AS c FROM pick_batches WHERE warehouse_id = ? AND status IN ('pending', 'assigned')`)

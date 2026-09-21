@@ -1,6 +1,6 @@
 import type { APIRoute } from 'astro';
 import { getDb } from '../../../lib/db';
-import { requireUser, AuthError } from '../../../lib/auth';
+import { requireUser, requireOwnWarehouse, AuthError } from '../../../lib/auth';
 import { unmergeAllSkus } from '../../../lib/skus';
 import { getOrganizationIdForWarehouse } from '../../../lib/org-accounts';
 
@@ -14,6 +14,7 @@ export const POST: APIRoute = async (context) => {
   try {
     const user = await requireUser(context, db, ['admin']);
     const body = await context.request.json<{ warehouseId: string }>();
+    requireOwnWarehouse(user, body.warehouseId);
     const organizationId = await getOrganizationIdForWarehouse(db, body.warehouseId);
     const result = await unmergeAllSkus(db, user.id, organizationId);
     return new Response(JSON.stringify(result), { status: 200, headers: { 'Content-Type': 'application/json' } });

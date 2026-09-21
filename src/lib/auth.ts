@@ -98,6 +98,24 @@ export class AuthError extends Error {
 }
 
 /**
+ * Verifies a client-supplied `warehouseId` actually belongs to the calling
+ * session — `requireUser` only checks *role* ("is this an admin/packer"),
+ * never *whose* data a warehouseId points at. Without this, any logged-in
+ * user could pass a different org's warehouseId and read/modify that
+ * warehouse's data outright — confirmed live: a brand-new self-signed-up
+ * org's session pulled a completely different organization's real orders
+ * and inventory this way, through routes that trusted the client-supplied
+ * id with no ownership check at all. Every route that accepts warehouseId
+ * from the client (query param, JSON body) must call this immediately
+ * after requireUser, using the exact user object requireUser returned.
+ */
+export function requireOwnWarehouse(user: User, warehouseId: string | null | undefined): asserts warehouseId is string {
+  if (!warehouseId || user.warehouse_id !== warehouseId) {
+    throw new AuthError(403, 'Not authorized for this warehouse');
+  }
+}
+
+/**
  * Server-side admin gate for every `src/pages/admin/*.astro` page. Returns a
  * redirect path if the request shouldn't see the page at all, or `null` if
  * it's an admin session and rendering can proceed. Every admin page must

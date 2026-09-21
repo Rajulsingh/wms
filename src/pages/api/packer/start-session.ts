@@ -1,6 +1,6 @@
 import type { APIRoute } from 'astro';
 import { getDb } from '../../../lib/db';
-import { requireUser, AuthError } from '../../../lib/auth';
+import { requireUser, requireOwnWarehouse, AuthError } from '../../../lib/auth';
 import { getMyPackBatches, PackerFlowError } from '../../../lib/packer';
 
 // Also used for polling once packing has started, not just the initial
@@ -16,6 +16,7 @@ export const POST: APIRoute = async (context) => {
       throw new PackerFlowError('no_station', 'No packing station is assigned to your account yet — ask an admin to assign one in Users.');
     }
     const body = await context.request.json<{ warehouseId: string }>();
+    requireOwnWarehouse(user, body.warehouseId);
 
     const state = await getMyPackBatches(db, user.id, user.station_id, body.warehouseId);
     return new Response(JSON.stringify(state), { status: 200, headers: { 'Content-Type': 'application/json' } });

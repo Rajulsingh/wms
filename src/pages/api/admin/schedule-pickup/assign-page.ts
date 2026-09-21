@@ -1,6 +1,6 @@
 import type { APIRoute } from 'astro';
 import { getDb } from '../../../../lib/db';
-import { requireUser, AuthError } from '../../../../lib/auth';
+import { requireUser, requireOwnWarehouse, AuthError } from '../../../../lib/auth';
 import { assignPageManually, base64ToBytes, SchedulePickupError } from '../../../../lib/schedule-pickup';
 
 export const POST: APIRoute = async (context) => {
@@ -8,6 +8,7 @@ export const POST: APIRoute = async (context) => {
   try {
     const user = await requireUser(context, db, ['admin']);
     const body = await context.request.json<{ warehouseId: string; batchId: string; orderId: string; pdfBase64: string; pageIndices: number[] }>();
+    requireOwnWarehouse(user, body.warehouseId);
 
     if (!body.orderId || !body.pageIndices?.length) {
       return new Response(JSON.stringify({ error: 'Select an order and at least one page' }), { status: 400 });

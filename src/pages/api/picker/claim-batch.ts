@@ -1,6 +1,6 @@
 import type { APIRoute } from 'astro';
 import { getDb } from '../../../lib/db';
-import { requireUser, AuthError } from '../../../lib/auth';
+import { requireUser, requireOwnWarehouse, AuthError } from '../../../lib/auth';
 import { getMyBatches } from '../../../lib/picker';
 
 // Returns every batch currently active for this picker, plus a sweep for
@@ -13,6 +13,7 @@ export const POST: APIRoute = async (context) => {
   try {
     const user = await requireUser(context, db, ['packer']);
     const body = await context.request.json<{ warehouseId: string }>();
+    requireOwnWarehouse(user, body.warehouseId);
 
     const batches = await getMyBatches(db, body.warehouseId, user.id);
     return new Response(JSON.stringify({ batches }), { status: 200, headers: { 'Content-Type': 'application/json' } });

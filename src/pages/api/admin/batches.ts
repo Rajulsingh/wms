@@ -1,6 +1,6 @@
 import type { APIRoute } from 'astro';
 import { getDb, logAudit } from '../../../lib/db';
-import { requireUser, AuthError } from '../../../lib/auth';
+import { requireUser, requireOwnWarehouse, AuthError } from '../../../lib/auth';
 import { retryBlockedOrders } from '../../../lib/orders';
 import { assignBatchToPacker, PickerFlowError } from '../../../lib/picker';
 
@@ -15,6 +15,7 @@ export const POST: APIRoute = async (context) => {
   try {
     const user = await requireUser(context, db, ['admin']);
     const body = await context.request.json<{ warehouseId: string }>();
+    requireOwnWarehouse(user, body.warehouseId);
 
     const result = await retryBlockedOrders(db, body.warehouseId);
 
@@ -39,8 +40,9 @@ export const POST: APIRoute = async (context) => {
 export const GET: APIRoute = async (context) => {
   const db = getDb();
   try {
-    await requireUser(context, db, ['admin']);
+    const user = await requireUser(context, db, ['admin']);
     const warehouseId = new URL(context.request.url).searchParams.get('warehouseId');
+    requireOwnWarehouse(user, warehouseId);
     const batches = await db
       .prepare(
         `SELECT pb.*, u.name AS assigned_picker_name
@@ -63,6 +65,7 @@ export const PATCH: APIRoute = async (context) => {
   try {
     const admin = await requireUser(context, db, ['admin']);
     const body = await context.request.json<{ warehouseId: string; batchId: string; packerId: string | null }>();
+    requireOwnWarehouse(admin, body.warehouseId);
 
     await assignBatchToPacker(db, body.warehouseId, body.batchId, body.packerId);
     await logAudit(db, {

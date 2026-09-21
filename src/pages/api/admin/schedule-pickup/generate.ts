@@ -1,6 +1,6 @@
 import type { APIRoute } from 'astro';
 import { getDb } from '../../../../lib/db';
-import { requireUser, AuthError } from '../../../../lib/auth';
+import { requireUser, requireOwnWarehouse, AuthError } from '../../../../lib/auth';
 import { createScheduleBatch, generateScheduleFile, SchedulePickupError, type ScheduleOrderInput } from '../../../../lib/schedule-pickup';
 
 export const POST: APIRoute = async (context) => {
@@ -20,6 +20,7 @@ export const POST: APIRoute = async (context) => {
     if (body.orders.some((o) => !o.invoiceId?.trim())) {
       return new Response(JSON.stringify({ error: 'Every order needs an invoice id' }), { status: 400 });
     }
+    requireOwnWarehouse(user, body.warehouseId);
 
     const batchId = await createScheduleBatch(db, user.id, body.warehouseId, body.pickupDate, body.pickupTime);
     const result = await generateScheduleFile(db, user.id, body.warehouseId, batchId, body.orders);

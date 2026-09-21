@@ -1,6 +1,6 @@
 import type { APIRoute } from 'astro';
 import { getDb } from '../../../lib/db';
-import { requireUser, AuthError } from '../../../lib/auth';
+import { requireUser, requireOwnWarehouse, AuthError } from '../../../lib/auth';
 import { getOrganizationIdForWarehouse } from '../../../lib/org-accounts';
 
 const DEFAULT_REORDER_POINT = 5;
@@ -17,9 +17,9 @@ const DEFAULT_REORDER_POINT = 5;
 export const GET: APIRoute = async (context) => {
   const db = getDb();
   try {
-    await requireUser(context, db, ['admin']);
+    const user = await requireUser(context, db, ['admin']);
     const warehouseId = new URL(context.request.url).searchParams.get('warehouseId');
-    if (!warehouseId) return new Response(JSON.stringify({ error: 'warehouseId is required' }), { status: 400 });
+    requireOwnWarehouse(user, warehouseId);
     const organizationId = await getOrganizationIdForWarehouse(db, warehouseId);
 
     // `WHERE s.organization_id = ?` is the fix for a real cross-tenant leak

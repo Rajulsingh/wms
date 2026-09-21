@@ -1,6 +1,6 @@
 import type { APIRoute } from 'astro';
 import { getDb } from '../../../lib/db';
-import { requireUser, AuthError } from '../../../lib/auth';
+import { requireUser, requireOwnWarehouse, AuthError } from '../../../lib/auth';
 import { applyAwbByScan, PackerFlowError } from '../../../lib/packer';
 
 // Matched against Amazon's own known AWB-to-order data first, FIFO only as a
@@ -10,6 +10,7 @@ export const POST: APIRoute = async (context) => {
   try {
     const user = await requireUser(context, db, ['packer']);
     const body = await context.request.json<{ warehouseId: string; awbCode: string }>();
+    requireOwnWarehouse(user, body.warehouseId);
 
     const result = await applyAwbByScan(db, user.id, body.warehouseId, body.awbCode);
     return new Response(JSON.stringify(result), { status: 200, headers: { 'Content-Type': 'application/json' } });

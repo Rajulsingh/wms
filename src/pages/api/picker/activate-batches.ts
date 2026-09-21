@@ -1,6 +1,6 @@
 import type { APIRoute } from 'astro';
 import { getDb } from '../../../lib/db';
-import { requireUser, AuthError } from '../../../lib/auth';
+import { requireUser, requireOwnWarehouse, AuthError } from '../../../lib/auth';
 import { activateBatches } from '../../../lib/picker';
 
 // The server-side half of the picker's "Activate pick list" tap (see
@@ -11,6 +11,7 @@ export const POST: APIRoute = async (context) => {
   try {
     const user = await requireUser(context, db, ['packer']);
     const body = await context.request.json<{ warehouseId: string }>();
+    requireOwnWarehouse(user, body.warehouseId);
     await activateBatches(db, body.warehouseId, user.id);
     return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json' } });
   } catch (err) {

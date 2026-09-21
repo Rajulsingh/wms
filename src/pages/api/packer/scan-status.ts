@@ -1,6 +1,6 @@
 import type { APIRoute } from 'astro';
 import { getDb } from '../../../lib/db';
-import { requireUser, AuthError } from '../../../lib/auth';
+import { requireUser, requireOwnWarehouse, AuthError } from '../../../lib/auth';
 import { getPendingLabels, getTodayScans } from '../../../lib/packer';
 
 // Powers the Scan page's initial load and refresh — everything read from
@@ -8,9 +8,9 @@ import { getPendingLabels, getTodayScans } from '../../../lib/packer';
 export const GET: APIRoute = async (context) => {
   const db = getDb();
   try {
-    await requireUser(context, db, ['packer']);
+    const user = await requireUser(context, db, ['packer']);
     const warehouseId = new URL(context.request.url).searchParams.get('warehouseId');
-    if (!warehouseId) return new Response(JSON.stringify({ error: 'warehouseId required' }), { status: 400 });
+    requireOwnWarehouse(user, warehouseId);
 
     const pending = await getPendingLabels(db, warehouseId);
     const todayScans = await getTodayScans(db, warehouseId);

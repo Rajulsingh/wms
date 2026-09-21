@@ -1,12 +1,13 @@
 import type { APIRoute } from 'astro';
 import { getDb, newId } from '../../../lib/db';
-import { requireUser, AuthError } from '../../../lib/auth';
+import { requireUser, requireOwnWarehouse, AuthError } from '../../../lib/auth';
 
 export const GET: APIRoute = async (context) => {
   const db = getDb();
   try {
-    await requireUser(context, db, ['admin']);
+    const user = await requireUser(context, db, ['admin']);
     const warehouseId = new URL(context.request.url).searchParams.get('warehouseId');
+    requireOwnWarehouse(user, warehouseId);
     const rows = await db
       .prepare(
         `SELECT loc.*, z.name AS zone_name FROM locations loc LEFT JOIN zones z ON z.id = loc.zone_id
@@ -24,7 +25,7 @@ export const GET: APIRoute = async (context) => {
 export const POST: APIRoute = async (context) => {
   const db = getDb();
   try {
-    await requireUser(context, db, ['admin']);
+    const user = await requireUser(context, db, ['admin']);
     const body = await context.request.json<{
       warehouseId: string;
       zoneId?: string;
@@ -32,6 +33,7 @@ export const POST: APIRoute = async (context) => {
       type?: 'pickable' | 'reserve';
       sequenceNumber?: number;
     }>();
+    requireOwnWarehouse(user, body.warehouseId);
     const code = body.code.trim();
     if (!code) return new Response(JSON.stringify({ error: 'Location code is required' }), { status: 400 });
 

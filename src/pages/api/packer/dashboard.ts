@@ -1,6 +1,6 @@
 import type { APIRoute } from 'astro';
 import { getDb } from '../../../lib/db';
-import { requireUser, AuthError } from '../../../lib/auth';
+import { requireUser, requireOwnWarehouse, AuthError } from '../../../lib/auth';
 import { getMyActiveBatches, getPickListView } from '../../../lib/picker';
 import { getUnbatchedOrderSummary } from '../../../lib/orders';
 import { getPackerDailySummary } from '../../../lib/packer';
@@ -16,7 +16,7 @@ export const GET: APIRoute = async (context) => {
   try {
     const user = await requireUser(context, db, ['packer']);
     const warehouseId = new URL(context.request.url).searchParams.get('warehouseId');
-    if (!warehouseId) return new Response(JSON.stringify({ error: 'warehouseId required' }), { status: 400 });
+    requireOwnWarehouse(user, warehouseId);
 
     const myBatchIds = await getMyActiveBatches(db, warehouseId, user.id);
     const myBatches = [];

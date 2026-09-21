@@ -1,6 +1,6 @@
 import type { APIRoute } from 'astro';
 import { getDb, logAudit } from '../../../lib/db';
-import { requireUser, AuthError } from '../../../lib/auth';
+import { requireUser, requireOwnWarehouse, AuthError } from '../../../lib/auth';
 import { fetchOrderById } from '../../../lib/amazon';
 import { importAmazonOrders } from '../../../lib/orders';
 import { resolveAmazonCredentialsForWarehouse } from '../../../lib/org-accounts';
@@ -22,6 +22,7 @@ export const POST: APIRoute = async (context) => {
     const body = await context.request.json<{ warehouseId: string; amazonOrderId: string }>();
     const amazonOrderId = body.amazonOrderId?.trim();
     if (!amazonOrderId) return new Response(JSON.stringify({ error: 'amazonOrderId is required' }), { status: 400 });
+    requireOwnWarehouse(user, body.warehouseId);
 
     const credentials = await resolveAmazonCredentialsForWarehouse(db, body.warehouseId);
     const order = await fetchOrderById(amazonOrderId, credentials);
