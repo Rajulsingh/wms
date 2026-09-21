@@ -559,20 +559,27 @@ const initialBatches = user.role === 'packer' && user.warehouse_id ? await getMy
         } else {
           // Undo only ever offered for a clean full pick (never a short/
           // damaged one — see unpickGroupQuantity in lib/picker.ts for why).
+          // Everything here stacks into its own row on narrow screens
+          // (matches the reason-flow block below) rather than cramming
+          // label + stepper + two buttons into one flex row — that packed
+          // row overflowed the card on a phone width, pushing the confirm
+          // button half off-screen.
           actionHtml = `
-            <div class="row" style="margin-top: 10px; gap: 8px; align-items: center;">
+            <div class="row" style="margin-top: 10px; gap: 8px; align-items: center; flex-wrap: wrap;">
               <div class="banner banner-success" style="padding: 8px 12px; margin: 0; flex: 1;">Done</div>
-              <button class="btn btn-ghost unpick-toggle" type="button" title="Undo pick" aria-label="Undo pick" style="width: auto; padding: 8px 10px; flex: 0 0 auto;">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="16" height="16"><path d="M3 7v6h6"></path><path d="M3.51 13a9 9 0 1 0 2.13-9.36L3 7"></path></svg>
-              </button>
+              <button class="btn btn-ghost unpick-toggle" type="button" style="width: auto; flex: 0 0 auto;">Unpick</button>
             </div>
             ${
               unpickOpen
-                ? `<div class="row" style="margin-top: 8px; gap: 8px; align-items: center; border-top: 1px dashed var(--border); padding-top: 10px;">
-                     <span style="font-size: 0.85rem; font-weight: 600;">Unpick</span>
-                     ${qtyStepperHtml(`<input type="number" class="unpick-qty-input" min="1" max="${picked}" value="${picked}" style="width: 64px; flex: 0 0 auto; min-height: 44px; text-align: center;" />`)}
-                     <button class="btn btn-ghost" data-action="cancel-unpick" style="flex: 1;">Cancel</button>
-                     <button class="btn btn-primary" data-action="confirm-unpick" style="flex: 1;">Unpick</button>
+                ? `<div class="stack" style="margin-top: 8px; gap: 8px; border-top: 1px dashed var(--border); padding-top: 10px;">
+                     <span style="font-size: 0.85rem; font-weight: 600;">Unpick how many?</span>
+                     <div class="row" style="gap: 8px; align-items: center;">
+                       ${qtyStepperHtml(`<input type="number" class="unpick-qty-input" min="1" max="${picked}" value="${picked}" style="width: 64px; flex: 0 0 auto; min-height: 44px; text-align: center;" />`)}
+                     </div>
+                     <div class="row" style="gap: 8px;">
+                       <button class="btn btn-ghost" data-action="cancel-unpick" style="flex: 1;">Cancel</button>
+                       <button class="btn btn-primary" data-action="confirm-unpick" style="flex: 1;">Unpick</button>
+                     </div>
                    </div>`
                 : ''
             }`;
