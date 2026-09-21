@@ -97,10 +97,18 @@ const initialBatches = user.role === 'packer' && user.warehouse_id ? await getMy
       started: boolean;
     }
 
-    // One card per ship-by date currently among this picker's batches,
-    // oldest date first — mirrors admin's own ship-by grouping (see
-    // shipByDate in admin/index.astro) so "today"/"tomorrow" mean the same
-    // thing everywhere in the app. `activated` mirrors the original global
+    // One card per ship-by date currently among this picker's batches, but
+    // only for today and tomorrow — the floor only ever needs to work
+    // today's and tomorrow's picklists; a far-future order (like the
+    // original Sept 27 one) stays reserved and stock-locked exactly as
+    // before, it just doesn't get its own card cluttering this screen until
+    // its date actually rolls into the window. Nothing needs to "release"
+    // it — this filter is recomputed against the real clock on every
+    // render, so a 3-day-out order becomes tomorrow's card on its own the
+    // moment the calendar catches up, no separate job needed. Oldest date
+    // first — mirrors admin's own ship-by grouping (see shipByDate in
+    // admin/index.astro) so "today"/"tomorrow" mean the same thing
+    // everywhere in the app. `activated` mirrors the original global
     // isActivated check, just scoped to this date's own batches; a batch
     // freshly swept in mid-walk for a date the picker already activated
     // inherits that date's activated state immediately (same reasoning as
@@ -114,7 +122,10 @@ const initialBatches = user.role === 'packer' && user.warehouse_id ? await getMy
         list.push(b);
         map.set(key, list);
       }
+      const todayIst = istDateString(new Date());
+      const tomorrowIst = istDateString(new Date(Date.now() + 24 * 60 * 60 * 1000));
       return [...map.entries()]
+        .filter(([date]) => date === 'unscheduled' || date === todayIst || date === tomorrowIst)
         .sort(([a], [b]) => (a === 'unscheduled' ? 1 : b === 'unscheduled' ? -1 : a.localeCompare(b)))
         .map(([date, batches]) => {
           const activated = batches.some((b) => b.status === 'in_progress' || b.status === 'completed');
@@ -304,10 +315,32 @@ const initialBatches = user.role === 'packer' && user.warehouse_id ? await getMy
       const remaining = rows.filter((r) => r.status === 'pending').length;
       const totalOrders = new Set(rows.map((r) => r.external_order_id)).size;
       const totalSkuLines = new Set(rows.map((r) => `${r.location_code}__${r.sku_code}`)).size;
+      // "today"/"tomorrow"/"27 Sept" for the done banner's "All orders
+      // picked for ___" — dateLabel always starts with "Ship by " except
+      // for the no-ship-by-date bucket, which reads better with no date
+      // phrase at all than literally "for No ship-by date".
+      const dateWord = g.date === 'unscheduled' ? '' : ` for ${dateLabel(g.date).replace(/^Ship by /, '')}`;
 
       const section = document.createElement('div');
       section.className = 'stack';
       section.style.gap = '14px';
+
+      // Once every order for this date is picked, the whole point is a
+      // clean "you're done" signal rather than a screen of already-"Done"
+      // cards to scroll past — real gap found live: this section used to
+      // just vanish outright once finished (a reload dropped it entirely,
+      // since a completed pick_batch no longer counts as "active" — see
+      // getMyBatches in lib/picker.ts), leaving no confirmation on screen
+      // that today's picking was actually done.
+      if (remaining === 0) {
+        section.innerHTML = `
+          <div class="stack" style="gap: 8px;">
+            <span class="big-label" style="font-size: 1.1rem;">${escapeHtml(dateLabel(g.date))}</span>
+          </div>
+          <div class="banner banner-success">All orders picked${escapeHtml(dateWord)} — new orders will appear here automatically.</div>`;
+        return section;
+      }
+
       section.innerHTML = `
         <div class="stack" style="gap: 8px;">
           <span class="big-label" style="font-size: 1.1rem;">${escapeHtml(dateLabel(g.date))}</span>
@@ -321,13 +354,6 @@ const initialBatches = user.role === 'packer' && user.warehouse_id ? await getMy
 
       const container = section.querySelector('[data-locations]') as HTMLElement;
       for (const locGroup of groupByLocation(rows)) container.appendChild(renderLocationSection(locGroup));
-
-      if (remaining === 0) {
-        const banner = document.createElement('div');
-        banner.className = 'banner banner-success';
-        banner.textContent = 'All caught up on this picklist — new orders for this date will appear here automatically.';
-        container.appendChild(banner);
-      }
 
       return section;
     }

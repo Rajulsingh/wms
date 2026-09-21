@@ -575,6 +575,21 @@ export async function getMyBatches(db: D1Database, warehouseId: string, pickerId
     if (!claimed) break;
     batchIds.push(claimed);
   }
+
+  // Also surface batches this picker finished earlier today — a completed
+  // pick_batch drops out of getMyActiveBatches by design (packing takes over
+  // from here, it's no longer "active" picking work), but that meant a
+  // reload right after finishing every order for a date showed nothing at
+  // all where that date's card used to be — a real gap found live. Bounded
+  // to "completed today" (UTC calendar day, a loose bound — picker/index.astro
+  // does the real IST today/tomorrow filtering client-side) so this can't
+  // grow into a full history scan.
+  const recentlyCompleted = await db
+    .prepare(`SELECT id FROM pick_batches WHERE warehouse_id = ? AND assigned_picker_id = ? AND status = 'completed' AND completed_at >= date('now')`)
+    .bind(warehouseId, pickerId)
+    .all<{ id: string }>();
+  for (const r of recentlyCompleted.results) if (!batchIds.includes(r.id)) batchIds.push(r.id);
+
   if (!batchIds.length) return [];
 
   const placeholders = batchIds.map(() => '?').join(',');
