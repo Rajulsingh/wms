@@ -90,14 +90,19 @@ async function claimAvailableBatch(db: D1Database, warehouseId: string, pickerId
  * ticket. It's also effectively permanent: `assignBatchToPacker` already
  * refuses to touch anything past 'assigned', so nothing in this codebase
  * ever moves a batch back out of 'in_progress'.
+ *
+ * Scoped to one `shipByDate` — a picker with both a "ship by today" and a
+ * "ship by tomorrow" picklist sees two separate gates (picker/index.astro)
+ * and activates them independently, so this must only flip the batches for
+ * the date actually being activated, never the picker's other pending date.
  */
-export async function activateBatches(db: D1Database, warehouseId: string, pickerId: string): Promise<void> {
+export async function activateBatches(db: D1Database, warehouseId: string, pickerId: string, shipByDate: string): Promise<void> {
   await db
     .prepare(
       `UPDATE pick_batches SET status = 'in_progress', activated_at = datetime('now')
-       WHERE warehouse_id = ? AND assigned_picker_id = ? AND status = 'assigned'`
+       WHERE warehouse_id = ? AND assigned_picker_id = ? AND status = 'assigned' AND ship_by_date = ?`
     )
-    .bind(warehouseId, pickerId)
+    .bind(warehouseId, pickerId, shipByDate)
     .run();
 }
 
@@ -535,6 +540,7 @@ export async function getMyActiveBatches(db: D1Database, warehouseId: string, pi
 export interface MyBatchEntry {
   batchId: string;
   status: string;
+  shipByDate: string | null;
   rows: PickListRow[];
 }
 
@@ -573,7 +579,10 @@ export async function getMyBatches(db: D1Database, warehouseId: string, pickerId
 
   const placeholders = batchIds.map(() => '?').join(',');
   const [statusRows, allRows] = await Promise.all([
-    db.prepare(`SELECT id, status FROM pick_batches WHERE id IN (${placeholders})`).bind(...batchIds).all<{ id: string; status: string }>(),
+    db
+      .prepare(`SELECT id, status, ship_by_date FROM pick_batches WHERE id IN (${placeholders})`)
+      .bind(...batchIds)
+      .all<{ id: string; status: string; ship_by_date: string | null }>(),
     db
       .prepare(
         `SELECT
@@ -605,6 +614,7 @@ export async function getMyBatches(db: D1Database, warehouseId: string, pickerId
   ]);
 
   const statusByBatch = new Map(statusRows.results.map((r) => [r.id, r.status]));
+  const shipByDateByBatch = new Map(statusRows.results.map((r) => [r.id, r.ship_by_date]));
   const rowsByBatch = new Map<string, PickListRow[]>();
   for (const r of allRows.results) {
     const list = rowsByBatch.get(r.pick_batch_id) ?? [];
@@ -614,6 +624,7 @@ export async function getMyBatches(db: D1Database, warehouseId: string, pickerId
 
   return batchIds.map((batchId) => ({
     batchId,
+    shipByDate: shipByDateByBatch.get(batchId) ?? null,
     status: statusByBatch.get(batchId) ?? 'pending',
     rows: rowsByBatch.get(batchId) ?? []
   }));

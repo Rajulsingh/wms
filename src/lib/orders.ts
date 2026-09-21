@@ -143,38 +143,34 @@ export interface ReserveOrderResult {
   batchId?: string;
   taskCount: number;
   reason?: string;
-  // Set (never alongside `reason`) when the only thing blocking reservation
-  // is that the order isn't due to ship yet — see isDueForPickingToday
-  // below. Distinguished from `reason` so callers (importAmazonOrders,
-  // retryBlockedOrders) don't lump "scheduled for a later day, working as
-  // intended" in with genuine stock-shortage "blocked" noise.
-  notDueYet?: boolean;
-  // Same idea, for an order Amazon hasn't confirmed yet (see
-  // amazon_order_status below) — held back even if its ship-by date is
-  // today, since Amazon could still cancel it before ever confirming it.
+  // Set (never alongside `reason`) for an order Amazon hasn't confirmed yet
+  // (see amazon_order_status below) — held back since Amazon could still
+  // cancel it before ever confirming it. Distinguished from `reason` so
+  // callers (importAmazonOrders, retryBlockedOrders) don't lump "waiting on
+  // Amazon, working as intended" in with genuine stock-shortage "blocked"
+  // noise.
   stillPending?: boolean;
 }
 
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 
 /**
- * A pick list should only ever contain orders actually going out today — a
- * user request after finding a same-day-scheduled Easy Ship order already
- * sitting in the active pick pool days before its real ship-by date (see
- * HANDOFF.md). `shipBy` is UTC (Amazon's `LatestShipDate`/`EarliestShipDate`,
+ * The IST calendar date (`YYYY-MM-DD`) a pick_batch is grouped under, so a
+ * far-future order (e.g. one scheduled 11 days out — a real incident, see
+ * HANDOFF.md) gets its own clearly-labeled, separately-activated picklist
+ * instead of either being hidden entirely or mixed in with today's actual
+ * urgent work. `shipBy` is UTC (Amazon's `LatestShipDate`/`EarliestShipDate`,
  * see amazon.ts); this seller's warehouse is India-based (same assumption
- * the cron trigger already hardcodes), so "today" means the IST calendar
- * day, not the UTC one — shifting both timestamps by the same fixed offset
- * before comparing dates is enough to get that right without a timezone
- * library. `null` (manual/CSV orders with no known ship-by date) is always
- * due — there's no date to defer to, so gating it would just leave it
- * stuck forever.
+ * the cron trigger already hardcodes), so the date is the IST calendar day,
+ * not the UTC one — shifting the timestamp by a fixed offset before slicing
+ * is enough to get that right without a timezone library. `null` (manual/CSV
+ * orders with no known ship-by date) groups under today's IST date — there's
+ * no real date to label it with, and "today" is the most useful default for
+ * something with no deadline of its own.
  */
-function isDueForPickingToday(shipBy: string | null): boolean {
-  if (!shipBy) return true;
-  const shipByIstDate = new Date(new Date(shipBy).getTime() + IST_OFFSET_MS).toISOString().slice(0, 10);
-  const todayIstDate = new Date(Date.now() + IST_OFFSET_MS).toISOString().slice(0, 10);
-  return shipByIstDate <= todayIstDate;
+function computeShipByIstDate(shipBy: string | null): string {
+  const ms = shipBy ? new Date(shipBy).getTime() : Date.now();
+  return new Date(ms + IST_OFFSET_MS).toISOString().slice(0, 10);
 }
 
 /**
@@ -186,11 +182,13 @@ function isDueForPickingToday(shipBy: string | null): boolean {
  * it's left `'pending'` untouched, to be retried later (see the retry hook
  * in inbound.ts's receiveStock, and picker.ts's self-healing fallback).
  *
- * Also gated on `isDueForPickingToday` — an order isn't reserved (no stock
- * locked, no pick_batch created) until its ship-by day actually arrives, so
- * the same retry machinery that re-attempts a stock-blocked order (the cron
- * job's retryBlockedOrders, every 5 minutes during warehouse hours) is what
- * naturally picks it up once it's due, with no separate scheduler needed.
+ * Every order reserves as soon as it's confirmed and in stock, regardless of
+ * how far out its ship-by date is — grouped into a `pick_batches.ship_by_date`
+ * label (see `computeShipByIstDate`) instead of held back, so a picker's
+ * "Activate pick list" gate can offer today's and tomorrow's picklists as
+ * separate, independently-activatable units rather than either hiding a
+ * near-term order or drowning today's urgent work in a far-future one (the
+ * original problem `computeShipByIstDate`'s docs describe). See HANDOFF.md.
  *
  * Also gated on `amazon_order_status !== 'Pending'` — a user request after
  * finding a genuinely same-day order still sitting Amazon-side "Pending"
@@ -216,9 +214,6 @@ export async function reserveOrderForPicking(db: D1Database, warehouseId: string
     .first<{ ship_by: string | null; amazon_order_status: string | null }>();
   if (orderRow?.amazon_order_status === 'Pending') {
     return { reserved: false, taskCount: 0, stillPending: true };
-  }
-  if (orderRow && !isDueForPickingToday(orderRow.ship_by)) {
-    return { reserved: false, taskCount: 0, notDueYet: true };
   }
 
   const items = await db
@@ -261,9 +256,13 @@ export async function reserveOrderForPicking(db: D1Database, warehouseId: string
   }
 
   const batchId = newId();
+  const shipByDate = computeShipByIstDate(orderRow?.ship_by ?? null);
   let taskCount = 0;
   try {
-    await db.prepare(`INSERT INTO pick_batches (id, warehouse_id, status) VALUES (?, ?, 'pending')`).bind(batchId, warehouseId).run();
+    await db
+      .prepare(`INSERT INTO pick_batches (id, warehouse_id, status, ship_by_date) VALUES (?, ?, 'pending', ?)`)
+      .bind(batchId, warehouseId, shipByDate)
+      .run();
     for (const r of orderReservations) {
       const location = await db
         .prepare(`SELECT sequence_number FROM locations WHERE id = ?`)

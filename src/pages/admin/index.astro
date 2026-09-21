@@ -110,9 +110,8 @@ if (redirectTo) return Astro.redirect(redirectTo);
     }
 
     // IST, not the browser's local zone — this warehouse is IST-only and the
-    // date this deadline actually falls on in IST is what matters for
-    // "is this due today" judgment calls, same reasoning as isDueForPickingToday
-    // in lib/orders.ts.
+    // date this deadline actually falls on in IST is what matters, same
+    // reasoning as computeShipByIstDate in lib/orders.ts.
     function shipByDate(o: OrderRow): string {
       if (!o.ship_by) return '—';
       return new Date(o.ship_by).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric' });

@@ -38,7 +38,7 @@ const initialBatches = user.role === 'packer' && user.warehouse_id ? await getMy
     window.__initialBatches = initialBatches;
   </script>
   <script>
-    import { escapeHtml, qtyStepperHtml, wireQtySteppers } from '../../lib/ui';
+    import { escapeHtml, qtyStepperHtml, wireQtySteppers, withLoading } from '../../lib/ui';
 
     interface Row {
       pick_task_id: string;
@@ -58,20 +58,79 @@ const initialBatches = user.role === 'packer' && user.warehouse_id ? await getMy
     interface BatchEntry {
       batchId: string;
       status: string;
+      shipByDate: string | null;
       rows: Row[];
     }
 
-    // Gates the picker into their list instead of dropping them straight
-    // into it the instant the page loads — the pick list itself is still
-    // assembled fully automatically in the background (claim-batch below
-    // runs on every boot with no admin step required), this only adds a
-    // deliberate "I'm ready" tap before work starts, and a second explicit
-    // "go" before the picker is actually looking at rack instructions.
-    // 'gate' = summary + Activate button, 'activating' = progress bar while
-    // (re-)fetching for freshness, 'ready' = activated, waiting for Start
-    // picking, 'working' = the real pick-section list (former sole state).
-    type Stage = 'gate' | 'activating' | 'ready' | 'working';
-    let stage: Stage = 'gate';
+    // Gates the picker into each ship-by-date's own list instead of dropping
+    // them straight into everything the instant the page loads — the lists
+    // themselves are still assembled fully automatically in the background
+    // (claim-batch below runs on every boot with no admin step required),
+    // this only adds a deliberate "I'm ready" tap before work starts for
+    // that date, and a second explicit "go" before the picker is actually
+    // looking at rack instructions for it. A picker with both a "ship by
+    // today" and a "ship by tomorrow" picklist sees two independent gates —
+    // activating one never touches the other, and once both are started
+    // they sit as two clearly-labeled sections on the same continuous page
+    // (see dateGroups/render below), not merged into one list, so a picker
+    // can move between them without losing which is which.
+    const startedDates = new Set<string>();
+
+    function istDateString(d: Date): string {
+      return d.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+    }
+
+    function dateLabel(date: string): string {
+      if (date === 'unscheduled') return 'No ship-by date';
+      const todayIst = istDateString(new Date());
+      const tomorrowIst = istDateString(new Date(Date.now() + 24 * 60 * 60 * 1000));
+      if (date === todayIst) return 'Ship by today';
+      if (date === tomorrowIst) return 'Ship by tomorrow';
+      const [y, m, d] = date.split('-').map(Number);
+      return `Ship by ${new Date(y, m - 1, d).toLocaleDateString('en-IN', { day: '2-digit', month: 'short' })}`;
+    }
+
+    interface DateGroup {
+      date: string;
+      batches: BatchEntry[];
+      activated: boolean;
+      started: boolean;
+    }
+
+    // One card per ship-by date currently among this picker's batches,
+    // oldest date first — mirrors admin's own ship-by grouping (see
+    // shipByDate in admin/index.astro) so "today"/"tomorrow" mean the same
+    // thing everywhere in the app. `activated` mirrors the original global
+    // isActivated check, just scoped to this date's own batches; a batch
+    // freshly swept in mid-walk for a date the picker already activated
+    // inherits that date's activated state immediately (same reasoning as
+    // markBatchStarted in lib/picker.ts — proof of work already underway on
+    // this date is what matters, not each individual batch's own status).
+    function dateGroups(): DateGroup[] {
+      const map = new Map<string, BatchEntry[]>();
+      for (const b of batchList) {
+        const key = b.shipByDate ?? 'unscheduled';
+        const list = map.get(key) ?? [];
+        list.push(b);
+        map.set(key, list);
+      }
+      return [...map.entries()]
+        .sort(([a], [b]) => (a === 'unscheduled' ? 1 : b === 'unscheduled' ? -1 : a.localeCompare(b)))
+        .map(([date, batches]) => {
+          const activated = batches.some((b) => b.status === 'in_progress' || b.status === 'completed');
+          const hasStarted = batches.some((b) => b.rows.some((r) => r.status !== 'pending'));
+          return { date, batches, activated, started: activated && (hasStarted || startedDates.has(date)) };
+        });
+    }
+
+    function groupSummary(batches: BatchEntry[]): { orders: number; lines: number; units: number } {
+      const rows = batches.flatMap((b) => b.rows);
+      return {
+        orders: new Set(rows.map((r) => r.external_order_id)).size,
+        lines: new Set(rows.map((r) => `${r.location_code}__${r.sku_code}`)).size,
+        units: rows.reduce((sum, r) => sum + r.quantity_required, 0)
+      };
+    }
 
     interface LocationGroup {
       key: string;
@@ -121,36 +180,17 @@ const initialBatches = user.role === 'packer' && user.warehouse_id ? await getMy
 
       const initial = (window as any).__initialBatches;
       batchList = initial ?? (await api('/api/picker/claim-batch', { warehouseId })).batches ?? [];
-      // A reload resumes past the gate whenever there's real evidence a
-      // human already got past it — either rows already picked/short/
-      // damaged (mid-walk), or the batch itself is already 'in_progress'
-      // (activated but not yet started — see activate() below and
-      // activateBatches in lib/picker.ts). Without the status check, a
-      // reload right after activating but before the first pick used to
-      // drop the picker straight back to "Activate pick list" as if nothing
-      // had happened, since a freshly-claimed batch never leaves 'assigned'
-      // any other way.
-      stage = hasStartedWork(batchList) ? 'working' : isActivated(batchList) ? 'ready' : 'gate';
-      renderStage();
+      render();
 
-      // Batches keep arriving — admin assigning one directly, or a fresh
-      // auto-sweep once everything currently shown is finished — so this
-      // never stops polling. Only actually re-renders when something new
-      // shows up, so an open "why was this short" panel elsewhere on the
-      // page survives a quiet tick. Only the 'working' stage renders new
-      // rows straight into the visible list — during 'gate'/'ready' it just
-      // refreshes the summary counts so a picker still on that screen isn't
-      // shown a stale total, without silently starting work for them. See
-      // HANDOFF.md.
+      // Batches keep arriving — admin assigning one directly, a fresh
+      // auto-sweep once everything currently shown is finished, or a brand
+      // new ship-by date showing up for the first time — so this never
+      // stops polling. Only actually re-renders when something new shows
+      // up, so an open "why was this short" panel elsewhere on the page
+      // survives a quiet tick. render() itself is stage-aware per date (see
+      // dateGroups above), so a poll can safely add a new gate card for one
+      // date while leaving another date's in-progress work undisturbed.
       setInterval(pollForMore, 8000);
-    }
-
-    function hasStartedWork(batches: BatchEntry[]): boolean {
-      return batches.some((b) => b.rows.some((r) => r.status !== 'pending'));
-    }
-
-    function isActivated(batches: BatchEntry[]): boolean {
-      return batches.some((b) => b.status === 'in_progress' || b.status === 'completed');
     }
 
     async function pollForMore() {
@@ -161,102 +201,68 @@ const initialBatches = user.role === 'packer' && user.warehouse_id ? await getMy
         const newOnes = incoming.filter((b) => !batchList.some((e) => e.batchId === b.batchId));
         if (!newOnes.length) return;
         batchList.push(...newOnes);
-        if (stage === 'working') render();
-        else if (stage === 'gate') renderGate();
+        render();
       } catch {
         // Transient — ignore, the next tick retries.
       }
     }
 
-    function renderStage() {
-      if (stage === 'gate') renderGate();
-      else if (stage === 'activating') renderActivating();
-      else if (stage === 'ready') renderReady();
-      else render();
+    function renderGateCard(g: DateGroup): HTMLElement {
+      const { orders, lines, units } = groupSummary(g.batches);
+      const el = document.createElement('div');
+      el.className = 'card stack';
+      el.style.gap = '10px';
+      el.innerHTML = `
+        <div class="eyebrow">${escapeHtml(dateLabel(g.date))}</div>
+        <p style="margin: 0;">${orders} order${orders === 1 ? '' : 's'} · ${lines} SKU line${lines === 1 ? '' : 's'} · ${units} unit${units === 1 ? '' : 's'}</p>
+        <button class="btn btn-primary activate-btn" style="width: auto; align-self: flex-start;">Activate pick list</button>`;
+      const btn = el.querySelector('.activate-btn') as HTMLButtonElement;
+      btn.addEventListener('click', () => activate(g.date, btn));
+      return el;
     }
 
-    function batchSummary(): { orders: number; lines: number; units: number } {
-      const rows = allRows();
-      return {
-        orders: new Set(rows.map((r) => r.external_order_id)).size,
-        lines: new Set(rows.map((r) => `${r.location_code}__${r.sku_code}`)).size,
-        units: rows.reduce((sum, r) => sum + r.quantity_required, 0)
-      };
-    }
-
-    function renderGate() {
-      const { orders, lines, units } = batchSummary();
-      const errorHtml = lastError ? `<div class="banner banner-danger">${escapeHtml(lastError)}</div>` : '';
-      app.innerHTML = orders
-        ? `
-        ${errorHtml}
-        <div class="stack" style="flex:1; justify-content:center; text-align:center; gap: 16px;">
-          <div>
-            <div class="big-label">Pick list ready</div>
-            <p>${orders} order${orders === 1 ? '' : 's'} · ${lines} SKU line${lines === 1 ? '' : 's'} · ${units} unit${units === 1 ? '' : 's'}</p>
-          </div>
-          <button class="btn btn-primary" id="activate-btn" style="width: auto; align-self: center; padding: 0 32px;">Activate pick list</button>
-        </div>`
-        : `
-        ${errorHtml}
-        <div class="stack" style="flex:1; justify-content:center; text-align:center;">
-          <div class="big-label">No batches</div>
-          <p>Nothing assigned right now — this checks automatically, or tap to check now.</p>
-          <button class="btn" id="retry">Check again</button>
-        </div>`;
-      document.getElementById('activate-btn')?.addEventListener('click', activate);
-      document.getElementById('retry')?.addEventListener('click', boot);
-    }
-
-    function renderActivating() {
-      app.innerHTML = `
-        <div class="stack" style="flex:1; justify-content:center; text-align:center; gap: 12px;">
-          <div class="big-label">Activating…</div>
-          <div class="progress-bar indeterminate active" style="max-width: 280px; margin: 0 auto;"><div class="progress-bar-fill"></div></div>
-        </div>`;
-    }
-
-    function renderReady() {
-      const { orders, lines, units } = batchSummary();
-      app.innerHTML = `
-        <div class="stack" style="flex:1; justify-content:center; text-align:center; gap: 16px;">
-          <div class="banner banner-success" style="display:inline-block;">Pick list activated</div>
-          <p>${orders} order${orders === 1 ? '' : 's'} · ${lines} SKU line${lines === 1 ? '' : 's'} · ${units} unit${units === 1 ? '' : 's'} ready to go.</p>
-          <button class="btn btn-primary" id="start-btn" style="width: auto; align-self: center; padding: 0 32px;">Start picking</button>
-        </div>`;
-      document.getElementById('start-btn')?.addEventListener('click', () => {
-        stage = 'working';
+    function renderReadyCard(g: DateGroup): HTMLElement {
+      const { orders, lines, units } = groupSummary(g.batches);
+      const el = document.createElement('div');
+      el.className = 'card stack';
+      el.style.gap = '10px';
+      el.innerHTML = `
+        <div class="eyebrow">${escapeHtml(dateLabel(g.date))}</div>
+        <div class="banner banner-success" style="display: inline-block; width: fit-content;">Pick list activated</div>
+        <p style="margin: 0;">${orders} order${orders === 1 ? '' : 's'} · ${lines} SKU line${lines === 1 ? '' : 's'} · ${units} unit${units === 1 ? '' : 's'} ready to go.</p>
+        <button class="btn btn-primary start-btn" style="width: auto; align-self: flex-start;">Start picking</button>`;
+      el.querySelector('.start-btn')?.addEventListener('click', () => {
+        startedDates.add(g.date);
         render();
       });
+      return el;
     }
 
-    // Re-fetches (rather than reusing what boot() already has) so "activate"
-    // genuinely reflects the current pick list — anything assigned in the
-    // seconds between landing on this screen and tapping the button is
-    // included, not just whatever existed at page load. The optimized
-    // getMyBatches (lib/picker.ts) fetches every batch's rows in one query
-    // instead of looping per batch, so this stays fast even with a full cart
-    // of small orders — no artificial delay added on top of it.
+    // Re-fetches (rather than reusing what render() already has) so
+    // "activate" genuinely reflects the current pick list — anything
+    // assigned in the seconds between landing on this screen and tapping
+    // the button is included, not just whatever existed at page load. The
+    // optimized getMyBatches (lib/picker.ts) fetches every batch's rows in
+    // one query instead of looping per batch, so this stays fast even with
+    // a full cart of small orders.
     //
-    // The actual persistence happens server-side (activate-batches, before
-    // the re-fetch) — this is what makes activation survive a reload instead
-    // of living only in this file's `stage` variable. See activateBatches in
-    // lib/picker.ts.
-    async function activate() {
-      stage = 'activating';
-      renderActivating();
+    // The actual persistence happens server-side (activate-batches, scoped
+    // to this one shipByDate — before the re-fetch) — this is what makes
+    // activation survive a reload instead of living only in this file's own
+    // state, and what keeps it from ever touching a picker's other,
+    // not-yet-activated date. See activateBatches in lib/picker.ts.
+    async function activate(shipByDate: string, btn: HTMLButtonElement) {
       try {
-        await api('/api/picker/activate-batches', { warehouseId });
-        const data = await api('/api/picker/claim-batch', { warehouseId });
-        batchList = data.batches ?? [];
+        await withLoading(btn, 'Activating…', async () => {
+          await api('/api/picker/activate-batches', { warehouseId, shipByDate });
+          const data = await api('/api/picker/claim-batch', { warehouseId });
+          batchList = data.batches ?? [];
+        });
         lastError = '';
-        stage = 'ready';
-        renderReady();
       } catch (err) {
         lastError = (err as Error).message;
-        stage = 'gate';
-        renderGate();
       }
+      render();
     }
 
     // Badge on the "Pack" tab so a picker knows work is waiting there without
@@ -283,46 +289,74 @@ const initialBatches = user.role === 'packer' && user.warehouse_id ? await getMy
       document.getElementById('retry')?.addEventListener('click', boot);
     }
 
-    // Every pick_task from every batch this picker has (auto-swept, or
-    // hand-assigned by admin) collapses into ONE flat list, grouped by
-    // location then SKU — never by batch and never by order. A picker's job
-    // is "bring N of this SKU from this bin", not "work through batch A then
-    // batch B" — which order(s) it's for is supporting detail under each
-    // SKU card, not the organizing axis. Two batches needing the same SKU at
-    // the same bin merge into a single card and a single "Mark done" tap
-    // covers both at once. See HANDOFF.md.
-    function allRows(): Row[] {
-      return batchList.flatMap((e) => e.rows);
+    // One section per ship-by date the picker has actually started (tapped
+    // "Start picking", or resumed mid-walk — see dateGroups above). Every
+    // pick_task within *that date* collapses into one flat list, grouped by
+    // location then SKU — never by batch and never by order, same as
+    // before. Two batches needing the same SKU at the same bin merge into a
+    // single card and a single "Mark done" tap covers both, but only within
+    // one date — the same SKU needed for both today and tomorrow renders as
+    // two separate cards, one per section, since picking tomorrow's stock
+    // into today's box (or the reverse) is exactly the mistake keeping
+    // dates visually distinct is meant to prevent. See HANDOFF.md.
+    function renderWorkingSection(g: DateGroup): HTMLElement {
+      const rows = g.batches.flatMap((b) => b.rows);
+      const remaining = rows.filter((r) => r.status === 'pending').length;
+      const totalOrders = new Set(rows.map((r) => r.external_order_id)).size;
+      const totalSkuLines = new Set(rows.map((r) => `${r.location_code}__${r.sku_code}`)).size;
+
+      const section = document.createElement('div');
+      section.className = 'stack';
+      section.style.gap = '14px';
+      section.innerHTML = `
+        <div class="stack" style="gap: 8px;">
+          <span class="big-label" style="font-size: 1.1rem;">${escapeHtml(dateLabel(g.date))}</span>
+          <div class="stack" style="flex-direction: row; gap: 16px; flex-wrap: wrap;">
+            <span class="pill">${totalOrders} orders</span>
+            <span class="pill">${totalSkuLines} SKU lines</span>
+            <span class="pill">${remaining} of ${rows.length} left</span>
+          </div>
+        </div>
+        <div class="stack" style="gap: 22px;" data-locations></div>`;
+
+      const container = section.querySelector('[data-locations]') as HTMLElement;
+      for (const locGroup of groupByLocation(rows)) container.appendChild(renderLocationSection(locGroup));
+
+      if (remaining === 0) {
+        const banner = document.createElement('div');
+        banner.className = 'banner banner-success';
+        banner.textContent = 'All caught up on this picklist — new orders for this date will appear here automatically.';
+        container.appendChild(banner);
+      }
+
+      return section;
     }
 
     function render() {
-      if (!batchList.length) {
+      const groups = dateGroups();
+      if (!groups.length) {
         renderNoBatch();
         return;
       }
 
-      const rows = allRows();
-      const totalRemaining = rows.filter((r) => r.status === 'pending').length;
-      const totalOrders = new Set(rows.map((r) => r.external_order_id)).size;
-      const totalSkuLines = new Set(rows.map((r) => `${r.location_code}__${r.sku_code}`)).size;
+      const gateGroups = groups.filter((g) => !g.activated);
+      const readyGroups = groups.filter((g) => g.activated && !g.started);
+      const workingGroups = groups.filter((g) => g.started);
 
-      app.innerHTML = `
-        ${lastError ? `<div class="banner banner-danger">${lastError}</div>` : ''}
-        <div class="stack" id="summary" style="flex-direction: row; gap: 16px; flex-wrap: wrap;">
-          <span class="pill">${totalOrders} orders</span>
-          <span class="pill">${totalSkuLines} SKU lines</span>
-          <span class="pill">${totalRemaining} of ${rows.length} left</span>
-        </div>
-        <div class="stack" id="location-container" style="gap: 22px;"></div>`;
+      let html = lastError ? `<div class="banner banner-danger">${escapeHtml(lastError)}</div>` : '';
+      if (gateGroups.length || readyGroups.length) html += `<div class="stack" id="picklists-panel" style="gap: 12px;"></div>`;
+      if (workingGroups.length) html += `<div class="stack" id="working-panel" style="gap: 32px; margin-top: 8px;"></div>`;
+      app.innerHTML = html;
 
-      const container = document.getElementById('location-container')!;
-      for (const locGroup of groupByLocation(rows)) container.appendChild(renderLocationSection(locGroup));
+      const panel = document.getElementById('picklists-panel');
+      if (panel) {
+        for (const g of gateGroups) panel.appendChild(renderGateCard(g));
+        for (const g of readyGroups) panel.appendChild(renderReadyCard(g));
+      }
 
-      if (totalRemaining === 0) {
-        const banner = document.createElement('div');
-        banner.className = 'banner banner-success';
-        banner.textContent = 'All caught up — new batches will appear here automatically.';
-        container.appendChild(banner);
+      const working = document.getElementById('working-panel');
+      if (working) {
+        for (const g of workingGroups) working.appendChild(renderWorkingSection(g));
       }
     }
 
