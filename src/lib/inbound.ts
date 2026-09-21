@@ -107,10 +107,23 @@ export async function receiveStock(
     const location = await db.prepare(`SELECT id FROM locations WHERE id = ? AND warehouse_id = ?`).bind(line.locationId, warehouseId).first<{ id: string }>();
     if (!location) throw new InboundError('location_not_found', 'Location not found in this warehouse');
 
+    // `status = 'available'` on the UPDATE branch matters as much as the
+    // quantity itself — real incident: a bin got flagged 'damaged' by a
+    // picker's report, then real, good stock was received into that exact
+    // (sku, location) later. The old UPSERT only added to quantity_on_hand
+    // and left `status` untouched, so the freshly-received units silently
+    // inherited the stale 'damaged' flag — reserveInventory (inventory.ts)
+    // filters `status = 'available'` and never even considers a 'damaged'
+    // row regardless of quantity, so the order kept reporting "0 in stock"
+    // even with real units physically on the shelf. Receiving is an
+    // explicit human action confirming what's in that bin right now is
+    // good — the same correction signal this app already uses elsewhere
+    // (e.g. an admin's SKU merge), so it's the right moment to clear a
+    // stale damage flag, not something that needs its own separate step.
     await db
       .prepare(
         `INSERT INTO inventory (id, sku_id, location_id, quantity_on_hand) VALUES (?, ?, ?, ?)
-         ON CONFLICT (sku_id, location_id) DO UPDATE SET quantity_on_hand = quantity_on_hand + excluded.quantity_on_hand, version = version + 1, updated_at = datetime('now')`
+         ON CONFLICT (sku_id, location_id) DO UPDATE SET quantity_on_hand = quantity_on_hand + excluded.quantity_on_hand, status = 'available', version = version + 1, updated_at = datetime('now')`
       )
       .bind(newId(), skuId, line.locationId, line.quantity)
       .run();
