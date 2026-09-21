@@ -131,7 +131,7 @@ if (user.role === 'packer' && user.warehouse_id) {
         app.innerHTML = `<p>This account is a "${user.role}" — the packer dashboard needs a packer login.</p>`;
         return;
       }
-      warehouseId = user.warehouse_id;
+      warehouseId = user.warehouseId;
       pollWorkBadge();
 
       const initial = (window as any).__initialData;
