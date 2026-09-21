@@ -663,6 +663,51 @@ tbody tr:hover {
   border-color: var(--danger-border);
 }
 
+/* Bulk-edit save bar (admin/inventory.astro) — appears once any row has an
+   unsaved change, fixed to the bottom of the viewport so it's reachable
+   regardless of scroll position in a long table. */
+#inventory-rows tr.dirty-row {
+  background: var(--warning-bg);
+}
+
+.bulk-save-bar {
+  position: fixed;
+  left: 50%;
+  bottom: 20px;
+  transform: translateX(-50%) translateY(24px);
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  background: var(--sidebar-bg);
+  color: var(--sidebar-fg);
+  padding: 10px 14px 10px 18px;
+  border-radius: 999px;
+  box-shadow: var(--shadow-md);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s ease, transform 0.18s ease;
+  z-index: 65;
+}
+
+.bulk-save-bar.show {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+  pointer-events: auto;
+}
+
+.bulk-save-bar .status-pill {
+  white-space: nowrap;
+}
+
+.bulk-save-bar .btn-ghost {
+  color: var(--sidebar-fg);
+}
+
+.bulk-save-bar .btn-ghost:hover {
+  background: var(--sidebar-bg-2);
+  color: var(--sidebar-fg);
+}
+
 .pick-flash-toast {
   position: fixed;
   top: 14px;
