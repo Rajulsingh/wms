@@ -12,7 +12,14 @@ import {
   type HandoverSlot
 } from './amazon';
 import { stampPackageIdentifier } from './label-stamp';
-import { resolveAmazonCredentialsForWarehouse } from './org-accounts';
+import { resolveAmazonCredentialsForWarehouse, NOT_CONNECTED } from './org-accounts';
+
+function assertConnected<T>(credentials: T | typeof NOT_CONNECTED): T {
+  if (credentials === NOT_CONNECTED) {
+    throw new ShippingError('amazon_not_connected', 'Connect your Amazon account first (Settings → Connect Amazon) before shipping orders.');
+  }
+  return credentials;
+}
 
 export class ShippingError extends Error {
   constructor(public code: string, message: string) {
@@ -56,7 +63,7 @@ async function loadOrderAndBox(
 
 export async function getHandoverSlotsForOrder(db: D1Database, orderId: string, boxSizeId: string, weightGrams: number): Promise<HandoverSlot[]> {
   const { order, lengthCm, widthCm, heightCm } = await loadOrderAndBox(db, orderId, boxSizeId);
-  const credentials = await resolveAmazonCredentialsForWarehouse(db, order.warehouse_id);
+  const credentials = assertConnected(await resolveAmazonCredentialsForWarehouse(db, order.warehouse_id));
   return listHandoverSlots(
     order.external_order_id,
     { length: lengthCm, width: widthCm, height: heightCm, unit: 'cm' },
@@ -89,7 +96,7 @@ export async function scheduleEasyShipForOrder(
   packageIdentifier: string
 ): Promise<ScheduleResult> {
   const { order } = await loadOrderAndBox(db, orderId, boxSizeId);
-  const credentials = await resolveAmazonCredentialsForWarehouse(db, order.warehouse_id);
+  const credentials = assertConnected(await resolveAmazonCredentialsForWarehouse(db, order.warehouse_id));
 
   const scheduled = await scheduleEasyShipPackage(order.external_order_id, slot, packageIdentifier, credentials);
 
@@ -165,7 +172,7 @@ export async function checkLabelStatus(db: D1Database, shipmentId: string): Prom
       warehouse_id: string;
     }>();
   if (!shipment) throw new ShippingError('not_found', 'Shipment not found');
-  const credentials = await resolveAmazonCredentialsForWarehouse(db, shipment.warehouse_id);
+  const credentials = assertConnected(await resolveAmazonCredentialsForWarehouse(db, shipment.warehouse_id));
 
   if (shipment.label_status === 'document_ready') {
     return { labelStatus: 'document_ready', labelBase64: shipment.label_base64 ?? undefined, labelFileType: shipment.label_file_type ?? undefined };
@@ -208,7 +215,7 @@ export async function retryLabelRequest(db: D1Database, shipmentId: string): Pro
     .bind(shipmentId)
     .first<{ id: string; external_order_id: string; warehouse_id: string }>();
   if (!shipment) throw new ShippingError('not_found', 'Shipment not found');
-  const credentials = await resolveAmazonCredentialsForWarehouse(db, shipment.warehouse_id);
+  const credentials = assertConnected(await resolveAmazonCredentialsForWarehouse(db, shipment.warehouse_id));
 
   const { feedId } = await requestEasyShipDocuments(shipment.external_order_id, credentials);
   await db.prepare(`UPDATE shipments SET label_status = 'feed_submitted', label_feed_id = ?, label_report_id = NULL WHERE id = ?`).bind(feedId, shipmentId).run();
@@ -310,7 +317,7 @@ export interface RateOption {
 
 export async function getRatesForOrder(db: D1Database, orderId: string, boxSizeId: string, weightValue: number, weightUnit: string): Promise<RateOption[]> {
   const { request, order } = await buildMfnShipmentRequest(db, orderId, boxSizeId, weightValue, weightUnit);
-  const credentials = await resolveAmazonCredentialsForWarehouse(db, order.warehouse_id);
+  const credentials = assertConnected(await resolveAmazonCredentialsForWarehouse(db, order.warehouse_id));
   const offers = await getEligibleShippingServices(request, credentials);
   return offers
     .filter((o) => !o.requiresAdditionalSellerInputs)
@@ -344,7 +351,7 @@ export async function purchaseLabelForOrder(
   packageIdentifier?: string
 ): Promise<PurchaseResult> {
   const { request, order } = await buildMfnShipmentRequest(db, orderId, boxSizeId, weightValue, weightUnit);
-  const credentials = await resolveAmazonCredentialsForWarehouse(db, order.warehouse_id);
+  const credentials = assertConnected(await resolveAmazonCredentialsForWarehouse(db, order.warehouse_id));
   const purchased = await purchaseShipment(request, shippingServiceId, shippingServiceOfferId, credentials);
   if (!purchased.labelBase64) throw new ShippingError('no_label', 'Amazon did not return a label in the purchase response');
 
@@ -448,7 +455,7 @@ export async function scheduleEasyShipBulk(
   // All orders in one bulk call are assumed to belong to the same warehouse
   // (the admin UI only ever offers orders from the session's own warehouse) —
   // resolving credentials once from the first order is correct for that case.
-  const credentials = await resolveAmazonCredentialsForWarehouse(db, loaded[0].order.warehouse_id);
+  const credentials = assertConnected(await resolveAmazonCredentialsForWarehouse(db, loaded[0].order.warehouse_id));
   const bulkResult = await createScheduledPackageBulk(
     loaded.map(({ input, order }) => ({
       amazonOrderId: order.external_order_id,

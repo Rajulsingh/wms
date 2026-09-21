@@ -2,7 +2,7 @@ import type { APIRoute } from 'astro';
 import { getDb, logAudit } from '../../../lib/db';
 import { requireUser, AuthError } from '../../../lib/auth';
 import { syncAmazonCatalog } from '../../../lib/catalog-sync';
-import { resolveAmazonCredentialsForWarehouse, getOrganizationIdForWarehouse } from '../../../lib/org-accounts';
+import { resolveAmazonCredentialsForWarehouse, getOrganizationIdForWarehouse, NOT_CONNECTED, AmazonNotConnectedError } from '../../../lib/org-accounts';
 
 /**
  * Streams newline-delimited JSON instead of a single JSON response — a full
@@ -21,12 +21,13 @@ export const POST: APIRoute = async (context) => {
     const user = await requireUser(context, db, ['admin']);
     if (!user.warehouse_id) return new Response(JSON.stringify({ error: 'Finish setting up your warehouse first' }), { status: 409 });
     const organizationId = await getOrganizationIdForWarehouse(db, user.warehouse_id);
+    const credentials = await resolveAmazonCredentialsForWarehouse(db, user.warehouse_id);
+    if (credentials === NOT_CONNECTED) throw new AmazonNotConnectedError();
 
     const stream = new ReadableStream({
       async start(controller) {
         const send = (obj: unknown) => controller.enqueue(encoder.encode(JSON.stringify(obj) + '\n'));
         try {
-          const credentials = await resolveAmazonCredentialsForWarehouse(db, user.warehouse_id!);
           const result = await syncAmazonCatalog(db, organizationId, (p) => send({ type: 'progress', ...p }), credentials);
           await logAudit(db, { userId: user.id, action: 'catalog.sync', metadata: result });
           send({ type: 'done', ...result });
@@ -41,6 +42,7 @@ export const POST: APIRoute = async (context) => {
     return new Response(stream, { status: 200, headers: { 'Content-Type': 'application/x-ndjson' } });
   } catch (err) {
     if (err instanceof AuthError) return new Response(JSON.stringify({ error: err.message }), { status: err.status });
+    if (err instanceof AmazonNotConnectedError) return new Response(JSON.stringify({ error: err.message }), { status: 409 });
     return new Response(JSON.stringify({ error: (err as Error).message }), { status: 500 });
   }
 };

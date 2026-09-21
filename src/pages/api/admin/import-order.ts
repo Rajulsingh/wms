@@ -3,7 +3,7 @@ import { getDb, logAudit } from '../../../lib/db';
 import { requireUser, requireOwnWarehouse, AuthError } from '../../../lib/auth';
 import { fetchOrderById } from '../../../lib/amazon';
 import { importAmazonOrders } from '../../../lib/orders';
-import { resolveAmazonCredentialsForWarehouse } from '../../../lib/org-accounts';
+import { resolveAmazonCredentialsForWarehouse, NOT_CONNECTED, AmazonNotConnectedError } from '../../../lib/org-accounts';
 
 /**
  * Backfills one specific Amazon order by id, bypassing the normal sync's
@@ -25,6 +25,7 @@ export const POST: APIRoute = async (context) => {
     requireOwnWarehouse(user, body.warehouseId);
 
     const credentials = await resolveAmazonCredentialsForWarehouse(db, body.warehouseId);
+    if (credentials === NOT_CONNECTED) throw new AmazonNotConnectedError();
     const order = await fetchOrderById(amazonOrderId, credentials);
     const summary = await importAmazonOrders(db, body.warehouseId, [order], credentials);
     await logAudit(db, { userId: user.id, action: 'order.manual_import_by_id', entityType: 'order', entityId: amazonOrderId, metadata: summary });
@@ -32,6 +33,7 @@ export const POST: APIRoute = async (context) => {
     return new Response(JSON.stringify(summary), { status: 200, headers: { 'Content-Type': 'application/json' } });
   } catch (err) {
     if (err instanceof AuthError) return new Response(JSON.stringify({ error: err.message }), { status: err.status });
+    if (err instanceof AmazonNotConnectedError) return new Response(JSON.stringify({ error: err.message }), { status: 409 });
     return new Response(JSON.stringify({ error: (err as Error).message }), { status: 500 });
   }
 };

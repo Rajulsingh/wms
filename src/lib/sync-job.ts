@@ -1,7 +1,7 @@
 import { fetchUnfulfilledOrders } from './amazon';
 import { importAmazonOrders, retryBlockedOrders } from './orders';
 import { syncOrderStatuses } from './amazon-sync';
-import { resolveAmazonCredentials } from './org-accounts';
+import { resolveAmazonCredentials, NOT_CONNECTED } from './org-accounts';
 
 export interface SyncJobResult {
   warehouseId: string;
@@ -81,12 +81,17 @@ export async function runAmazonSyncJob(db: D1Database, sinceHours = 24): Promise
   for (const wh of warehouses.results) {
     const runStartedAt = new Date();
     try {
-      // Each org's orders must sync against *its own* Amazon account, not
-      // this deploy's global one — resolveAmazonCredentials falls back to
-      // undefined (meaning "use the global env vars") for any warehouse
-      // that hasn't connected its own account yet, which is exactly this
-      // deploy's own original warehouse until it's explicitly migrated.
+      // Each org's orders must sync against *its own* Amazon account, never
+      // this deploy's global one — resolveAmazonCredentials only falls back
+      // to the global env vars for LEGACY_ORGANIZATION_ID (this deploy's own
+      // original warehouse). Real incident (see HANDOFF.md): the first live
+      // signup after this code shipped had no Amazon account connected yet,
+      // and an earlier version of this fallback silently imported the
+      // *original* org's real orders into the new org's warehouse every
+      // cron tick. Any other org with no account connected is skipped
+      // outright — no import attempt, no silent cross-account sync.
       const credentials = await resolveAmazonCredentials(db, wh.organization_id);
+      if (credentials === NOT_CONNECTED) continue;
       const since = wh.amazon_orders_synced_through ? new Date(wh.amazon_orders_synced_through) : new Date(Date.now() - sinceHours * 60 * 60 * 1000);
       const amazonOrders = await fetchUnfulfilledOrders(since, credentials);
       const importSummary = await importAmazonOrders(db, wh.id, amazonOrders, credentials);

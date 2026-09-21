@@ -199,17 +199,40 @@ export async function saveAmazonCredentials(
 }
 
 /**
- * Resolves an organization's own Amazon credentials for lib/amazon.ts calls.
- * Returns undefined (meaning "fall back to this deploy's global env vars —
- * see getEnv() in amazon.ts) when the org hasn't connected an account yet,
- * which is exactly the state your own original warehouse is in until it's
- * explicitly backfilled — so this never breaks pre-existing behavior.
+ * The pre-existing single-tenant deploy's own organization, backfilled by
+ * migrations/0026_skus_per_organization.sql. This is the ONLY organization
+ * allowed to fall back to the deploy's global env-var Amazon credentials —
+ * every other org must connect its own account or be refused sync outright.
+ *
+ * Real incident (see HANDOFF.md): the very first live signup after this
+ * multi-tenant code shipped had no Amazon account connected yet, and the
+ * original (undefined-means-"use the global account") fallback let the next
+ * cron cycle silently import the *original* organization's real live Amazon
+ * orders into the new org's empty warehouse — a duplicate, permanently-stuck
+ * copy of every order, re-created every 5 minutes for as long as it ran.
  */
-export async function resolveAmazonCredentials(db: D1Database, organizationId: string | null): Promise<Partial<AmazonEnv> | undefined> {
-  if (!organizationId) return undefined;
+export const LEGACY_ORGANIZATION_ID = '03f8b401-f826-46de-884c-84630abfb025';
+
+/** Distinguishes "use the legacy global-env fallback" from "this org has no Amazon account — refuse to sync" — see resolveAmazonCredentials. */
+export const NOT_CONNECTED = Symbol('amazon-not-connected');
+
+/**
+ * Resolves an organization's own Amazon credentials for lib/amazon.ts calls.
+ * Three outcomes: a real credentials object (org has connected its own
+ * account), `undefined` (ONLY for LEGACY_ORGANIZATION_ID — meaning "fall
+ * back to this deploy's global env vars," preserving the original
+ * warehouse's pre-existing behavior), or `NOT_CONNECTED` (any other
+ * organization with no Amazon account connected — callers must refuse to
+ * sync/act rather than ever falling back to someone else's account).
+ */
+export async function resolveAmazonCredentials(
+  db: D1Database,
+  organizationId: string | null
+): Promise<Partial<AmazonEnv> | undefined | typeof NOT_CONNECTED> {
+  if (!organizationId) return NOT_CONNECTED;
   const org = await db.prepare(`SELECT * FROM organizations WHERE id = ?`).bind(organizationId).first<Organization>();
   if (!org || !org.amazon_refresh_token_enc || !org.amazon_client_secret_enc || !org.amazon_client_id || !org.amazon_marketplace_id) {
-    return undefined;
+    return organizationId === LEGACY_ORGANIZATION_ID ? undefined : NOT_CONNECTED;
   }
   const [clientSecret, refreshToken] = await Promise.all([decryptSecret(org.amazon_client_secret_enc), decryptSecret(org.amazon_refresh_token_enc)]);
   return {
@@ -223,9 +246,18 @@ export async function resolveAmazonCredentials(db: D1Database, organizationId: s
 }
 
 /** Same as resolveAmazonCredentials, but looked up by warehouse — the shape every admin API route actually has in hand. */
-export async function resolveAmazonCredentialsForWarehouse(db: D1Database, warehouseId: string): Promise<Partial<AmazonEnv> | undefined> {
+export async function resolveAmazonCredentialsForWarehouse(
+  db: D1Database,
+  warehouseId: string
+): Promise<Partial<AmazonEnv> | undefined | typeof NOT_CONNECTED> {
   const row = await db.prepare(`SELECT organization_id FROM warehouses WHERE id = ?`).bind(warehouseId).first<{ organization_id: string | null }>();
   return resolveAmazonCredentials(db, row?.organization_id ?? null);
+}
+
+export class AmazonNotConnectedError extends Error {
+  constructor() {
+    super('Connect your Amazon account first (Settings → Connect Amazon) before using this feature.');
+  }
 }
 
 /**
