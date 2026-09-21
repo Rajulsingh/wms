@@ -309,9 +309,16 @@ if (redirectTo) return Astro.redirect(redirectTo);
       }
       warehouseId = me.user.warehouseId;
 
-      const [orders, boxes] = await Promise.all([api(`/api/admin/orders?warehouseId=${warehouseId}`), api(`/api/admin/box-sizes?warehouseId=${warehouseId}`)]);
+      // /api/admin/orders returns { orders, totalCount, ... } (real pagination —
+      // see getAdminOrders in lib/admin-orders.ts), not a bare array; a
+      // fixed large pageSize instead of the UI's own default-50 page is what
+      // makes this actually see every shippable order, not just page 1.
+      const [ordersResult, boxes] = await Promise.all([
+        api(`/api/admin/orders?warehouseId=${warehouseId}&pageSize=1000`),
+        api(`/api/admin/box-sizes?warehouseId=${warehouseId}`)
+      ]);
       boxSizes = boxes;
-      shippableOrders = orders.filter((o: OrderRow) => o.source === 'amazon' && o.status !== 'ready_to_ship' && o.status !== 'shipped');
+      shippableOrders = ordersResult.orders.filter((o: OrderRow) => o.source === 'amazon' && o.status !== 'ready_to_ship' && o.status !== 'shipped');
 
       if (!boxSizes.length) {
         app.innerHTML = `<p>No box sizes configured yet. <a href="/admin/settings">Add one in Settings</a> first.</p>`;
