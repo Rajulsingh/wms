@@ -708,19 +708,26 @@ tbody tr:hover {
   color: var(--sidebar-fg);
 }
 
+/* Solid color + white text, not the pale --success-bg/--success pair used
+   for inline banners — a real complaint from live use ("not much
+   visible"): a mint-on-mint pastel toast is easy to miss at a glance on a
+   bright warehouse tablet. Colors are hardcoded rather than theme tokens,
+   same reasoning as --sidebar-*, so this stays equally bold in light and
+   dark mode instead of picking up dark mode's dimmer success green. */
 .pick-flash-toast {
   position: fixed;
   top: 14px;
   left: 50%;
-  transform: translateX(-50%) translateY(-14px);
-  background: var(--success-bg);
-  color: var(--success);
-  border: 1px solid var(--success-border);
-  padding: 10px 20px;
+  transform: translateX(-50%) translateY(-14px) scale(0.96);
+  background: #15803d;
+  color: #ffffff;
+  border: none;
+  padding: 13px 26px;
   border-radius: 999px;
   font-weight: 800;
-  font-size: 0.95rem;
-  box-shadow: var(--shadow-md);
+  font-size: 1.05rem;
+  letter-spacing: 0.01em;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.28);
   opacity: 0;
   pointer-events: none;
   transition: opacity 0.18s ease, transform 0.18s ease;
@@ -729,7 +736,7 @@ tbody tr:hover {
 
 .pick-flash-toast.show {
   opacity: 1;
-  transform: translateX(-50%) translateY(0);
+  transform: translateX(-50%) translateY(0) scale(1);
 }
 
 .theme-toggle {

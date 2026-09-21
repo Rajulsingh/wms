@@ -51,6 +51,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
       location_code: string;
       sku_code: string;
       sku_name: string;
+      msku: string | null;
       image_url: string | null;
       external_order_id: string;
       order_source: string;
@@ -162,6 +163,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
       location_code: string;
       sku_code: string;
       sku_name: string;
+      msku: string | null;
       image_url: string | null;
       quantity_required: number;
       quantity_picked: number;
@@ -197,6 +199,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
           location_code: first.location_code,
           sku_code: first.sku_code,
           sku_name: first.sku_name,
+          msku: first.msku,
           image_url: first.image_url,
           quantity_required: memberRows.reduce((sum, r) => sum + r.quantity_required, 0),
           quantity_picked: memberRows.reduce((sum, r) => sum + r.quantity_picked, 0),
@@ -303,23 +306,23 @@ if (redirectTo) return Astro.redirect(redirectTo);
         </div>
         <div class="table-scroll"><table>
           <thead>
-            <tr><th>Zone</th><th>Bin</th><th>Product</th><th>SKU</th><th>Units</th><th>Orders</th><th>Status</th></tr>
+            <tr><th>Zone</th><th>Bin</th><th>Product</th><th>MSKU</th><th>Units</th><th>Orders</th><th>Status</th></tr>
           </thead>
           <tbody>
             ${groupRowsBySkuLocation(rows)
               .map(
                 (g) => `<tr>
-                  <td>${g.zone_name ?? '—'}</td>
-                  <td>${g.location_code}</td>
+                  <td>${escapeHtml(g.zone_name ?? '—')}</td>
+                  <td>${escapeHtml(g.location_code)}</td>
                   <td>
                     <div class="row" style="align-items:center; gap:10px;">
-                      ${g.image_url ? `<img class="table-thumb" src="${g.image_url}" alt="" />` : ''}
-                      <span>${g.sku_name}</span>
+                      ${g.image_url ? `<img class="table-thumb" src="${escapeHtml(g.image_url)}" alt="" />` : ''}
+                      <span>${escapeHtml(g.sku_name)}</span>
                     </div>
                   </td>
-                  <td>${g.sku_code}</td>
+                  <td>${g.msku ? `<strong>${escapeHtml(g.msku)}</strong>` : escapeHtml(g.sku_code)}${g.msku ? `<br><span style="font-size: 0.75rem; color: var(--muted);">${escapeHtml(g.sku_code)}</span>` : ''}</td>
                   <td>${g.quantity_picked}/${g.quantity_required}</td>
-                  <td style="font-size: 0.82rem; color: var(--muted);">${g.orderBreakdown}</td>
+                  <td style="font-size: 0.82rem; color: var(--muted);">${escapeHtml(g.orderBreakdown)}</td>
                   <td>${statusPill(g.status)}</td>
                 </tr>`
               )
@@ -380,12 +383,12 @@ if (redirectTo) return Astro.redirect(redirectTo);
 
     document.getElementById('download-btn')?.addEventListener('click', () => {
       if (!currentRows.length) return;
-      const header = ['Zone', 'Bin', 'Product', 'SKU', 'Order', 'Units', 'Status'];
+      const header = ['Zone', 'Bin', 'Product', 'MSKU', 'SKU', 'Order', 'Units', 'Status'];
       const csvEscape = (v: string) => `"${v.replace(/"/g, '""')}"`;
       const lines = [
         header.join(','),
         ...currentRows.map((r) =>
-          [r.zone_name ?? '', r.location_code, r.sku_name, r.sku_code, r.external_order_id, String(r.quantity_required), r.status].map(csvEscape).join(',')
+          [r.zone_name ?? '', r.location_code, r.sku_name, r.msku ?? '', r.sku_code, r.external_order_id, String(r.quantity_required), r.status].map(csvEscape).join(',')
         )
       ];
       const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });

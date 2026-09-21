@@ -207,7 +207,7 @@ const initialBatches = user.role === 'packer' && user.warehouse_id ? await getMy
       void el.offsetWidth; // force reflow so back-to-back picks each restart the animation
       el.classList.add('show');
       if (flashTimer) clearTimeout(flashTimer);
-      flashTimer = setTimeout(() => el?.classList.remove('show'), 1600);
+      flashTimer = setTimeout(() => el?.classList.remove('show'), 2200);
     }
 
     async function boot() {
