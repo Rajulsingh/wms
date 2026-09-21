@@ -50,6 +50,7 @@ const initialBatches = user.role === 'packer' && user.station_id ? (await getMyP
       order_notes: string | null;
       sku_code: string;
       sku_name: string;
+      msku: string | null;
       image_url: string | null;
       quantity_required: number;
       quantity_packed: number;
@@ -364,7 +365,7 @@ const initialBatches = user.role === 'packer' && user.station_id ? (await getMyP
       el.innerHTML = `
         ${item.image_url ? `<img class="thumb thumb-lg" src="${item.image_url}" alt="" />` : '<div class="thumb thumb-lg"></div>'}
         <div class="stack" style="gap: 2px; flex: 1; min-width: 0;">
-          <span class="qty" style="font-size: 1.05rem;">${escapeHtml(item.sku_code)} <span style="color: var(--muted); font-weight: 400; font-size: 0.9rem;">×${item.quantity_required}</span></span>
+          <span class="qty" style="font-size: 1.05rem;">${escapeHtml(item.msku || item.sku_code)} <span style="color: var(--muted); font-weight: 400; font-size: 0.9rem;">×${item.quantity_required}</span></span>
           <span style="font-size: 0.78rem; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${escapeHtml(item.sku_name)}</span>
         </div>
         ${

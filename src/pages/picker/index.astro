@@ -48,6 +48,7 @@ const initialBatches = user.role === 'packer' && user.warehouse_id ? await getMy
       location_code: string;
       sku_code: string;
       sku_name: string;
+      msku: string | null;
       image_url: string | null;
       external_order_id: string;
       order_source: string;
@@ -155,6 +156,7 @@ const initialBatches = user.role === 'packer' && user.warehouse_id ? await getMy
     interface SkuGroup {
       sku_code: string;
       sku_name: string;
+      msku: string | null;
       image_url: string | null;
       rows: Row[];
     }
@@ -487,7 +489,7 @@ const initialBatches = user.role === 'packer' && user.warehouse_id ? await getMy
         for (const r of locGroup.rows) {
           let sg = skuGroups.find((sg) => sg.sku_code === r.sku_code);
           if (!sg) {
-            sg = { sku_code: r.sku_code, sku_name: r.sku_name, image_url: r.image_url, rows: [] };
+            sg = { sku_code: r.sku_code, sku_name: r.sku_name, msku: r.msku, image_url: r.image_url, rows: [] };
             skuGroups.push(sg);
           }
           sg.rows.push(r);
@@ -609,7 +611,7 @@ const initialBatches = user.role === 'packer' && user.warehouse_id ? await getMy
         <div class="row" style="align-items: center; gap: 14px;">
           ${sg.image_url ? `<img class="thumb thumb-lg" src="${sg.image_url}" alt="" />` : '<div class="thumb thumb-lg"></div>'}
           <div class="stack" style="gap: 2px; flex: 1; min-width: 0;">
-            <span class="qty" style="font-size: 1.05rem;">${escapeHtml(sg.sku_code)}</span>
+            <span class="qty" style="font-size: 1.05rem;">${escapeHtml(sg.msku || sg.sku_code)}</span>
             <span style="font-size: 0.78rem; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${escapeHtml(sg.sku_name)}</span>
           </div>
         </div>

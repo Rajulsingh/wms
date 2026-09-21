@@ -119,7 +119,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
               (r) => `
         <tr data-inv-id="${r.id}" data-sku-id="${r.sku_id}" data-original-onhand="${r.quantity_on_hand}">
           <td>${escapeHtml(r.sku_code)}<br><span style="font-size: 0.75rem; color: var(--muted);">${escapeHtml(r.sku_name)}</span></td>
-          <td>${r.msku ? `<strong>${escapeHtml(r.msku)}</strong>` : '<span style="color: var(--muted);">—</span>'}</td>
+          <td><input type="text" class="msku-input" value="${r.msku ? escapeHtml(r.msku) : ''}" placeholder="—" style="width: 100%; min-width: 110px; min-height: 40px; padding: 6px 8px; font-weight: 700;" /></td>
           <td>${r.zone_name ? escapeHtml(r.zone_name) + ' · ' : ''}${escapeHtml(r.location_code)}</td>
           <td><input type="number" class="onhand-input" value="${r.quantity_on_hand}" min="${r.quantity_reserved}" style="width: 90px; min-height: 40px; padding: 6px 8px;" /></td>
           <td>${r.quantity_reserved}</td>
@@ -143,6 +143,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
           const reason = (row.querySelector('.reason-input') as HTMLInputElement).value.trim();
           const priceRaw = (row.querySelector('.price-input') as HTMLInputElement).value;
           const price = priceRaw === '' ? null : Number(priceRaw);
+          const msku = (row.querySelector('.msku-input') as HTMLInputElement).value.trim() || null;
           const quantityChanged = onHand !== originalOnHand;
           if (quantityChanged && !reason) {
             alert('A reason is required to change the on-hand count.');
@@ -153,10 +154,10 @@ if (redirectTo) return Astro.redirect(redirectTo);
             await withLoading(btn, 'Saving…', () =>
               Promise.all([
                 quantityChanged ? api('/api/admin/inventory', { inventoryId: invId, quantityOnHand: onHand, reason }, 'PATCH') : Promise.resolve(),
-                api('/api/admin/skus', { skuId, price, warehouseId }, 'PATCH')
+                api('/api/admin/skus', { skuId, price, msku, warehouseId }, 'PATCH')
               ])
             );
-            if (quantityChanged) await loadInventory();
+            await loadInventory();
           } catch (err) {
             alert((err as Error).message);
           }

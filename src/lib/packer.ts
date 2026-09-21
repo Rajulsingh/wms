@@ -34,6 +34,7 @@ export interface PackBatchItemView {
   order_notes: string | null;
   sku_code: string;
   sku_name: string;
+  msku: string | null;
   image_url: string | null;
   quantity_required: number;
   quantity_packed: number;
@@ -185,7 +186,7 @@ export async function getPackBatchState(db: D1Database, pickBatchId: string): Pr
   // appeared anywhere in the packing UI — found 2026-09-19, see HANDOFF.md.
   const items = await db
     .prepare(
-      `SELECT oi.id AS order_item_id, oi.order_id, o.external_order_id, o.notes AS order_notes, sk.sku_code, sk.name AS sku_name, sk.image_url,
+      `SELECT oi.id AS order_item_id, oi.order_id, o.external_order_id, o.notes AS order_notes, sk.sku_code, sk.name AS sku_name, sk.msku, sk.image_url,
               oi.quantity_picked AS quantity_required, oi.quantity_packed
        FROM order_items oi
        JOIN orders o ON o.id = oi.order_id

@@ -180,6 +180,7 @@ export interface PickListRow {
   sequence_number: number;
   sku_code: string;
   sku_name: string;
+  msku: string | null;
   image_url: string | null;
   external_order_id: string;
   order_source: string;
@@ -219,6 +220,7 @@ export async function getPickListView(db: D1Database, batchId: string): Promise<
          loc.sequence_number,
          sk.sku_code,
          sk.name AS sku_name,
+         sk.msku,
          sk.image_url,
          o.external_order_id,
          o.source AS order_source,
@@ -259,6 +261,7 @@ export async function getPickListViewForBatches(db: D1Database, batchIds: string
          loc.sequence_number,
          sk.sku_code,
          sk.name AS sku_name,
+         sk.msku,
          sk.image_url,
          o.external_order_id,
          o.source AS order_source,
@@ -719,6 +722,7 @@ export async function getMyBatches(db: D1Database, warehouseId: string, pickerId
            loc.sequence_number,
            sk.sku_code,
            sk.name AS sku_name,
+           sk.msku,
            sk.image_url,
            o.external_order_id,
            o.source AS order_source,

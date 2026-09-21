@@ -34,10 +34,24 @@ export const PATCH: APIRoute = async (context) => {
   const db = getDb();
   try {
     const user = await requireUser(context, db, ['admin']);
-    const body = await context.request.json<{ skuId: string; warehouseId: string; price?: number | null; reorderPoint?: number | null }>();
+    const body = await context.request.json<{ skuId: string; warehouseId: string; price?: number | null; reorderPoint?: number | null; msku?: string | null }>();
     requireOwnWarehouse(user, body.warehouseId);
     const organizationId = await getOrganizationIdForWarehouse(db, body.warehouseId);
 
+    if (body.msku !== undefined) {
+      const trimmed = body.msku?.trim() || null;
+      try {
+        await db.prepare(`UPDATE skus SET msku = ? WHERE id = ? AND organization_id = ?`).bind(trimmed, body.skuId, organizationId).run();
+      } catch (err) {
+        // idx_skus_msku (migration 0018) is a unique index — this is the
+        // realistic way it gets hit here: a typo that happens to match
+        // another SKU's MSKU, not a code path worth its own precheck query.
+        if ((err as Error).message.includes('UNIQUE')) {
+          return new Response(JSON.stringify({ error: `MSKU "${trimmed}" is already used by another SKU` }), { status: 409 });
+        }
+        throw err;
+      }
+    }
     if (body.price !== undefined) {
       if (body.price !== null && (!Number.isFinite(body.price) || body.price < 0)) {
         return new Response(JSON.stringify({ error: 'Price must be a non-negative number' }), { status: 400 });
