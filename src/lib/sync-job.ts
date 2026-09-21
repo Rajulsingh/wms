@@ -1,6 +1,7 @@
 import { fetchUnfulfilledOrders } from './amazon';
 import { importAmazonOrders, retryBlockedOrders } from './orders';
 import { syncOrderStatuses } from './amazon-sync';
+import { resolveAmazonCredentials } from './org-accounts';
 
 export interface SyncJobResult {
   warehouseId: string;
@@ -72,17 +73,25 @@ export interface SyncJobResult {
  * dedupes by external order id regardless.
  */
 export async function runAmazonSyncJob(db: D1Database, sinceHours = 24): Promise<SyncJobResult[]> {
-  const warehouses = await db.prepare(`SELECT id, amazon_orders_synced_through FROM warehouses`).all<{ id: string; amazon_orders_synced_through: string | null }>();
+  const warehouses = await db
+    .prepare(`SELECT id, amazon_orders_synced_through, organization_id FROM warehouses`)
+    .all<{ id: string; amazon_orders_synced_through: string | null; organization_id: string | null }>();
   const results: SyncJobResult[] = [];
 
   for (const wh of warehouses.results) {
     const runStartedAt = new Date();
     try {
+      // Each org's orders must sync against *its own* Amazon account, not
+      // this deploy's global one — resolveAmazonCredentials falls back to
+      // undefined (meaning "use the global env vars") for any warehouse
+      // that hasn't connected its own account yet, which is exactly this
+      // deploy's own original warehouse until it's explicitly migrated.
+      const credentials = await resolveAmazonCredentials(db, wh.organization_id);
       const since = wh.amazon_orders_synced_through ? new Date(wh.amazon_orders_synced_through) : new Date(Date.now() - sinceHours * 60 * 60 * 1000);
-      const amazonOrders = await fetchUnfulfilledOrders(since);
-      const importSummary = await importAmazonOrders(db, wh.id, amazonOrders);
+      const amazonOrders = await fetchUnfulfilledOrders(since, credentials);
+      const importSummary = await importAmazonOrders(db, wh.id, amazonOrders, credentials);
       await db.prepare(`UPDATE warehouses SET amazon_orders_synced_through = ? WHERE id = ?`).bind(runStartedAt.toISOString(), wh.id).run();
-      const statusResult = await syncOrderStatuses(db, wh.id);
+      const statusResult = await syncOrderStatuses(db, wh.id, credentials);
       const retryResult = await retryBlockedOrders(db, wh.id);
 
       results.push({

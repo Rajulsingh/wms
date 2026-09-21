@@ -1,4 +1,4 @@
-import { fetchOrderStatuses, EASYSHIP_NOT_YET_COLLECTED } from './amazon';
+import { fetchOrderStatuses, EASYSHIP_NOT_YET_COLLECTED, type AmazonEnv } from './amazon';
 import { releaseReservation } from './inventory';
 import { logAudit, logException } from './db';
 
@@ -50,7 +50,7 @@ export interface SyncResult {
  * already-terminal orders just to chase a display label isn't worth the
  * extra GetOrders calls this account already worried about rate limits on.
  */
-export async function syncOrderStatuses(db: D1Database, warehouseId: string): Promise<SyncResult> {
+export async function syncOrderStatuses(db: D1Database, warehouseId: string, credentials?: Partial<AmazonEnv>): Promise<SyncResult> {
   const unresolved = await db
     .prepare(`SELECT id, external_order_id FROM orders WHERE warehouse_id = ? AND source = 'amazon' AND status NOT IN ('shipped', 'cancelled')`)
     .bind(warehouseId)
@@ -60,7 +60,7 @@ export async function syncOrderStatuses(db: D1Database, warehouseId: string): Pr
     return { checked: 0, shipped: 0, cancelled: 0 };
   }
 
-  const statuses = await fetchOrderStatuses(unresolved.results.map((o) => o.external_order_id));
+  const statuses = await fetchOrderStatuses(unresolved.results.map((o) => o.external_order_id), credentials);
   let shipped = 0;
   let cancelled = 0;
 

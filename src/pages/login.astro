@@ -22,7 +22,27 @@ import Base from '../layouts/Base.astro';
         </span>
       </div>
       <h1 class="big-label" style="font-size: 1.6rem;">Sign in</h1>
-      <form id="login-form" class="stack">
+
+      <div class="row" role="tablist" style="gap: 4px; padding: 4px; background: var(--surface-sunken, rgba(0,0,0,0.04)); border-radius: var(--radius-pill, 100px);">
+        <button type="button" id="tab-owner" class="btn" style="flex: 1;">Business owner</button>
+        <button type="button" id="tab-floor" class="btn" style="flex: 1;">Warehouse floor</button>
+      </div>
+
+      <form id="owner-login-form" class="stack">
+        <div class="stack" style="gap: 6px;">
+          <label for="email">Email</label>
+          <input id="email" name="email" type="email" autocomplete="email" required />
+        </div>
+        <div class="stack" style="gap: 6px;">
+          <label for="owner-password">Password</label>
+          <input id="owner-password" name="password" type="password" autocomplete="current-password" required />
+        </div>
+        <div id="owner-error" class="banner banner-danger" style="display: none;"></div>
+        <button type="submit" class="btn btn-primary">Sign in</button>
+      </form>
+      <p id="signup-hint" style="text-align: center; margin-top: -8px;"><a href="/signup">New seller? Create an account</a></p>
+
+      <form id="login-form" class="stack" style="display: none;">
         <div class="stack" style="gap: 6px;">
           <label for="name">Name</label>
           <input id="name" name="name" type="text" autocomplete="username" required />
@@ -38,7 +58,57 @@ import Base from '../layouts/Base.astro';
   </div>
 
   <script>
-    const form = document.getElementById('login-form') as HTMLFormElement;
+    const tabOwner = document.getElementById('tab-owner') as HTMLButtonElement;
+    const tabFloor = document.getElementById('tab-floor') as HTMLButtonElement;
+    const ownerForm = document.getElementById('owner-login-form') as HTMLFormElement;
+    const floorForm = document.getElementById('login-form') as HTMLFormElement;
+    const signupHint = document.getElementById('signup-hint') as HTMLParagraphElement;
+
+    function showOwner() {
+      ownerForm.style.display = '';
+      signupHint.style.display = '';
+      floorForm.style.display = 'none';
+      tabOwner.classList.add('btn-primary');
+      tabFloor.classList.remove('btn-primary');
+    }
+    function showFloor() {
+      floorForm.style.display = '';
+      ownerForm.style.display = 'none';
+      signupHint.style.display = 'none';
+      tabFloor.classList.add('btn-primary');
+      tabOwner.classList.remove('btn-primary');
+    }
+    tabOwner.addEventListener('click', showOwner);
+    tabFloor.addEventListener('click', showFloor);
+    showOwner();
+
+    const ownerError = document.getElementById('owner-error') as HTMLDivElement;
+    ownerForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      ownerError.style.display = 'none';
+      const email = (document.getElementById('email') as HTMLInputElement).value.trim();
+      const password = (document.getElementById('owner-password') as HTMLInputElement).value;
+
+      const res = await fetch('/api/auth/login-owner', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password })
+      });
+
+      if (!res.ok) {
+        const body: any = await res.json().catch(() => ({ error: 'Sign in failed' }));
+        ownerError.textContent = body.error ?? 'Sign in failed';
+        ownerError.style.display = 'block';
+        return;
+      }
+
+      // requireAdminPage sends a still-onboarding owner (no warehouse yet) to
+      // /onboarding/warehouse automatically — always landing on /admin here
+      // is safe either way.
+      window.location.href = '/admin';
+    });
+
+    const form = floorForm;
     const errorBox = document.getElementById('error') as HTMLDivElement;
 
     form.addEventListener('submit', async (e) => {

@@ -2,6 +2,7 @@ import type { APIRoute } from 'astro';
 import { getDb, logAudit } from '../../../lib/db';
 import { requireUser, AuthError } from '../../../lib/auth';
 import { syncAmazonCatalog } from '../../../lib/catalog-sync';
+import { resolveAmazonCredentialsForWarehouse, getOrganizationIdForWarehouse } from '../../../lib/org-accounts';
 
 /**
  * Streams newline-delimited JSON instead of a single JSON response — a full
@@ -18,12 +19,15 @@ export const POST: APIRoute = async (context) => {
 
   try {
     const user = await requireUser(context, db, ['admin']);
+    if (!user.warehouse_id) return new Response(JSON.stringify({ error: 'Finish setting up your warehouse first' }), { status: 409 });
+    const organizationId = await getOrganizationIdForWarehouse(db, user.warehouse_id);
 
     const stream = new ReadableStream({
       async start(controller) {
         const send = (obj: unknown) => controller.enqueue(encoder.encode(JSON.stringify(obj) + '\n'));
         try {
-          const result = await syncAmazonCatalog(db, (p) => send({ type: 'progress', ...p }));
+          const credentials = await resolveAmazonCredentialsForWarehouse(db, user.warehouse_id!);
+          const result = await syncAmazonCatalog(db, organizationId, (p) => send({ type: 'progress', ...p }), credentials);
           await logAudit(db, { userId: user.id, action: 'catalog.sync', metadata: result });
           send({ type: 'done', ...result });
         } catch (err) {

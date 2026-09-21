@@ -17,10 +17,10 @@ export class SkuMergeError extends Error {
  * over again, defeating the merge. Returns null if no SKU has this code at
  * all — the caller decides whether to create one.
  */
-export async function resolveSkuIdByCode(db: D1Database, skuCode: string): Promise<string | null> {
+export async function resolveSkuIdByCode(db: D1Database, organizationId: string, skuCode: string): Promise<string | null> {
   const row = await db
-    .prepare(`SELECT id, merged_into_id FROM skus WHERE sku_code = ?`)
-    .bind(skuCode)
+    .prepare(`SELECT id, merged_into_id FROM skus WHERE organization_id = ? AND sku_code = ?`)
+    .bind(organizationId, skuCode)
     .first<{ id: string; merged_into_id: string | null }>();
   if (!row) return null;
   return row.merged_into_id ?? row.id;
@@ -36,12 +36,12 @@ interface SkuRef {
   merged_into_id: string | null;
 }
 
-async function loadMergeable(db: D1Database, sourceCode: string, targetCode: string): Promise<{ source: SkuRef; target: SkuRef }> {
+async function loadMergeable(db: D1Database, organizationId: string, sourceCode: string, targetCode: string): Promise<{ source: SkuRef; target: SkuRef }> {
   if (sourceCode === targetCode) throw new SkuMergeError('same_sku', 'Pick two different SKU codes to merge');
 
   const [source, target] = await Promise.all([
-    db.prepare(`SELECT id, sku_code, name, image_url, asin, msku, merged_into_id FROM skus WHERE sku_code = ?`).bind(sourceCode).first<SkuRef>(),
-    db.prepare(`SELECT id, sku_code, name, image_url, asin, msku, merged_into_id FROM skus WHERE sku_code = ?`).bind(targetCode).first<SkuRef>()
+    db.prepare(`SELECT id, sku_code, name, image_url, asin, msku, merged_into_id FROM skus WHERE organization_id = ? AND sku_code = ?`).bind(organizationId, sourceCode).first<SkuRef>(),
+    db.prepare(`SELECT id, sku_code, name, image_url, asin, msku, merged_into_id FROM skus WHERE organization_id = ? AND sku_code = ?`).bind(organizationId, targetCode).first<SkuRef>()
   ]);
   if (!source) throw new SkuMergeError('not_found', `No SKU found with code "${sourceCode}"`);
   if (!target) throw new SkuMergeError('not_found', `No SKU found with code "${targetCode}"`);
@@ -72,8 +72,8 @@ export interface SkuMergePreview {
 }
 
 /** Read-only — what a merge of these two codes would move, so admin can see it before committing. */
-export async function previewSkuMerge(db: D1Database, sourceCode: string, targetCode: string): Promise<SkuMergePreview> {
-  const { source, target } = await loadMergeable(db, sourceCode, targetCode);
+export async function previewSkuMerge(db: D1Database, organizationId: string, sourceCode: string, targetCode: string): Promise<SkuMergePreview> {
+  const { source, target } = await loadMergeable(db, organizationId, sourceCode, targetCode);
 
   const [inv, oi, pt] = await Promise.all([
     db.prepare(`SELECT COUNT(*) AS lines, COALESCE(SUM(quantity_on_hand), 0) AS units FROM inventory WHERE sku_id = ?`).bind(source.id).first<{ lines: number; units: number }>(),
@@ -204,15 +204,16 @@ function toCandidate(r: DupRow): DuplicateSkuCandidate {
  * whichever has more order history, then whichever is older — it's only a
  * suggestion; admin picks the actual pair to merge.
  */
-export async function findDuplicateSkus(db: D1Database): Promise<DuplicateSkuGroup[]> {
+export async function findDuplicateSkus(db: D1Database, organizationId: string): Promise<DuplicateSkuGroup[]> {
   const rows = await db
     .prepare(
       `SELECT s.id, s.sku_code, s.name, s.image_url, s.asin, s.msku, s.created_at,
               COALESCE((SELECT SUM(quantity_on_hand) FROM inventory WHERE sku_id = s.id), 0) AS inventory_units,
               (SELECT COUNT(*) FROM order_items WHERE sku_id = s.id) AS order_item_count
        FROM skus s
-       WHERE s.merged_into_id IS NULL AND s.is_parent_asin = 0`
+       WHERE s.organization_id = ? AND s.merged_into_id IS NULL AND s.is_parent_asin = 0`
     )
+    .bind(organizationId)
     .all<DupRow>();
 
   const placed = new Set<string>();
@@ -272,8 +273,8 @@ export interface SkuMergeResult {
  * still be manually corrected by an admin who understands the schema, even
  * though there's no one-click "undo" in the UI.
  */
-export async function mergeSku(db: D1Database, userId: string, sourceCode: string, targetCode: string): Promise<SkuMergeResult> {
-  const { source, target } = await loadMergeable(db, sourceCode, targetCode);
+export async function mergeSku(db: D1Database, userId: string, organizationId: string, sourceCode: string, targetCode: string): Promise<SkuMergeResult> {
+  const { source, target } = await loadMergeable(db, organizationId, sourceCode, targetCode);
 
   const sourceInv = await db
     .prepare(`SELECT id, location_id, quantity_on_hand, quantity_reserved FROM inventory WHERE sku_id = ?`)
@@ -337,18 +338,18 @@ export interface SkuUnmergePreview {
   targetOrderItemCount: number;
 }
 
-async function loadUnmergeable(db: D1Database, sourceCode: string): Promise<{ source: SkuRef; target: SkuRef }> {
-  const source = await db.prepare(`SELECT id, sku_code, name, image_url, asin, msku, merged_into_id FROM skus WHERE sku_code = ?`).bind(sourceCode).first<SkuRef>();
+async function loadUnmergeable(db: D1Database, organizationId: string, sourceCode: string): Promise<{ source: SkuRef; target: SkuRef }> {
+  const source = await db.prepare(`SELECT id, sku_code, name, image_url, asin, msku, merged_into_id FROM skus WHERE organization_id = ? AND sku_code = ?`).bind(organizationId, sourceCode).first<SkuRef>();
   if (!source) throw new SkuMergeError('not_found', `No SKU found with code "${sourceCode}"`);
   if (!source.merged_into_id) throw new SkuMergeError('not_merged', `"${sourceCode}" isn't currently merged into anything`);
-  const target = await db.prepare(`SELECT id, sku_code, name, image_url, asin, msku, merged_into_id FROM skus WHERE id = ?`).bind(source.merged_into_id).first<SkuRef>();
+  const target = await db.prepare(`SELECT id, sku_code, name, image_url, asin, msku, merged_into_id FROM skus WHERE id = ? AND organization_id = ?`).bind(source.merged_into_id, organizationId).first<SkuRef>();
   if (!target) throw new SkuMergeError('not_found', `"${sourceCode}"'s merge target no longer exists`);
   return { source, target };
 }
 
 /** Read-only — shows what a SKU is currently merged into, plus context on the target, before committing to unmerge. */
-export async function previewSkuUnmerge(db: D1Database, sourceCode: string): Promise<SkuUnmergePreview> {
-  const { source, target } = await loadUnmergeable(db, sourceCode);
+export async function previewSkuUnmerge(db: D1Database, organizationId: string, sourceCode: string): Promise<SkuUnmergePreview> {
+  const { source, target } = await loadUnmergeable(db, organizationId, sourceCode);
 
   const [inv, oi] = await Promise.all([
     db.prepare(`SELECT COUNT(*) AS lines, COALESCE(SUM(quantity_on_hand), 0) AS units FROM inventory WHERE sku_id = ?`).bind(target.id).first<{ lines: number; units: number }>(),
@@ -383,8 +384,8 @@ export interface SkuUnmergeResult {
  * production incidents this was built from (see HANDOFF.md): cross-reference
  * against Amazon's own order records before moving anything.
  */
-export async function unmergeSku(db: D1Database, userId: string, sourceCode: string): Promise<SkuUnmergeResult> {
-  const { source, target } = await loadUnmergeable(db, sourceCode);
+export async function unmergeSku(db: D1Database, userId: string, organizationId: string, sourceCode: string): Promise<SkuUnmergeResult> {
+  const { source, target } = await loadUnmergeable(db, organizationId, sourceCode);
 
   await db.prepare(`UPDATE skus SET merged_into_id = NULL WHERE id = ?`).bind(source.id).run();
 
@@ -409,11 +410,11 @@ export async function unmergeSku(db: D1Database, userId: string, sourceCode: str
  * — not a routine action. Same non-negotiable as a single unmerge: never
  * moves inventory/order_items/pick_tasks, just clears every `merged_into_id`.
  */
-export async function unmergeAllSkus(db: D1Database, userId: string): Promise<{ count: number; sourceCodes: string[] }> {
-  const merged = await db.prepare(`SELECT id, sku_code FROM skus WHERE merged_into_id IS NOT NULL`).all<{ id: string; sku_code: string }>();
+export async function unmergeAllSkus(db: D1Database, userId: string, organizationId: string): Promise<{ count: number; sourceCodes: string[] }> {
+  const merged = await db.prepare(`SELECT id, sku_code FROM skus WHERE organization_id = ? AND merged_into_id IS NOT NULL`).bind(organizationId).all<{ id: string; sku_code: string }>();
   if (!merged.results.length) return { count: 0, sourceCodes: [] };
 
-  await db.prepare(`UPDATE skus SET merged_into_id = NULL WHERE merged_into_id IS NOT NULL`).run();
+  await db.prepare(`UPDATE skus SET merged_into_id = NULL WHERE organization_id = ? AND merged_into_id IS NOT NULL`).bind(organizationId).run();
 
   await logAudit(db, {
     userId,
@@ -426,8 +427,8 @@ export async function unmergeAllSkus(db: D1Database, userId: string): Promise<{ 
 }
 
 /** Next suggested MSKU — sequential and zero-padded so it reads/writes easily on a physical label, e.g. "MSKU-000042". Purely a suggestion; receiving can type any value instead (see setMsku). */
-export async function suggestNextMsku(db: D1Database): Promise<string> {
-  const row = await db.prepare(`SELECT msku FROM skus WHERE msku LIKE 'MSKU-%' ORDER BY msku DESC LIMIT 1`).first<{ msku: string }>();
+export async function suggestNextMsku(db: D1Database, organizationId: string): Promise<string> {
+  const row = await db.prepare(`SELECT msku FROM skus WHERE organization_id = ? AND msku LIKE 'MSKU-%' ORDER BY msku DESC LIMIT 1`).bind(organizationId).first<{ msku: string }>();
   const lastNum = row ? parseInt(row.msku.slice(5), 10) : 0;
   const next = (Number.isFinite(lastNum) ? lastNum : 0) + 1;
   return `MSKU-${String(next).padStart(6, '0')}`;
@@ -452,17 +453,17 @@ export interface SetMskuResult {
  * SKU is currently live for that MSKU, in case its original holder has
  * itself since been merged into something else.
  */
-export async function setMsku(db: D1Database, userId: string, skuCode: string, msku: string): Promise<SetMskuResult> {
+export async function setMsku(db: D1Database, userId: string, organizationId: string, skuCode: string, msku: string): Promise<SetMskuResult> {
   const trimmed = msku.trim();
   if (!trimmed) throw new SkuMergeError('msku_required', 'MSKU is required');
 
-  const self = await db.prepare(`SELECT id, merged_into_id FROM skus WHERE sku_code = ?`).bind(skuCode).first<{ id: string; merged_into_id: string | null }>();
+  const self = await db.prepare(`SELECT id, merged_into_id FROM skus WHERE organization_id = ? AND sku_code = ?`).bind(organizationId, skuCode).first<{ id: string; merged_into_id: string | null }>();
   if (!self) throw new SkuMergeError('not_found', `No SKU found with code "${skuCode}"`);
   if (self.merged_into_id) throw new SkuMergeError('already_merged', `"${skuCode}" has already been merged into another SKU`);
 
   const existingHolder = await db
-    .prepare(`SELECT id, sku_code, merged_into_id FROM skus WHERE msku = ? AND id != ?`)
-    .bind(trimmed, self.id)
+    .prepare(`SELECT id, sku_code, merged_into_id FROM skus WHERE organization_id = ? AND msku = ? AND id != ?`)
+    .bind(organizationId, trimmed, self.id)
     .first<{ id: string; sku_code: string; merged_into_id: string | null }>();
 
   if (!existingHolder) {
@@ -472,7 +473,7 @@ export async function setMsku(db: D1Database, userId: string, skuCode: string, m
   }
 
   const finalTargetId = existingHolder.merged_into_id ?? existingHolder.id;
-  const finalTarget = await db.prepare(`SELECT sku_code FROM skus WHERE id = ?`).bind(finalTargetId).first<{ sku_code: string }>();
+  const finalTarget = await db.prepare(`SELECT sku_code FROM skus WHERE id = ? AND organization_id = ?`).bind(finalTargetId, organizationId).first<{ sku_code: string }>();
   if (!finalTarget) throw new SkuMergeError('not_found', `"${trimmed}" could not be resolved to a live SKU`);
 
   if (finalTarget.sku_code === skuCode) {
@@ -480,6 +481,6 @@ export async function setMsku(db: D1Database, userId: string, skuCode: string, m
     return { msku: trimmed, merged: false };
   }
 
-  await mergeSku(db, userId, skuCode, finalTarget.sku_code);
+  await mergeSku(db, userId, organizationId, skuCode, finalTarget.sku_code);
   return { msku: trimmed, merged: true, mergedIntoCode: finalTarget.sku_code };
 }

@@ -1,0 +1,105 @@
+---
+import Base from '../layouts/Base.astro';
+---
+
+<Base title="Pricing">
+  <div class="auth-shell" style="align-items: flex-start; padding-top: 48px;">
+    <div style="max-width: 880px; width: 100%; display: flex; flex-direction: column; gap: 32px; margin: 0 auto;">
+      <div class="stack" style="text-align: center; gap: 8px;">
+        <div class="brand" style="justify-content: center;">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 8 12 3 3 8l9 5 9-5Z"></path>
+              <path d="M3 8v8l9 5 9-5V8"></path>
+              <path d="M12 13v8"></path>
+            </svg>
+          </span>
+          <span class="brand-text">
+            <span class="row" style="align-items: center; gap: 6px;">
+              <span class="brand-name">ecomglider</span>
+              <span class="pre-alpha-tag">Pre-Alpha</span>
+            </span>
+            <span class="brand-section">Warehouse</span>
+          </span>
+        </div>
+        <h1 class="big-label" style="font-size: 2rem;">A warehouse management system built for Amazon sellers</h1>
+        <p style="max-width: 560px; margin: 0 auto;">
+          Pick, pack, and ship Amazon orders with barcode scanning, live inventory, and Easy Ship label automation — the same
+          system built for and run by a real Amazon seller, now open to others.
+          Read <a href="/how-it-works">how it works</a>.
+        </p>
+      </div>
+
+      <div class="row" style="gap: 20px; flex-wrap: wrap; justify-content: center; align-items: stretch;">
+        <div class="card stack" style="flex: 1; min-width: 260px; max-width: 320px;">
+          <h2>Starter</h2>
+          <p class="big-label" style="font-size: 1.8rem;">Contact us</p>
+          <p>One warehouse, unlimited orders, full Amazon Easy Ship integration.</p>
+          <ul style="padding-left: 18px; display: flex; flex-direction: column; gap: 6px;">
+            <li>Barcode pick &amp; pack</li>
+            <li>Live inventory &amp; reorder alerts</li>
+            <li>Amazon order sync</li>
+            <li>Easy Ship label automation</li>
+          </ul>
+        </div>
+        <div class="card stack" style="flex: 1; min-width: 260px; max-width: 320px; border-color: var(--info, inherit);">
+          <h2>Growing seller</h2>
+          <p class="big-label" style="font-size: 1.8rem;">Contact us</p>
+          <p>Everything in Starter, plus priority support while we roll out more warehouses per account.</p>
+          <ul style="padding-left: 18px; display: flex; flex-direction: column; gap: 6px;">
+            <li>Priority onboarding help</li>
+            <li>Custom exception workflows</li>
+            <li>Early access to new features</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="card stack" style="max-width: 480px; margin: 0 auto; width: 100%;">
+        <h2>Request access</h2>
+        <p>
+          We're onboarding sellers individually during pre-alpha — leave your details and we'll reach out to set up your
+          account.
+        </p>
+        <form id="access-form" class="stack">
+          <input type="text" id="name" placeholder="Your name" required />
+          <input type="email" id="email" placeholder="Email" required />
+          <input type="text" id="company" placeholder="Business name" />
+          <input type="tel" id="phone" placeholder="Phone (optional)" />
+          <textarea id="message" placeholder="Anything we should know? (optional)" rows="3"></textarea>
+          <div id="result" class="banner" style="display: none;"></div>
+          <button type="submit" class="btn btn-primary">Request access</button>
+        </form>
+        <p style="text-align: center; margin-top: 4px;"><a href="/signup">Already have credentials? Create your account</a></p>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const form = document.getElementById('access-form') as HTMLFormElement;
+    const result = document.getElementById('result') as HTMLDivElement;
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      result.style.display = 'none';
+
+      const body = {
+        name: (document.getElementById('name') as HTMLInputElement).value.trim(),
+        email: (document.getElementById('email') as HTMLInputElement).value.trim(),
+        company: (document.getElementById('company') as HTMLInputElement).value.trim(),
+        phone: (document.getElementById('phone') as HTMLInputElement).value.trim(),
+        message: (document.getElementById('message') as HTMLTextAreaElement).value.trim()
+      };
+
+      const res = await fetch('/api/access-requests', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+
+      result.className = res.ok ? 'banner banner-success' : 'banner banner-danger';
+      result.textContent = res.ok ? "Thanks — we'll be in touch shortly." : 'Something went wrong. Please try again.';
+      result.style.display = 'block';
+      if (res.ok) form.reset();
+    });
+  </script>
+</Base>

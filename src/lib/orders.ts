@@ -1,8 +1,9 @@
 import { newId } from './db';
 import { reserveInventory, releaseReservation, InsufficientStockError } from './inventory';
-import { fetchCatalogItemDetails, type AmazonOrder } from './amazon';
+import { fetchCatalogItemDetails, type AmazonOrder, type AmazonEnv } from './amazon';
 import { resolveSkuIdByCode } from './skus';
 import { mapWithConcurrency } from './concurrency';
+import { getOrganizationIdForWarehouse } from './org-accounts';
 
 export interface ImportSummary {
   imported: number;
@@ -34,8 +35,9 @@ export interface ImportSummary {
  * same SKU's stock resolve correctly (one wins, the other gets a real
  * insufficient-stock result) rather than double-booking.
  */
-export async function importAmazonOrders(db: D1Database, warehouseId: string, orders: AmazonOrder[]): Promise<ImportSummary> {
+export async function importAmazonOrders(db: D1Database, warehouseId: string, orders: AmazonOrder[], credentials?: Partial<AmazonEnv>): Promise<ImportSummary> {
   const summary: ImportSummary = { imported: 0, skipped: 0, newSkusCreated: [], shortOrders: [] };
+  const organizationId = await getOrganizationIdForWarehouse(db, warehouseId);
 
   await mapWithConcurrency(orders, 5, async (order) => {
     const existing = await db
@@ -69,19 +71,26 @@ export async function importAmazonOrders(db: D1Database, warehouseId: string, or
       // that's since been merged into another SKU — otherwise the same
       // SellerSKU showing up again would spawn a second empty duplicate
       // every time, right back where the merge started. See lib/skus.ts.
-      let skuId = await resolveSkuIdByCode(db, item.sellerSku);
+      let skuId = await resolveSkuIdByCode(db, organizationId, item.sellerSku);
       if (!skuId) {
-        const catalog = item.asin ? await fetchCatalogItemDetails(item.asin) : { title: null, imageUrl: null };
+        const catalog = item.asin ? await fetchCatalogItemDetails(item.asin, credentials) : { title: null, imageUrl: null };
         const candidateId = newId();
+        // ON CONFLICT still targets the plain sku_code UNIQUE constraint
+        // (not (organization_id, sku_code) — that composite constraint
+        // doesn't exist yet, see migrations/0026_skus_per_organization.sql
+        // for why the table rebuild needed for it was deferred). Means two
+        // different orgs sharing the exact same SellerSKU string would still
+        // collide here — a known, documented, low-probability follow-up,
+        // not the leak this organization_id column exists to close.
         await db
-          .prepare(`INSERT INTO skus (id, sku_code, name, image_url, asin) VALUES (?, ?, ?, ?, ?) ON CONFLICT (sku_code) DO NOTHING`)
-          .bind(candidateId, item.sellerSku, catalog.title ?? item.title ?? item.sellerSku, catalog.imageUrl, item.asin ?? null)
+          .prepare(`INSERT INTO skus (id, organization_id, sku_code, name, image_url, asin) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (sku_code) DO NOTHING`)
+          .bind(candidateId, organizationId, item.sellerSku, catalog.title ?? item.title ?? item.sellerSku, catalog.imageUrl, item.asin ?? null)
           .run();
         // Re-resolve regardless of who won — a concurrently-processed order
         // with the same brand-new SellerSKU may have created it first, in
         // which case the INSERT above was a no-op and this returns *their*
         // id, not candidateId.
-        skuId = await resolveSkuIdByCode(db, item.sellerSku);
+        skuId = await resolveSkuIdByCode(db, organizationId, item.sellerSku);
         if (skuId === candidateId) summary.newSkusCreated.push(item.sellerSku);
       }
       await db

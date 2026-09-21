@@ -1,0 +1,73 @@
+---
+import Base from '../layouts/Base.astro';
+
+const steps = [
+  {
+    title: '1. Connect your Amazon account',
+    body: 'Sign up, then link your own Amazon Seller Central account via LWA credentials. Your orders, catalog, and Easy Ship shipping stay entirely yours — nothing is shared with other sellers on the platform.'
+  },
+  {
+    title: '2. Orders sync automatically',
+    body: 'Unshipped Amazon orders pull in on a schedule, get matched against your SKUs, and reserve stock automatically. No manual CSV exports.'
+  },
+  {
+    title: '3. Pick with barcode scanning',
+    body: 'Pickers get an assigned batch and location-by-location instructions with barcode/QR scanning at every step, so the wrong item can\'t make it into a cart unnoticed.'
+  },
+  {
+    title: '4. Pack and print',
+    body: 'Packers verify contents by scanning, then the system stamps and manages shipping labels through Amazon Easy Ship — including bulk scheduling for busy days.'
+  },
+  {
+    title: '5. Track everything from one dashboard',
+    body: 'See orders by Amazon status (pending, unshipped, waiting for pickup, shipped, cancelled), inventory levels, and exceptions that need a human — all searchable and filterable like Seller Central, but built for your floor team.'
+  }
+];
+---
+
+<Base title="How it works">
+  <div class="auth-shell" style="align-items: flex-start; padding-top: 48px;">
+    <div style="max-width: 720px; width: 100%; margin: 0 auto; display: flex; flex-direction: column; gap: 28px;">
+      <div class="stack" style="text-align: center; gap: 8px;">
+        <div class="brand" style="justify-content: center;">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 8 12 3 3 8l9 5 9-5Z"></path>
+              <path d="M3 8v8l9 5 9-5V8"></path>
+              <path d="M12 13v8"></path>
+            </svg>
+          </span>
+          <span class="brand-text">
+            <span class="row" style="align-items: center; gap: 6px;">
+              <span class="brand-name">ecomglider</span>
+              <span class="pre-alpha-tag">Pre-Alpha</span>
+            </span>
+            <span class="brand-section">Warehouse</span>
+          </span>
+        </div>
+        <h1 class="big-label" style="font-size: 2rem;">How ecomglider WMS works</h1>
+        <p>A pick-pack-ship system built around one job: get Amazon orders out the door correctly, every time.</p>
+      </div>
+
+      <div class="stack" style="gap: 16px;">
+        {
+          steps.map((step) => (
+            <div class="card stack">
+              <h2 style="font-size: 1.1rem;">{step.title}</h2>
+              <p>{step.body}</p>
+            </div>
+          ))
+        }
+      </div>
+
+      <div class="card stack" style="text-align: center;">
+        <h2>Ready to try it?</h2>
+        <p>We're onboarding sellers individually during pre-alpha.</p>
+        <div class="row" style="justify-content: center; gap: 12px;">
+          <a href="/pricing" class="btn btn-primary">See pricing &amp; request access</a>
+          <a href="/signup" class="btn">I already have credentials</a>
+        </div>
+      </div>
+    </div>
+  </div>
+</Base>

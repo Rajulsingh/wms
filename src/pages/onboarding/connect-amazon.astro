@@ -1,0 +1,95 @@
+---
+import Base from '../../layouts/Base.astro';
+import { getDb } from '../../lib/db';
+import { getCurrentUser } from '../../lib/auth';
+import { getOrganizationForUser } from '../../lib/org-accounts';
+
+const db = getDb();
+const user = await getCurrentUser(Astro, db);
+if (!user || user.role !== 'admin') return Astro.redirect('/login');
+
+const organization = await getOrganizationForUser(db, user.id);
+const alreadyConnected = Boolean(organization?.amazon_connected_at);
+// Reached mid-onboarding right after the warehouse step (normal case) or
+// later from the admin sidebar to reconnect/replace credentials — either way
+// "done" means /admin. The only edge case is landing here directly with no
+// warehouse yet (e.g. a bookmarked link), which sends back to that step first.
+const nextHref = user.warehouse_id ? '/admin' : '/onboarding/warehouse';
+---
+
+<Base title="Connect Amazon">
+  <div class="auth-shell">
+    <div class="auth-card stack" style="max-width: 520px;">
+      <h1 class="big-label" style="font-size: 1.5rem;">Connect your Amazon account</h1>
+      <p style="margin-top: -8px;">
+        Enter the LWA credentials from your own Amazon SP-API developer registration (Seller Central → Apps &amp; Services →
+        Develop apps). One-click "Authorize" is coming once our app finishes Amazon's public review — this manual step works today.
+      </p>
+
+      {
+        alreadyConnected && (
+          <div class="banner banner-success">Amazon account connected. Enter new credentials below to replace it.</div>
+        )
+      }
+
+      <form id="amazon-form" class="stack">
+        <div class="stack" style="gap: 6px;">
+          <label for="clientId">LWA Client ID</label>
+          <input id="clientId" type="text" required />
+        </div>
+        <div class="stack" style="gap: 6px;">
+          <label for="clientSecret">LWA Client Secret</label>
+          <input id="clientSecret" type="password" required />
+        </div>
+        <div class="stack" style="gap: 6px;">
+          <label for="refreshToken">Refresh Token</label>
+          <input id="refreshToken" type="password" required />
+        </div>
+        <div class="stack" style="gap: 6px;">
+          <label for="marketplaceId">Marketplace ID</label>
+          <input id="marketplaceId" type="text" placeholder="e.g. A21TJRUUN4KGV for India" required />
+        </div>
+        <div class="stack" style="gap: 6px;">
+          <label for="merchantId">Merchant / Selling Partner ID (optional)</label>
+          <input id="merchantId" type="text" />
+        </div>
+        <div id="error" class="banner banner-danger" style="display: none;"></div>
+        <button type="submit" class="btn btn-primary">Save and continue</button>
+      </form>
+      <p style="text-align: center; margin-top: 4px;"><a href={nextHref}>Skip for now</a></p>
+    </div>
+  </div>
+
+  <script define:vars={{ continueHref: nextHref }}>
+    const form = document.getElementById('amazon-form');
+    const errorBox = document.getElementById('error');
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      errorBox.style.display = 'none';
+
+      const body = {
+        clientId: document.getElementById('clientId').value.trim(),
+        clientSecret: document.getElementById('clientSecret').value.trim(),
+        refreshToken: document.getElementById('refreshToken').value.trim(),
+        marketplaceId: document.getElementById('marketplaceId').value.trim(),
+        merchantId: document.getElementById('merchantId').value.trim()
+      };
+
+      const res = await fetch('/api/onboarding/connect-amazon', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({ error: 'Could not save Amazon credentials' }));
+        errorBox.textContent = data.error ?? 'Could not save Amazon credentials';
+        errorBox.style.display = 'block';
+        return;
+      }
+
+      window.location.href = continueHref;
+    });
+  </script>
+</Base>

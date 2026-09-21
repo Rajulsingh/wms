@@ -3,6 +3,7 @@ import { getDb, logAudit } from '../../../lib/db';
 import { requireUser, AuthError } from '../../../lib/auth';
 import { fetchOrderById } from '../../../lib/amazon';
 import { importAmazonOrders } from '../../../lib/orders';
+import { resolveAmazonCredentialsForWarehouse } from '../../../lib/org-accounts';
 
 /**
  * Backfills one specific Amazon order by id, bypassing the normal sync's
@@ -22,8 +23,9 @@ export const POST: APIRoute = async (context) => {
     const amazonOrderId = body.amazonOrderId?.trim();
     if (!amazonOrderId) return new Response(JSON.stringify({ error: 'amazonOrderId is required' }), { status: 400 });
 
-    const order = await fetchOrderById(amazonOrderId);
-    const summary = await importAmazonOrders(db, body.warehouseId, [order]);
+    const credentials = await resolveAmazonCredentialsForWarehouse(db, body.warehouseId);
+    const order = await fetchOrderById(amazonOrderId, credentials);
+    const summary = await importAmazonOrders(db, body.warehouseId, [order], credentials);
     await logAudit(db, { userId: user.id, action: 'order.manual_import_by_id', entityType: 'order', entityId: amazonOrderId, metadata: summary });
 
     return new Response(JSON.stringify(summary), { status: 200, headers: { 'Content-Type': 'application/json' } });

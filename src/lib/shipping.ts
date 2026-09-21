@@ -12,6 +12,7 @@ import {
   type HandoverSlot
 } from './amazon';
 import { stampPackageIdentifier } from './label-stamp';
+import { resolveAmazonCredentialsForWarehouse } from './org-accounts';
 
 export class ShippingError extends Error {
   constructor(public code: string, message: string) {
@@ -55,7 +56,13 @@ async function loadOrderAndBox(
 
 export async function getHandoverSlotsForOrder(db: D1Database, orderId: string, boxSizeId: string, weightGrams: number): Promise<HandoverSlot[]> {
   const { order, lengthCm, widthCm, heightCm } = await loadOrderAndBox(db, orderId, boxSizeId);
-  return listHandoverSlots(order.external_order_id, { length: lengthCm, width: widthCm, height: heightCm, unit: 'cm' }, { value: weightGrams, unit: 'grams' });
+  const credentials = await resolveAmazonCredentialsForWarehouse(db, order.warehouse_id);
+  return listHandoverSlots(
+    order.external_order_id,
+    { length: lengthCm, width: widthCm, height: heightCm, unit: 'cm' },
+    { value: weightGrams, unit: 'grams' },
+    credentials
+  );
 }
 
 export interface ScheduleResult {
@@ -82,8 +89,9 @@ export async function scheduleEasyShipForOrder(
   packageIdentifier: string
 ): Promise<ScheduleResult> {
   const { order } = await loadOrderAndBox(db, orderId, boxSizeId);
+  const credentials = await resolveAmazonCredentialsForWarehouse(db, order.warehouse_id);
 
-  const scheduled = await scheduleEasyShipPackage(order.external_order_id, slot, packageIdentifier);
+  const scheduled = await scheduleEasyShipPackage(order.external_order_id, slot, packageIdentifier, credentials);
 
   const packageId = newId();
   await db
@@ -124,7 +132,7 @@ export async function scheduleEasyShipForOrder(
   // failure here shouldn't surface as a purchase failure. label_status stays
   // queryable and retryLabelRequest can re-kick this off.
   try {
-    const { feedId } = await requestEasyShipDocuments(order.external_order_id);
+    const { feedId } = await requestEasyShipDocuments(order.external_order_id, credentials);
     await db.prepare(`UPDATE shipments SET label_status = 'feed_submitted', label_feed_id = ? WHERE id = ?`).bind(feedId, shipmentId).run();
   } catch {
     await db.prepare(`UPDATE shipments SET label_status = 'failed' WHERE id = ?`).bind(shipmentId).run();
@@ -142,7 +150,10 @@ export interface LabelStatusResult {
 /** Advances label retrieval by exactly one step and returns current status — call from a poll loop, never a blocking wait (Amazon's processing time is unbounded from here). */
 export async function checkLabelStatus(db: D1Database, shipmentId: string): Promise<LabelStatusResult> {
   const shipment = await db
-    .prepare(`SELECT label_status, label_feed_id, label_report_id, label_base64, label_file_type, package_identifier FROM shipments WHERE id = ?`)
+    .prepare(
+      `SELECT s.label_status, s.label_feed_id, s.label_report_id, s.label_base64, s.label_file_type, s.package_identifier, o.warehouse_id
+       FROM shipments s JOIN packages p ON p.id = s.package_id JOIN orders o ON o.id = p.order_id WHERE s.id = ?`
+    )
     .bind(shipmentId)
     .first<{
       label_status: string;
@@ -151,15 +162,17 @@ export async function checkLabelStatus(db: D1Database, shipmentId: string): Prom
       label_base64: string | null;
       label_file_type: string | null;
       package_identifier: string | null;
+      warehouse_id: string;
     }>();
   if (!shipment) throw new ShippingError('not_found', 'Shipment not found');
+  const credentials = await resolveAmazonCredentialsForWarehouse(db, shipment.warehouse_id);
 
   if (shipment.label_status === 'document_ready') {
     return { labelStatus: 'document_ready', labelBase64: shipment.label_base64 ?? undefined, labelFileType: shipment.label_file_type ?? undefined };
   }
 
   if (shipment.label_status === 'feed_submitted' && shipment.label_feed_id) {
-    const feed = await checkEasyShipFeed(shipment.label_feed_id);
+    const feed = await checkEasyShipFeed(shipment.label_feed_id, credentials);
     if (feed.status === 'DONE' && feed.reportReferenceId) {
       await db.prepare(`UPDATE shipments SET label_status = 'report_ready', label_report_id = ? WHERE id = ?`).bind(feed.reportReferenceId, shipmentId).run();
       return { labelStatus: 'report_ready' };
@@ -172,7 +185,7 @@ export async function checkLabelStatus(db: D1Database, shipmentId: string): Prom
   }
 
   if (shipment.label_status === 'report_ready' && shipment.label_report_id) {
-    const report = await checkEasyShipReport(shipment.label_report_id);
+    const report = await checkEasyShipReport(shipment.label_report_id, credentials);
     if (report.status === 'DONE' && report.labelBase64 && report.labelFileType) {
       const stamped = await stampPackageIdentifier(report.labelBase64, report.labelFileType, shipment.package_identifier ?? '');
       await db.prepare(`UPDATE shipments SET label_status = 'document_ready', label_base64 = ?, label_file_type = ? WHERE id = ?`).bind(stamped.base64, stamped.fileType, shipmentId).run();
@@ -191,12 +204,13 @@ export async function checkLabelStatus(db: D1Database, shipmentId: string): Prom
 /** Retries label retrieval from scratch after a `failed` status — does not re-schedule the pickup, that already happened. */
 export async function retryLabelRequest(db: D1Database, shipmentId: string): Promise<void> {
   const shipment = await db
-    .prepare(`SELECT s.id, o.external_order_id FROM shipments s JOIN packages p ON p.id = s.package_id JOIN orders o ON o.id = p.order_id WHERE s.id = ?`)
+    .prepare(`SELECT s.id, o.external_order_id, o.warehouse_id FROM shipments s JOIN packages p ON p.id = s.package_id JOIN orders o ON o.id = p.order_id WHERE s.id = ?`)
     .bind(shipmentId)
-    .first<{ id: string; external_order_id: string }>();
+    .first<{ id: string; external_order_id: string; warehouse_id: string }>();
   if (!shipment) throw new ShippingError('not_found', 'Shipment not found');
+  const credentials = await resolveAmazonCredentialsForWarehouse(db, shipment.warehouse_id);
 
-  const { feedId } = await requestEasyShipDocuments(shipment.external_order_id);
+  const { feedId } = await requestEasyShipDocuments(shipment.external_order_id, credentials);
   await db.prepare(`UPDATE shipments SET label_status = 'feed_submitted', label_feed_id = ?, label_report_id = NULL WHERE id = ?`).bind(feedId, shipmentId).run();
 }
 
@@ -295,8 +309,9 @@ export interface RateOption {
 }
 
 export async function getRatesForOrder(db: D1Database, orderId: string, boxSizeId: string, weightValue: number, weightUnit: string): Promise<RateOption[]> {
-  const { request } = await buildMfnShipmentRequest(db, orderId, boxSizeId, weightValue, weightUnit);
-  const offers = await getEligibleShippingServices(request);
+  const { request, order } = await buildMfnShipmentRequest(db, orderId, boxSizeId, weightValue, weightUnit);
+  const credentials = await resolveAmazonCredentialsForWarehouse(db, order.warehouse_id);
+  const offers = await getEligibleShippingServices(request, credentials);
   return offers
     .filter((o) => !o.requiresAdditionalSellerInputs)
     .map((o) => ({
@@ -329,7 +344,8 @@ export async function purchaseLabelForOrder(
   packageIdentifier?: string
 ): Promise<PurchaseResult> {
   const { request, order } = await buildMfnShipmentRequest(db, orderId, boxSizeId, weightValue, weightUnit);
-  const purchased = await purchaseShipment(request, shippingServiceId, shippingServiceOfferId);
+  const credentials = await resolveAmazonCredentialsForWarehouse(db, order.warehouse_id);
+  const purchased = await purchaseShipment(request, shippingServiceId, shippingServiceOfferId, credentials);
   if (!purchased.labelBase64) throw new ShippingError('no_label', 'Amazon did not return a label in the purchase response');
 
   const stamped = await stampPackageIdentifier(purchased.labelBase64, purchased.labelFileType, packageIdentifier ?? order.external_order_id);
@@ -429,12 +445,17 @@ export async function scheduleEasyShipBulk(
   }
 
   const { createScheduledPackageBulk } = await import('./amazon');
+  // All orders in one bulk call are assumed to belong to the same warehouse
+  // (the admin UI only ever offers orders from the session's own warehouse) —
+  // resolving credentials once from the first order is correct for that case.
+  const credentials = await resolveAmazonCredentialsForWarehouse(db, loaded[0].order.warehouse_id);
   const bulkResult = await createScheduledPackageBulk(
     loaded.map(({ input, order }) => ({
       amazonOrderId: order.external_order_id,
       packageIdentifier: input.packageIdentifier,
       packageTimeSlot: slot
-    }))
+    })),
+    credentials
   );
 
   // Create local package/shipment rows for everything Amazon actually scheduled.

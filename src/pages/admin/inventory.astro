@@ -135,7 +135,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
           try {
             await Promise.all([
               api('/api/admin/inventory', { inventoryId: invId, quantityOnHand: onHand }, 'PATCH'),
-              api('/api/admin/skus', { skuId, price }, 'PATCH')
+              api('/api/admin/skus', { skuId, price, warehouseId }, 'PATCH')
             ]);
           } catch (err) {
             alert((err as Error).message);
@@ -186,7 +186,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
       mergeProgress.classList.add('active');
       try {
         const preview: MergePreview = await withLoading(btn, 'Checking…', () =>
-          api(`/api/admin/sku-merge?sourceCode=${encodeURIComponent(sourceCode)}&targetCode=${encodeURIComponent(targetCode)}`)
+          api(`/api/admin/sku-merge?sourceCode=${encodeURIComponent(sourceCode)}&targetCode=${encodeURIComponent(targetCode)}&warehouseId=${warehouseId}`)
         );
         mergeResult.innerHTML = `
           <div class="banner ${preview.mskuMismatch || preview.asinMismatch ? 'banner-danger' : 'banner-warning'}" style="margin-top: 10px;">
@@ -217,7 +217,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
         document.getElementById('merge-confirm-btn')?.addEventListener('click', async (ce) => {
           const confirmBtn = ce.currentTarget as HTMLButtonElement;
           try {
-            await withLoading(confirmBtn, 'Merging…', () => api('/api/admin/sku-merge', { sourceCode, targetCode }, 'POST'));
+            await withLoading(confirmBtn, 'Merging…', () => api('/api/admin/sku-merge', { sourceCode, targetCode, warehouseId }, 'POST'));
             mergeResult.innerHTML = `<div class="banner banner-success" style="margin-top: 10px;">Merged. Reloading inventory…</div>`;
             mergeSourceInput.value = '';
             mergeTargetInput.value = '';
@@ -254,7 +254,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
       const btn = e.currentTarget as HTMLButtonElement;
       try {
         const preview: UnmergePreview = await withLoading(btn, 'Checking…', () =>
-          api(`/api/admin/sku-unmerge?sourceCode=${encodeURIComponent(sourceCode)}`)
+          api(`/api/admin/sku-unmerge?sourceCode=${encodeURIComponent(sourceCode)}&warehouseId=${warehouseId}`)
         );
         unmergeResult.innerHTML = `
           <div class="banner banner-warning" style="margin-top: 10px;">
@@ -278,7 +278,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
         document.getElementById('unmerge-confirm-btn')?.addEventListener('click', async (ce) => {
           const confirmBtn = ce.currentTarget as HTMLButtonElement;
           try {
-            await withLoading(confirmBtn, 'Unmerging…', () => api('/api/admin/sku-unmerge', { sourceCode }, 'POST'));
+            await withLoading(confirmBtn, 'Unmerging…', () => api('/api/admin/sku-unmerge', { sourceCode, warehouseId }, 'POST'));
             unmergeResult.innerHTML = `<div class="banner banner-success" style="margin-top: 10px;">Unmerged — "${escapeHtml(sourceCode)}" is independent again.</div>`;
             unmergeSourceInput.value = '';
           } catch (err) {
@@ -301,7 +301,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
       });
       if (!ok) return;
       try {
-        const result = await withLoading(btn, 'Unmerging…', () => api('/api/admin/sku-unmerge-all', {}, 'POST'));
+        const result = await withLoading(btn, 'Unmerging…', () => api('/api/admin/sku-unmerge-all', { warehouseId }, 'POST'));
         unmergeAllResult.innerHTML = result.count
           ? `<div class="banner banner-success" style="margin-top: 10px;">Unmerged ${result.count} listing${result.count === 1 ? '' : 's'}.</div>`
           : `<p style="margin-top: 10px;">Nothing was merged — no change made.</p>`;
@@ -375,7 +375,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
       duplicatesResult.innerHTML = '';
       scanProgress.classList.add('active');
       try {
-        const groups: DuplicateGroup[] = await withLoading(btn, 'Scanning…', () => api('/api/admin/sku-duplicates'));
+        const groups: DuplicateGroup[] = await withLoading(btn, 'Scanning…', () => api(`/api/admin/sku-duplicates?warehouseId=${warehouseId}`));
         if (!groups.length) {
           duplicatesResult.innerHTML = `<p>No possible duplicates found.</p>`;
           return;

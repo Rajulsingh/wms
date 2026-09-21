@@ -1,0 +1,58 @@
+---
+import Base from '../../layouts/Base.astro';
+import { getDb } from '../../lib/db';
+import { getCurrentUser } from '../../lib/auth';
+
+const db = getDb();
+const user = await getCurrentUser(Astro, db);
+if (!user || user.role !== 'admin') return Astro.redirect('/login');
+if (user.warehouse_id) return Astro.redirect('/admin');
+---
+
+<Base title="Set up your warehouse">
+  <div class="auth-shell">
+    <div class="auth-card stack" style="max-width: 480px;">
+      <h1 class="big-label" style="font-size: 1.5rem;">Set up your warehouse</h1>
+      <p style="margin-top: -8px;">Step 1 of 2 — one warehouse per account for now.</p>
+      <form id="warehouse-form" class="stack">
+        <div class="stack" style="gap: 6px;">
+          <label for="name">Warehouse name</label>
+          <input id="name" name="name" type="text" placeholder="e.g. Mumbai FC" required />
+        </div>
+        <div class="stack" style="gap: 6px;">
+          <label for="code">Short code</label>
+          <input id="code" name="code" type="text" placeholder="e.g. BOM1" maxlength="12" required />
+        </div>
+        <div id="error" class="banner banner-danger" style="display: none;"></div>
+        <button type="submit" class="btn btn-primary">Continue</button>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    const form = document.getElementById('warehouse-form') as HTMLFormElement;
+    const errorBox = document.getElementById('error') as HTMLDivElement;
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      errorBox.style.display = 'none';
+      const name = (document.getElementById('name') as HTMLInputElement).value.trim();
+      const code = (document.getElementById('code') as HTMLInputElement).value.trim();
+
+      const res = await fetch('/api/onboarding/create-warehouse', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, code })
+      });
+
+      if (!res.ok) {
+        const data: any = await res.json().catch(() => ({ error: 'Could not create warehouse' }));
+        errorBox.textContent = data.error ?? 'Could not create warehouse';
+        errorBox.style.display = 'block';
+        return;
+      }
+
+      window.location.href = '/onboarding/connect-amazon';
+    });
+  </script>
+</Base>

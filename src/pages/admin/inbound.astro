@@ -283,7 +283,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
     }
 
     async function loadCatalog() {
-      const rows: CatalogRow[] = await api('/api/admin/skus');
+      const rows: CatalogRow[] = await api(`/api/admin/skus?warehouseId=${warehouseId}`);
       const tbody = document.getElementById('catalog-rows')!;
       tbody.innerHTML = rows.length
         ? rows

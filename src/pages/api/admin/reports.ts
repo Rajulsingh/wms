@@ -1,6 +1,7 @@
 import type { APIRoute } from 'astro';
 import { getDb } from '../../../lib/db';
 import { requireUser, AuthError } from '../../../lib/auth';
+import { getOrganizationIdForWarehouse } from '../../../lib/org-accounts';
 
 const DEFAULT_REORDER_POINT = 5;
 
@@ -18,7 +19,15 @@ export const GET: APIRoute = async (context) => {
   try {
     await requireUser(context, db, ['admin']);
     const warehouseId = new URL(context.request.url).searchParams.get('warehouseId');
+    if (!warehouseId) return new Response(JSON.stringify({ error: 'warehouseId is required' }), { status: 400 });
+    const organizationId = await getOrganizationIdForWarehouse(db, warehouseId);
 
+    // `WHERE s.organization_id = ?` is the fix for a real cross-tenant leak
+    // (migrations/0026_skus_per_organization.sql): this used to drive FROM
+    // skus with no organization filter at all, so every seller's stock
+    // report listed every OTHER seller's SKUs too (with 0 on-hand for ones
+    // the LEFT JOIN on warehouse-scoped `loc` didn't match) — confirmed live
+    // while testing onboarding, not theoretical.
     const stock = await db
       .prepare(
         `SELECT s.id AS sku_id, s.sku_code, s.name AS sku_name, s.reorder_point,
@@ -27,11 +36,11 @@ export const GET: APIRoute = async (context) => {
          FROM skus s
          LEFT JOIN inventory inv ON inv.sku_id = s.id
          LEFT JOIN locations loc ON loc.id = inv.location_id AND loc.warehouse_id = ?
-         WHERE s.merged_into_id IS NULL
+         WHERE s.organization_id = ? AND s.merged_into_id IS NULL
          GROUP BY s.id
          ORDER BY s.sku_code`
       )
-      .bind(warehouseId)
+      .bind(warehouseId, organizationId)
       .all<{ sku_id: string; sku_code: string; sku_name: string; reorder_point: number | null; on_hand: number; reserved: number }>();
 
     const dailyPicks = await db

@@ -25,7 +25,7 @@ import { mapWithConcurrency } from './concurrency';
  * was never the real bug, EasyShip was just the wrong API to call.
  */
 
-interface AmazonEnv {
+export interface AmazonEnv {
   AMAZON_LWA_CLIENT_ID: string;
   AMAZON_LWA_CLIENT_SECRET: string;
   AMAZON_REFRESH_TOKEN: string;
@@ -34,7 +34,18 @@ interface AmazonEnv {
   AMAZON_MERCHANT_ID?: string;
 }
 
-function getEnv(): AmazonEnv {
+/**
+ * `credentials` lets a caller override the global Worker-secret Amazon
+ * account with a specific organization's own stored credentials (see
+ * organizations.amazon_* columns / lib/org-amazon.ts) — multi-tenant
+ * onboarding means each seller's orders must sync against *their* Amazon
+ * account, not this deploy's own. Falls back to the global env vars when no
+ * override is given (or a field is missing from it), which keeps every
+ * pre-existing call site — and your own organization, until it's backfilled
+ * with its own stored credentials — working unchanged.
+ */
+function getEnv(credentials?: Partial<AmazonEnv>): AmazonEnv {
+  const merged = { ...(workerEnv as unknown as AmazonEnv), ...credentials } as AmazonEnv;
   const required: (keyof AmazonEnv)[] = [
     'AMAZON_LWA_CLIENT_ID',
     'AMAZON_LWA_CLIENT_SECRET',
@@ -42,11 +53,11 @@ function getEnv(): AmazonEnv {
     'AMAZON_MARKETPLACE_ID'
   ];
   for (const key of required) {
-    if (!(workerEnv as unknown as Record<string, string | undefined>)[key]) {
-      throw new Error(`Missing ${key} — set it in .dev.vars locally or via "wrangler secret put" in production.`);
+    if (!merged[key]) {
+      throw new Error(`Missing ${key} — set it in .dev.vars locally, via "wrangler secret put" in production, or connect an Amazon account for this organization.`);
     }
   }
-  return workerEnv as unknown as AmazonEnv;
+  return merged;
 }
 
 // SP-API has three regional endpoints, and a request to the wrong one for
@@ -134,8 +145,8 @@ export interface AmazonOrder {
  * MarketplaceIds=ATVPDKIKX0DER — no FulfillmentChannels/OrderStatuses
  * filters, no real dates. Real filtering only works against production.
  */
-export async function fetchUnfulfilledOrders(since: Date): Promise<AmazonOrder[]> {
-  const env = getEnv();
+export async function fetchUnfulfilledOrders(since: Date, credentials?: Partial<AmazonEnv>): Promise<AmazonOrder[]> {
+  const env = getEnv(credentials);
   const accessToken = await getAccessToken(env);
   const isSandbox = env.AMAZON_SPAPI_SANDBOX === 'true';
 
@@ -299,8 +310,8 @@ export interface AmazonOrderStatus {
  * FBA order id by mistake should get a clear error, not have it quietly
  * enter this warehouse's pick/pack pipeline.
  */
-export async function fetchOrderById(amazonOrderId: string): Promise<AmazonOrder> {
-  const env = getEnv();
+export async function fetchOrderById(amazonOrderId: string, credentials?: Partial<AmazonEnv>): Promise<AmazonOrder> {
+  const env = getEnv(credentials);
   const accessToken = await getAccessToken(env);
 
   const url = new URL(`${baseUrl(env)}/orders/v0/orders`);
@@ -340,8 +351,8 @@ export async function fetchOrderById(amazonOrderId: string): Promise<AmazonOrder
   };
 }
 
-export async function fetchOrderStatuses(amazonOrderIds: string[]): Promise<Map<string, AmazonOrderStatus>> {
-  const env = getEnv();
+export async function fetchOrderStatuses(amazonOrderIds: string[], credentials?: Partial<AmazonEnv>): Promise<Map<string, AmazonOrderStatus>> {
+  const env = getEnv(credentials);
   const accessToken = await getAccessToken(env);
   const result = new Map<string, AmazonOrderStatus>();
 
@@ -382,8 +393,8 @@ export interface CatalogItemDetails {
  * references it (§ "images and details can be fetched from real product
  * listings on amazon").
  */
-export async function fetchCatalogItemDetails(asin: string): Promise<CatalogItemDetails> {
-  const env = getEnv();
+export async function fetchCatalogItemDetails(asin: string, credentials?: Partial<AmazonEnv>): Promise<CatalogItemDetails> {
+  const env = getEnv(credentials);
   const accessToken = await getAccessToken(env);
   const url = new URL(`${baseUrl(env)}/catalog/2022-04-01/items/${asin}`);
   url.searchParams.set('marketplaceIds', env.AMAZON_MARKETPLACE_ID);
@@ -435,8 +446,8 @@ export interface ListingSummary {
  * right tool for this. Capped at 1000 items / 50 pages of 20, matching
  * Amazon's own stated ceiling for this endpoint's pagination.
  */
-export async function fetchAllListings(onPage?: (pageItems: ListingSummary[]) => void | Promise<void>): Promise<ListingSummary[]> {
-  const env = getEnv();
+export async function fetchAllListings(onPage?: (pageItems: ListingSummary[]) => void | Promise<void>, credentials?: Partial<AmazonEnv>): Promise<ListingSummary[]> {
+  const env = getEnv(credentials);
   const sellerId = env.AMAZON_MERCHANT_ID;
   if (!sellerId) {
     throw new Error('AMAZON_MERCHANT_ID is not set — required as the sellerId path parameter for the Listings Items API.');
@@ -582,8 +593,8 @@ export interface ShippingServiceOffer {
 }
 
 /** Gets available carrier services + rates for a box size/weight against a specific order — call this first, let the admin pick one, then purchaseShipment with that offer id. */
-export async function getEligibleShippingServices(request: MfnShipmentRequest): Promise<ShippingServiceOffer[]> {
-  const env = getEnv();
+export async function getEligibleShippingServices(request: MfnShipmentRequest, credentials?: Partial<AmazonEnv>): Promise<ShippingServiceOffer[]> {
+  const env = getEnv(credentials);
   const accessToken = await getAccessToken(env);
   const res = await fetch(`${baseUrl(env)}/mfn/v0/eligibleShippingServices`, {
     method: 'POST',
@@ -617,9 +628,10 @@ export interface PurchasedShipment {
 export async function purchaseShipment(
   request: MfnShipmentRequest,
   shippingServiceId: string,
-  shippingServiceOfferId: string
+  shippingServiceOfferId: string,
+  credentials?: Partial<AmazonEnv>
 ): Promise<PurchasedShipment> {
-  const env = getEnv();
+  const env = getEnv(credentials);
   const accessToken = await getAccessToken(env);
   const res = await fetch(`${baseUrl(env)}/mfn/v0/shipments`, {
     method: 'POST',
@@ -679,8 +691,8 @@ export interface HandoverSlot {
  * state). Call this with the box/weight the package will actually ship in;
  * the chosen slot is then passed to `scheduleEasyShipPackage`.
  */
-export async function listHandoverSlots(amazonOrderId: string, dimensions: EasyShipDimensions, weight: EasyShipWeight): Promise<HandoverSlot[]> {
-  const env = getEnv();
+export async function listHandoverSlots(amazonOrderId: string, dimensions: EasyShipDimensions, weight: EasyShipWeight, credentials?: Partial<AmazonEnv>): Promise<HandoverSlot[]> {
+  const env = getEnv(credentials);
   const accessToken = await getAccessToken(env);
   const res = await fetch(`${baseUrl(env)}/easyShip/2022-03-23/timeSlot`, {
     method: 'POST',
@@ -713,9 +725,10 @@ export interface ScheduledPackageResult {
 export async function scheduleEasyShipPackage(
   amazonOrderId: string,
   slot: Pick<HandoverSlot, 'slotId' | 'startTime' | 'endTime' | 'handoverMethod'>,
-  packageIdentifier?: string
+  packageIdentifier?: string,
+  credentials?: Partial<AmazonEnv>
 ): Promise<ScheduledPackageResult> {
-  const env = getEnv();
+  const env = getEnv(credentials);
   const accessToken = await getAccessToken(env);
   const res = await fetch(`${baseUrl(env)}/easyShip/2022-03-23/package`, {
     method: 'POST',
@@ -762,8 +775,8 @@ async function spApiFetch(env: AmazonEnv, path: string, init?: RequestInit): Pro
 }
 
 /** Kicks off label/invoice retrieval — submits a POST_EASYSHIP_DOCUMENTS feed for this order. Returns the feed id to poll with `checkEasyShipFeed`. */
-export async function requestEasyShipDocuments(amazonOrderId: string): Promise<{ feedId: string }> {
-  const env = getEnv();
+export async function requestEasyShipDocuments(amazonOrderId: string, credentials?: Partial<AmazonEnv>): Promise<{ feedId: string }> {
+  const env = getEnv(credentials);
 
   // 1. Reserve a feed document slot — Amazon hands back a pre-signed upload URL.
   const docRes = await spApiFetch(env, '/feeds/2021-06-30/documents', {
@@ -811,8 +824,8 @@ export interface FeedCheckResult {
 }
 
 /** One non-blocking check of feed processing. Once DONE, downloads the feed's own processing report to pull out the DocumentReportReferenceID — that id is what actually retrieves the label PDF next, via `checkEasyShipReport`. */
-export async function checkEasyShipFeed(feedId: string): Promise<FeedCheckResult> {
-  const env = getEnv();
+export async function checkEasyShipFeed(feedId: string, credentials?: Partial<AmazonEnv>): Promise<FeedCheckResult> {
+  const env = getEnv(credentials);
   const res = await spApiFetch(env, `/feeds/2021-06-30/feeds/${feedId}`);
   if (!res.ok) throw new Error(`getFeed failed: ${res.status} ${await res.text()}`);
   const feed = (await res.json()) as { processingStatus: string; resultFeedDocumentId?: string };
@@ -840,8 +853,8 @@ export interface ReportCheckResult {
 }
 
 /** One non-blocking check of the report (the actual label+invoice PDF) status. */
-export async function checkEasyShipReport(reportId: string): Promise<ReportCheckResult> {
-  const env = getEnv();
+export async function checkEasyShipReport(reportId: string, credentials?: Partial<AmazonEnv>): Promise<ReportCheckResult> {
+  const env = getEnv(credentials);
   const res = await spApiFetch(env, `/reports/2021-06-30/reports/${reportId}`);
   if (!res.ok) throw new Error(`getReport failed: ${res.status} ${await res.text()}`);
   const report = (await res.json()) as { processingStatus: string; reportDocumentId?: string };
@@ -912,8 +925,8 @@ export interface BulkScheduleResult {
 }
 
 /** Schedules multiple orders in one call. A `packageTimeSlot` is optional per order — omit it and Amazon assigns the earliest available slot instead of requiring a `listHandoverSlots` call for every order first. */
-export async function createScheduledPackageBulk(orders: BulkOrderSchedule[]): Promise<BulkScheduleResult> {
-  const env = getEnv();
+export async function createScheduledPackageBulk(orders: BulkOrderSchedule[], credentials?: Partial<AmazonEnv>): Promise<BulkScheduleResult> {
+  const env = getEnv(credentials);
   const accessToken = await getAccessToken(env);
   const res = await fetch(`${baseUrl(env)}/easyShip/2022-03-23/packages/bulk`, {
     method: 'POST',

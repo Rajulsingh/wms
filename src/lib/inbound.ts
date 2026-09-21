@@ -1,6 +1,7 @@
 import { newId, logAudit } from './db';
 import { resolveSkuIdByCode, setMsku, SkuMergeError } from './skus';
 import { retryBlockedOrdersForSku } from './orders';
+import { getOrganizationIdForWarehouse } from './org-accounts';
 
 export class InboundError extends Error {
   constructor(public code: string, message: string) {
@@ -42,6 +43,7 @@ export async function receiveStock(
   lines: ReceiveLine[]
 ): Promise<{ receiptId: string; lines: ReceiveLineResult[] }> {
   if (!lines.length) throw new InboundError('no_lines', 'Add at least one line to receive');
+  const organizationId = await getOrganizationIdForWarehouse(db, warehouseId);
 
   const receiptId = newId();
   await db
@@ -59,7 +61,10 @@ export async function receiveStock(
     let skuCode: string;
     let alreadyHasMsku = false;
     if (skuId) {
-      const sku = await db.prepare(`SELECT sku_code, msku FROM skus WHERE id = ?`).bind(skuId).first<{ sku_code: string; msku: string | null }>();
+      const sku = await db
+        .prepare(`SELECT sku_code, msku FROM skus WHERE id = ? AND organization_id = ?`)
+        .bind(skuId, organizationId)
+        .first<{ sku_code: string; msku: string | null }>();
       if (!sku) throw new InboundError('sku_not_found', 'SKU not found');
       skuCode = sku.sku_code;
       alreadyHasMsku = sku.msku != null;
@@ -71,14 +76,14 @@ export async function receiveStock(
       // that's since been merged puts the stock on the surviving SKU
       // instead of the dead one. See lib/skus.ts.
       const code = line.newSku.skuCode.trim();
-      const resolvedId = await resolveSkuIdByCode(db, code);
+      const resolvedId = await resolveSkuIdByCode(db, organizationId, code);
       if (resolvedId) {
         skuId = resolvedId;
         const existing = await db.prepare(`SELECT msku FROM skus WHERE id = ?`).bind(resolvedId).first<{ msku: string | null }>();
         alreadyHasMsku = existing?.msku != null;
       } else {
         skuId = newId();
-        await db.prepare(`INSERT INTO skus (id, sku_code, name) VALUES (?, ?, ?)`).bind(skuId, code, line.newSku.name.trim()).run();
+        await db.prepare(`INSERT INTO skus (id, organization_id, sku_code, name) VALUES (?, ?, ?, ?)`).bind(skuId, organizationId, code, line.newSku.name.trim()).run();
       }
       skuCode = code;
     }
@@ -90,12 +95,12 @@ export async function receiveStock(
     // still be `skuId`.
     if (line.msku?.trim() && !alreadyHasMsku) {
       try {
-        await setMsku(db, userId, skuCode, line.msku);
+        await setMsku(db, userId, organizationId, skuCode, line.msku);
       } catch (err) {
         if (err instanceof SkuMergeError) throw new InboundError(err.code, err.message);
         throw err;
       }
-      const resolved = await resolveSkuIdByCode(db, skuCode);
+      const resolved = await resolveSkuIdByCode(db, organizationId, skuCode);
       if (resolved) skuId = resolved;
     }
 

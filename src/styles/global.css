@@ -471,6 +471,9 @@ video.scanner {
 input[type='text'],
 input[type='number'],
 input[type='password'],
+input[type='email'],
+input[type='tel'],
+textarea,
 select {
   font-family: inherit;
   font-size: 1.05rem;
@@ -482,6 +485,12 @@ select {
   width: 100%;
   min-height: 52px;
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+textarea {
+  min-height: 80px;
+  font-size: 1rem;
+  resize: vertical;
 }
 
 select {
@@ -497,6 +506,7 @@ select {
    .form-input:focus-visible exactly (outline: 2px solid var(--color-
    primary); outline-offset: 1px). */
 input:focus-visible,
+textarea:focus-visible,
 select:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;

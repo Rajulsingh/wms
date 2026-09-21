@@ -2,6 +2,7 @@ import type { APIRoute } from 'astro';
 import { getDb } from '../../../lib/db';
 import { requireUser, AuthError } from '../../../lib/auth';
 import { unmergeAllSkus } from '../../../lib/skus';
+import { getOrganizationIdForWarehouse } from '../../../lib/org-accounts';
 
 // Separate route from sku-unmerge.ts (rather than an `{ all: true }` flag on
 // it) on purpose — this is a much more consequential action (every merged
@@ -12,7 +13,9 @@ export const POST: APIRoute = async (context) => {
   const db = getDb();
   try {
     const user = await requireUser(context, db, ['admin']);
-    const result = await unmergeAllSkus(db, user.id);
+    const body = await context.request.json<{ warehouseId: string }>();
+    const organizationId = await getOrganizationIdForWarehouse(db, body.warehouseId);
+    const result = await unmergeAllSkus(db, user.id, organizationId);
     return new Response(JSON.stringify(result), { status: 200, headers: { 'Content-Type': 'application/json' } });
   } catch (err) {
     if (err instanceof AuthError) return new Response(JSON.stringify({ error: err.message }), { status: err.status });

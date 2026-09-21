@@ -1,0 +1,67 @@
+---
+import AdminShell from '../../components/AdminShell.astro';
+import { getDb } from '../../lib/db';
+import { requireAdminPage } from '../../lib/auth';
+
+const redirectTo = await requireAdminPage(Astro, getDb());
+if (redirectTo) return Astro.redirect(redirectTo);
+---
+
+<AdminShell title="Signup requests" current="leads">
+  <div style="max-width: 900px; display: flex; flex-direction: column; gap: 18px;">
+    <div class="card stack">
+      <h2>Requests from the pricing page</h2>
+      <p>Sellers who filled out "Request access" — action them by creating an account for them via <code>/api/partner/provision-org</code> or <a href="/signup">/signup</a> on their behalf.</p>
+      <div id="leads-list" class="stack"></div>
+    </div>
+  </div>
+
+  <script>
+    const list = document.getElementById('leads-list') as HTMLDivElement;
+
+    async function load() {
+      const res = await fetch('/api/admin/leads');
+      const leads: any[] = await res.json();
+      if (!leads.length) {
+        list.innerHTML = '<p>No requests yet.</p>';
+        return;
+      }
+      list.innerHTML = '';
+      for (const lead of leads) {
+        const row = document.createElement('div');
+        row.className = 'card stack';
+        row.style.gap = '6px';
+        row.innerHTML = `
+          <div class="row" style="justify-content: space-between; align-items: flex-start;">
+            <div>
+              <strong>${lead.name}</strong> — ${lead.email}
+              ${lead.company ? `<div>${lead.company}</div>` : ''}
+              ${lead.phone ? `<div>${lead.phone}</div>` : ''}
+              ${lead.message ? `<div style="color: var(--muted);">${lead.message}</div>` : ''}
+              <div style="font-size: 0.8rem; color: var(--muted);">${new Date(lead.created_at).toLocaleString()}</div>
+            </div>
+            <select data-id="${lead.id}" class="lead-status" style="width: auto; min-height: auto; padding: 6px 10px;">
+              ${['new', 'contacted', 'onboarded', 'declined']
+                .map((s) => `<option value="${s}" ${s === lead.status ? 'selected' : ''}>${s}</option>`)
+                .join('')}
+            </select>
+          </div>
+        `;
+        list.appendChild(row);
+      }
+
+      list.querySelectorAll('.lead-status').forEach((el) => {
+        const select = el as unknown as HTMLSelectElement;
+        select.addEventListener('change', async () => {
+          await fetch('/api/admin/leads', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: select.dataset.id, status: select.value })
+          });
+        });
+      });
+    }
+
+    load();
+  </script>
+</AdminShell>

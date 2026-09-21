@@ -4,6 +4,7 @@ import { requireUser, AuthError } from '../../../lib/auth';
 import { resolveSkuIdByCode } from '../../../lib/skus';
 import { reserveOrderForPicking } from '../../../lib/orders';
 import { getAdminOrders, type AdminOrderTab, type SentFilter, type SearchField, type SortOption } from '../../../lib/admin-orders';
+import { getOrganizationIdForWarehouse } from '../../../lib/org-accounts';
 
 /** Manual order entry / CSV-row-at-a-time import (§11 MVP: "manual + CSV/API"). One order per call; a CSV upload UI can call this in a loop. */
 export const POST: APIRoute = async (context) => {
@@ -28,9 +29,10 @@ export const POST: APIRoute = async (context) => {
       .bind(orderId, body.warehouseId, body.externalOrderId, body.priority ?? 0, body.customerName ?? null, body.shippingAddress ?? null)
       .run();
 
+    const organizationId = await getOrganizationIdForWarehouse(db, body.warehouseId);
     const unmatchedSkus: string[] = [];
     for (const item of body.items) {
-      const skuId = await resolveSkuIdByCode(db, item.skuCode);
+      const skuId = await resolveSkuIdByCode(db, organizationId, item.skuCode);
       if (!skuId) {
         unmatchedSkus.push(item.skuCode);
         continue;

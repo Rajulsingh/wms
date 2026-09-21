@@ -1,5 +1,5 @@
 import { newId } from './db';
-import { fetchAllListings } from './amazon';
+import { fetchAllListings, type AmazonEnv } from './amazon';
 
 export interface CatalogSyncResult {
   created: number;
@@ -63,7 +63,12 @@ export interface CatalogSyncProgress {
  * `is_parent_asin` so duplicate-scan (skus.ts) can exclude it from being
  * treated as a fresh candidate without touching anything it's already doing.
  */
-export async function syncAmazonCatalog(db: D1Database, onProgress?: (p: CatalogSyncProgress) => void | Promise<void>): Promise<CatalogSyncResult> {
+export async function syncAmazonCatalog(
+  db: D1Database,
+  organizationId: string,
+  onProgress?: (p: CatalogSyncProgress) => void | Promise<void>,
+  credentials?: Partial<AmazonEnv>
+): Promise<CatalogSyncResult> {
   let created = 0;
   let updated = 0;
   let skippedParent = 0;
@@ -73,7 +78,7 @@ export async function syncAmazonCatalog(db: D1Database, onProgress?: (p: Catalog
     for (const listing of pageItems) {
       if (!listing.title) continue; // nothing useful to store yet
 
-      const existing = await db.prepare(`SELECT id FROM skus WHERE sku_code = ?`).bind(listing.sku).first<{ id: string }>();
+      const existing = await db.prepare(`SELECT id FROM skus WHERE organization_id = ? AND sku_code = ?`).bind(organizationId, listing.sku).first<{ id: string }>();
 
       if (!listing.buyable) {
         if (existing) {
@@ -84,9 +89,12 @@ export async function syncAmazonCatalog(db: D1Database, onProgress?: (p: Catalog
       }
 
       if (!existing) {
+        // ON CONFLICT still targets the plain sku_code UNIQUE constraint —
+        // see the matching note in orders.ts's importAmazonOrders for why
+        // (organization_id, sku_code) isn't a real constraint yet.
         await db
-          .prepare(`INSERT INTO skus (id, sku_code, name, image_url, asin) VALUES (?, ?, ?, ?, ?)`)
-          .bind(newId(), listing.sku, listing.title, listing.imageUrl, listing.asin)
+          .prepare(`INSERT INTO skus (id, organization_id, sku_code, name, image_url, asin) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (sku_code) DO NOTHING`)
+          .bind(newId(), organizationId, listing.sku, listing.title, listing.imageUrl, listing.asin)
           .run();
         created++;
       } else {
@@ -99,7 +107,7 @@ export async function syncAmazonCatalog(db: D1Database, onProgress?: (p: Catalog
     }
     processed += pageItems.length;
     if (onProgress) await onProgress({ processed, total: null });
-  });
+  }, credentials);
 
   return { created, updated, skippedParent, total: listings.length };
 }

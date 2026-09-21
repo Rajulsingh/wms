@@ -115,6 +115,11 @@ export async function requireAdminPage(context: APIContext, db: D1Database): Pro
   const user = await getCurrentUser(context, db);
   if (!user) return '/login';
   if (user.role !== 'admin') return '/picker';
+  // A freshly-signed-up org owner (see org-accounts.ts) has no warehouse yet
+  // — every existing admin page assumes user.warehouse_id is set, so send
+  // them to finish onboarding instead of rendering a page that would 500 or
+  // silently show nothing.
+  if (!user.warehouse_id) return '/onboarding/warehouse';
   return null;
 }
 

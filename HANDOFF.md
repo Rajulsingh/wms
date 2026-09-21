@@ -2182,6 +2182,85 @@ full story behind each). What's actually not done yet, ordered by what's blockin
    has a real bug** (it's `null` by then) — caught this in the eighth pass's reset button; capture
    the element into a variable before the first `await`, every time.
 
+## Recently done (2026-09-21) — multi-tenant onboarding foundation (WMS as a paid tool other sellers can sign up for)
+
+Direction: this WMS is headed toward being a premium feature of ecomglider.com, sold to other
+Amazon sellers, not just the one it was built for. This pass made the platform itself ready for
+that (schema, auth, per-org Amazon credentials, onboarding, public pricing/how-it-works pages,
+and an integration seam for ecomglider.com) — **nothing on ecomglider.com itself was touched**,
+per explicit instruction; that merge is a separate future step.
+
+- **`organizations` + `org_accounts` tables** (`migrations/0025_organizations.sql`). An
+  organization owns Amazon credentials (LWA client id/secret/refresh token, AES-GCM encrypted —
+  see `lib/crypto.ts` — under a new `CREDENTIALS_ENCRYPTION_KEY` secret) and one warehouse (v1
+  scope choice, not a schema limit). `org_accounts` is a deliberately thin email+password wrapper
+  around a real `users` row (role `admin`) — logging in as an owner just opens the *same*
+  `wms_session` cookie the floor PIN login does, so every existing `/admin` page and
+  `requireUser`/`requireAdminPage` check needed zero changes. Floor PIN auth is completely
+  untouched.
+- **Amazon OAuth reality check, and the interim path taken**: letting *other* sellers authorize
+  from their own Seller Central requires this app's SP-API application to be a **Public**
+  application, which needs Amazon's review/approval (days–weeks, not something to build around).
+  Interim: `/onboarding/connect-amazon` collects a seller's own LWA credentials manually (their
+  own self-authorized app, same mechanism the original account uses) — same DB shape, so a
+  one-click OAuth redirect can replace this later without a schema change.
+- **Every SP-API call site now takes optional per-org credentials** (`lib/amazon.ts`'s `getEnv`
+  now merges an override over the global env vars) — threaded through `sync-job.ts` (the cron
+  path, which has no human in the loop and had to be correct), `shipping.ts`, `catalog-sync.ts`,
+  `orders.ts`'s `importAmazonOrders`, and `api/admin/import-order.ts`. Falls back to this
+  deploy's own global env vars whenever an org hasn't connected its own account — which is
+  exactly the state the original warehouse is in, so nothing about its existing behavior changed.
+- **Real cross-tenant leak found and fixed, not just designed around**: while testing onboarding
+  live, a freshly-signed-up test org's admin dashboard showed "233 Current SKUs" — the *original*
+  account's catalog. `skus` had no `organization_id` at all (original comment: "shared across
+  warehouses" — true for one seller, not several). Root cause: `api/admin/reports.ts`'s stock
+  query drove `FROM skus` with the warehouse filter only on a `LEFT JOIN`, not a `WHERE` — every
+  SKU row came back regardless of tenant. Fixed via `migrations/0026_skus_per_organization.sql`
+  (`ADD COLUMN organization_id`, backfilled a bootstrap "Ecomglider (Original)" org so the
+  existing warehouse/catalog carried forward unchanged) plus scoping every direct `skus` query:
+  `lib/skus.ts` (merge/unmerge/duplicate-scan/MSKU — every exported function now takes
+  `organizationId`), `lib/orders.ts`, `lib/inbound.ts`, `lib/catalog-sync.ts`,
+  `api/admin/skus.ts` (list + price/reorder update — the update now also checks
+  `organization_id` in its `WHERE`, closing an IDOR), `api/admin/inbound.ts`,
+  `api/admin/reports.ts`. Queries driven from an already warehouse-scoped table
+  (`order_items`/`pick_tasks`/`inventory` joined *into* `skus` by id — `admin-orders.ts`,
+  `packer.ts`, `picker.ts`, `schedule-pickup.ts`, `api/admin/inventory.ts`,
+  `api/admin/exceptions.ts`) were confirmed safe as-is and left alone.
+  **Known follow-up, not fixed**: `sku_code`/`barcode` are still globally `UNIQUE` (not
+  `(organization_id, sku_code)`) — SQLite/D1 enforces foreign keys, so the usual
+  rebuild-and-rename pattern (`migrations/0002_simplify_roles.sql`) failed live with
+  `FOREIGN KEY constraint failed` (`inventory`/`order_items`/`pick_tasks`/`returns` all hold a
+  live `REFERENCES skus(id)`) and was rolled back cleanly. Two different sellers whose Amazon
+  catalogs happen to share an identical SellerSKU or barcode string would still collide onto the
+  same row — rare in practice (Amazon SellerSKUs are seller-chosen), but a real gap if it ever
+  needs closing: requires a proper FK-aware table rebuild, not a quick migration.
+- **Onboarding flow**: `/signup` (business name, owner name, email, password) → creates the org +
+  admin user + org_account, logs the owner in immediately → `requireAdminPage` sends anyone with
+  no `warehouse_id` to `/onboarding/warehouse` automatically (works for every existing admin page
+  with no per-page change) → `/onboarding/warehouse` (name + short code) →
+  `/onboarding/connect-amazon` (also reachable later from the sidebar to reconnect/replace
+  credentials, "Skip for now" available) → lands on the real `/admin`, fully isolated by
+  `organization_id`.
+- **`/pricing`** ("Purchase WMS" page) — plans shown as "Contact us" (no payment processor wired
+  up yet, deliberate scope choice) plus a "Request access" form → `access_requests` table,
+  actioned from a new `/admin/leads` page (status dropdown: new/contacted/onboarded/declined).
+- **`/how-it-works`** — public explainer page, no auth.
+- **`api/partner/provision-org.ts`** — the "one command" integration seam for ecomglider.com:
+  bearer-auth (`PARTNER_API_KEY` secret) endpoint that creates an org + returns a
+  `/onboarding/set-password?token=...` setup link, for ecomglider's backend to call after a
+  future purchase. Nothing on ecomglider.com calls this yet — it's ready, not wired up.
+- **Pre-alpha PIN auth is now two mechanisms**, not one: floor PIN (`users.pin_hash`, unchanged)
+  and owner email+password (`org_accounts.password_hash`, PBKDF2-SHA256 100k iterations,
+  `lib/crypto.ts`) — see "Open items" #5, which is about the floor PIN specifically, not this.
+- Verified live end-to-end in the browser: signed up a real second org, walked through both
+  onboarding steps, confirmed it landed in the *real* `/admin` UI (same code, not a separate
+  "seller" app) scoped to its own empty warehouse, found and fixed the SKU leak, then logged back
+  into the original account and confirmed its 233 SKUs / order counts were untouched by the
+  backfill.
+- **Not yet done**: applying `migrations/0025`/`0026` to the **remote** D1 database, setting
+  `CREDENTIALS_ENCRYPTION_KEY`/`PARTNER_API_KEY` as production Worker secrets, and deploying —
+  all local-only so far, pending the user's go-ahead to touch production.
+
 ## Read this before touching anything
 
 - The original spec (heavy NFC + per-unit barcode scanning) was **explicitly rejected by the
@@ -2803,3 +2882,10 @@ path parameter for the Listings Items API catalog sync, added 2026-09-19 — see
 in `amazon.ts`), `SESSION_SECRET`. All mirrored as Worker secrets in production via
 `wrangler secret put` — if you rotate one locally, push it to production too, they don't sync
 automatically.
+
+Added 2026-09-21 (multi-tenant onboarding — see that section above), **generated locally for dev
+but not yet pushed to production**: `CREDENTIALS_ENCRYPTION_KEY` (AES-GCM key, base64, 32 raw
+bytes — `openssl rand -base64 32` — encrypts per-organization Amazon credentials at rest, see
+`lib/crypto.ts`) and `PARTNER_API_KEY` (bearer secret for `api/partner/provision-org.ts` — same
+generation command). Generate fresh values for production rather than reusing the `.dev.vars`
+ones.
