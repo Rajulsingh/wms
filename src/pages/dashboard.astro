@@ -1,6 +1,7 @@
 ---
 import Base from '../layouts/Base.astro';
 import TopBar from '../components/TopBar.astro';
+import PackerSidebar from '../components/PackerSidebar.astro';
 import { getDb } from '../lib/db';
 import { getCurrentUser, toClientUser } from '../lib/auth';
 import { getTodaySummary } from '../lib/dashboard';
@@ -21,6 +22,7 @@ const initialSummary = user.warehouse_id ? await getTodaySummary(db, user.wareho
 
 <Base title="Today">
   <div class="screen">
+    <PackerSidebar current="today" />
     <TopBar section="Today">
       <a href="/picker" class="pill tab-pill" style="text-decoration: none;">Pick</a>
       <a href="/packer" class="pill tab-pill" style="text-decoration: none;">Pack</a>

@@ -1,6 +1,7 @@
 ---
 import Base from '../../layouts/Base.astro';
 import TopBar from '../../components/TopBar.astro';
+import PackerSidebar from '../../components/PackerSidebar.astro';
 import { getDb } from '../../lib/db';
 import { getCurrentUser, toClientUser } from '../../lib/auth';
 import { getPendingLabels, getTodayScans } from '../../lib/packer';
@@ -22,6 +23,7 @@ const initialStatus =
 
 <Base title="Scan">
   <div class="screen">
+    <PackerSidebar current="scan" />
     <TopBar section="Scan" homeHref="/packer/home">
       <a href="/picker" class="pill tab-pill" style="text-decoration: none;">Pick<span class="badge-dot" id="badge-pick"></span></a>
       <a href="/packer" class="pill tab-pill" style="text-decoration: none;">Pack<span class="badge-dot" id="badge-pack"></span></a>
