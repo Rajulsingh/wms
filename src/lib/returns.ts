@@ -39,10 +39,19 @@ const RETURN_ROW_SELECT = `
   LEFT JOIN orders o ON o.id = r.order_id
 `;
 
-/** The packer's queue: returns synced from Amazon but not yet physically inspected. Oldest request first — those have been waiting longest. */
+/** Synced from Amazon but not yet confirmed physically received — see confirmTodayReceipt, which is what actually moves a row out of here. Oldest request first. Not filtered to "today": a return synced days ago and still sitting here genuinely hasn't been received yet, which is exactly what this list is for. */
 export async function getExpectedReturns(db: D1Database, warehouseId: string): Promise<ReturnRow[]> {
   const rows = await db
     .prepare(`${RETURN_ROW_SELECT} WHERE r.warehouse_id = ? AND r.status = 'expected' ORDER BY r.return_request_date ASC`)
+    .bind(warehouseId)
+    .all<ReturnRow>();
+  return rows.results;
+}
+
+/** Confirmed physically received (via confirmTodayReceipt) but not yet inspected — this, not the raw 'expected' backlog, is what the packer actually scans/selects against. */
+export async function getReceivedReturns(db: D1Database, warehouseId: string): Promise<ReturnRow[]> {
+  const rows = await db
+    .prepare(`${RETURN_ROW_SELECT} WHERE r.warehouse_id = ? AND r.status = 'received' ORDER BY r.return_request_date ASC`)
     .bind(warehouseId)
     .all<ReturnRow>();
   return rows.results;
@@ -53,17 +62,17 @@ export async function getReturnById(db: D1Database, returnId: string): Promise<R
   return row ?? null;
 }
 
-/** Matches a return to this AWB/tracking id scanned on the floor — the packer's entry point into inspecting one specific package. Falls back to matching on Amazon order id, since a self-printed or handwritten label might not carry the tracking id Amazon's report has. */
+/** Matches a return to this AWB/tracking id scanned on the floor — the packer's entry point into inspecting one specific package, only among what's already confirmed received (see getReceivedReturns). Falls back to matching on Amazon order id, since a self-printed or handwritten label might not carry the tracking id Amazon's report has. */
 export async function findReturnByScan(db: D1Database, warehouseId: string, code: string): Promise<ReturnRow | null> {
   const trimmed = code.trim();
   if (!trimmed) return null;
   const byTracking = await db
-    .prepare(`${RETURN_ROW_SELECT} WHERE r.warehouse_id = ? AND r.tracking_id = ? AND r.status = 'expected' ORDER BY r.return_request_date ASC LIMIT 1`)
+    .prepare(`${RETURN_ROW_SELECT} WHERE r.warehouse_id = ? AND r.tracking_id = ? AND r.status = 'received' ORDER BY r.return_request_date ASC LIMIT 1`)
     .bind(warehouseId, trimmed)
     .first<ReturnRow>();
   if (byTracking) return byTracking;
   return db
-    .prepare(`${RETURN_ROW_SELECT} WHERE r.warehouse_id = ? AND r.external_order_id = ? AND r.status = 'expected' ORDER BY r.return_request_date ASC LIMIT 1`)
+    .prepare(`${RETURN_ROW_SELECT} WHERE r.warehouse_id = ? AND r.external_order_id = ? AND r.status = 'received' ORDER BY r.return_request_date ASC LIMIT 1`)
     .bind(warehouseId, trimmed)
     .first<ReturnRow>();
 }
@@ -83,34 +92,55 @@ export async function getTodayReceipt(db: D1Database, warehouseId: string): Prom
 }
 
 /**
- * The packer's headcount reconciliation, separate from inspecting any one
- * return — see migration 0031. `expectedCount` is never taken from the
- * client: it's the same live count `getExpectedReturns` shows right before
- * this is called, computed here again so it can't be spoofed to make a
- * shortfall look clean. `receivedCount` is the only real input — whatever
- * the packer actually counted coming off the courier.
+ * The packer's headcount reconciliation — and the only thing that actually
+ * moves a return out of "expected" and into "received" (see
+ * getReceivedReturns). A real bug found live: the original version of this
+ * only recorded a number, never touched any individual row, so the
+ * "expected today" list kept re-showing the same accumulated backlog every
+ * day forever, including returns already confirmed received days earlier.
+ *
+ * `receivedCount` is a delta, not an absolute total — callable more than
+ * once per day (a second courier drop later the same day just adds more),
+ * each call transitioning that many more of the oldest still-'expected'
+ * rows to 'received'. The stored `receivedCount` accumulates across calls;
+ * `expectedCount` is recomputed each time as received-so-far plus
+ * whatever's still outstanding, so it always reads as "the total this
+ * warehouse has seen today," not a stale first-call snapshot.
  */
 export async function confirmTodayReceipt(db: D1Database, warehouseId: string, userId: string, receivedCount: number): Promise<ReturnReceipt> {
   if (!Number.isFinite(receivedCount) || receivedCount < 0) throw new Error('Received count must be a non-negative number');
   const expected = await getExpectedReturns(db, warehouseId);
-  const expectedCount = expected.length;
+  const toReceive = expected.slice(0, Math.min(receivedCount, expected.length));
+
+  for (const r of toReceive) {
+    await db.prepare(`UPDATE returns SET status = 'received', updated_at = datetime('now') WHERE id = ?`).bind(r.id).run();
+  }
+  if (toReceive.length) {
+    await logAudit(db, {
+      userId,
+      action: 'return.received',
+      entityType: 'warehouse',
+      entityId: warehouseId,
+      metadata: { count: toReceive.length, returnIds: toReceive.map((r) => r.id) }
+    });
+  }
+
   const receiptDate = istDateString();
+  const existing = await getTodayReceipt(db, warehouseId);
+  const cumulativeReceived = (existing?.receivedCount ?? 0) + toReceive.length;
+  const stillExpected = expected.length - toReceive.length;
 
   await db
     .prepare(
       `INSERT INTO return_receipts (warehouse_id, receipt_date, expected_count, received_count, confirmed_by, confirmed_at) VALUES (?, ?, ?, ?, ?, datetime('now'))
        ON CONFLICT (warehouse_id, receipt_date) DO UPDATE SET expected_count = excluded.expected_count, received_count = excluded.received_count, confirmed_by = excluded.confirmed_by, confirmed_at = datetime('now')`
     )
-    .bind(warehouseId, receiptDate, expectedCount, receivedCount, userId)
+    .bind(warehouseId, receiptDate, cumulativeReceived + stillExpected, cumulativeReceived, userId)
     .run();
-  await logAudit(db, { userId, action: 'return.receipt_confirmed', entityType: 'warehouse', entityId: warehouseId, metadata: { expectedCount, receivedCount } });
+  await logAudit(db, { userId, action: 'return.receipt_confirmed', entityType: 'warehouse', entityId: warehouseId, metadata: { receivedNow: toReceive.length, cumulativeReceived } });
 
   const confirmed = await getTodayReceipt(db, warehouseId);
   return confirmed!;
-}
-
-export async function hasConfirmedReceiptToday(db: D1Database, warehouseId: string): Promise<boolean> {
-  return (await getTodayReceipt(db, warehouseId)) !== null;
 }
 
 export interface ReturnReceiptHistoryRow extends ReturnReceipt {
@@ -135,13 +165,13 @@ const INSPECTION_STATUSES = ['ready_to_repack', 'unsellable', 'safe_to_claim'] a
 export type InspectionStatus = (typeof INSPECTION_STATUSES)[number];
 
 /**
- * Records the packer's inspection outcome. Requires today's receiving
- * headcount to already be confirmed (see confirmTodayReceipt) — inspecting
- * individual returns before that reconciliation happens is exactly the
- * "quietly missing three of them" gap the headcount step exists to catch.
- * `safe_to_claim` requires both images (label + product) — that's what lets
- * the admin actually file the SAFE-T claim afterward; the other two
- * outcomes need neither.
+ * Records the packer's inspection outcome. Requires the return to already
+ * be 'received' (see confirmTodayReceipt) — a per-row gate, not a day-level
+ * one: only returns actually confirmed off the courier are inspectable,
+ * regardless of what else happened to be confirmed today. `safe_to_claim`
+ * requires both images (label + product) — that's what lets the admin
+ * actually file the SAFE-T claim afterward; the other two outcomes need
+ * neither.
  */
 export async function recordReturnInspection(
   db: D1Database,
@@ -154,10 +184,10 @@ export async function recordReturnInspection(
   if (status === 'safe_to_claim' && (!images.labelImageKey || !images.productImageKey)) {
     throw new Error('Safe-to-claim requires both a label photo and a product photo');
   }
-  const row = await db.prepare(`SELECT warehouse_id AS warehouseId FROM returns WHERE id = ?`).bind(returnId).first<{ warehouseId: string }>();
+  const row = await db.prepare(`SELECT status FROM returns WHERE id = ?`).bind(returnId).first<{ status: string }>();
   if (!row) throw new Error('Return not found');
-  if (!(await hasConfirmedReceiptToday(db, row.warehouseId))) {
-    throw new Error("Confirm how many returns you received today before inspecting — see the count above the OTP.");
+  if (row.status !== 'received') {
+    throw new Error('This return must be confirmed received before it can be inspected — see the receiving count above the OTP.');
   }
   await db
     .prepare(
@@ -257,6 +287,34 @@ export async function syncReturnsReport(db: D1Database, warehouseId: string, cre
   return { imported: 0, status: 'REQUESTED' };
 }
 
+const RETURN_DATE_MONTHS: Record<string, string> = {
+  Jan: '01', Feb: '02', Mar: '03', Apr: '04', May: '05', Jun: '06',
+  Jul: '07', Aug: '08', Sep: '09', Oct: '10', Nov: '11', Dec: '12'
+};
+
+/**
+ * Amazon's actual return_request_date/return_delivery_date value is
+ * "DD-Mon-YYYY" text (confirmed live against real production rows: e.g.
+ * "02-Sep-2026") — not the ISO format every other date in this app
+ * assumes. A real bug found live: string-sorting/slicing that format
+ * doesn't behave like ISO, and it silently broke both the "oldest first"
+ * ordering and the admin table's date column. Normalized here at
+ * ingestion so every downstream comparison can keep assuming ISO, same as
+ * everywhere else, rather than teaching each call site Amazon's format.
+ * An unrecognized shape is logged and passed through as-is rather than
+ * dropped — a future report-format change should be loud, not silent.
+ */
+function parseAmazonReturnDate(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  if (/^\d{4}-\d{2}-\d{2}/.test(trimmed)) return trimmed.slice(0, 10);
+  const m = trimmed.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{4})$/);
+  if (m && RETURN_DATE_MONTHS[m[2]]) return `${m[3]}-${RETURN_DATE_MONTHS[m[2]]}-${m[1].padStart(2, '0')}`;
+  console.error(`Returns sync: unrecognized date format "${raw}" — check parseAmazonReturnDate in lib/returns.ts against a real report.`);
+  return trimmed;
+}
+
 async function upsertReturnsRows(db: D1Database, warehouseId: string, rows: ReturnsReportRow[]): Promise<number> {
   let imported = 0;
   for (const row of rows) {
@@ -297,8 +355,8 @@ async function upsertReturnsRows(db: D1Database, warehouseId: string, rows: Retu
         row.itemName || null,
         row.returnReason || null,
         row.trackingId || null,
-        row.returnRequestDate || null,
-        row.returnDeliveryDate || null
+        parseAmazonReturnDate(row.returnRequestDate),
+        parseAmazonReturnDate(row.returnDeliveryDate)
       )
       .run();
     imported++;

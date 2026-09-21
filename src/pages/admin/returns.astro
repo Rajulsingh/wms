@@ -42,7 +42,8 @@ if (redirectTo) return Astro.redirect(redirectTo);
     }
 
     const STATUS_LABELS: Record<string, string> = {
-      expected: 'Expected',
+      expected: 'Awaiting receipt',
+      received: 'Received, awaiting inspection',
       ready_to_repack: 'Ready to repack',
       unsellable: 'Unsellable',
       safe_to_claim: 'Safe to claim',
@@ -190,7 +191,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
           <span class="eyebrow">Inspection outcomes</span>
           <select id="status-filter" style="max-width: 220px;">
             ${Object.entries(STATUS_LABELS)
-              .filter(([value]) => value !== 'expected')
+              .filter(([value]) => value !== 'expected' && value !== 'received')
               .map(([value, label]) => `<option value="${value}" ${value === packerStatusFilter ? 'selected' : ''}>${label}</option>`)
               .join('')}
           </select>
