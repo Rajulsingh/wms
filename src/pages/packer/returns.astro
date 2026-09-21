@@ -1,0 +1,317 @@
+---
+import Base from '../../layouts/Base.astro';
+import TopBar from '../../components/TopBar.astro';
+import PackerSidebar from '../../components/PackerSidebar.astro';
+import { getDb } from '../../lib/db';
+import { getCurrentUser, toClientUser } from '../../lib/auth';
+import { getExpectedReturns, getTodayOtp } from '../../lib/returns';
+
+const db = getDb();
+const user = await getCurrentUser(Astro, db);
+if (!user) return Astro.redirect('/login');
+const serverUser = toClientUser(user);
+
+const initialData =
+  user.role === 'packer' && user.warehouse_id
+    ? { expected: await getExpectedReturns(db, user.warehouse_id), otp: await getTodayOtp(db, user.warehouse_id) }
+    : null;
+---
+
+<Base title="Returns">
+  <div class="screen">
+    <PackerSidebar current="returns" />
+    <TopBar section="Returns" homeHref="/packer/home">
+      <a href="/picker" class="pill tab-pill" style="text-decoration: none;">Pick<span class="badge-dot" id="badge-pick"></span></a>
+      <a href="/packer" class="pill tab-pill" style="text-decoration: none;">Pack<span class="badge-dot" id="badge-pack"></span></a>
+      <a href="/packer/scan" class="pill tab-pill" style="text-decoration: none;">Scan</a>
+      <a href="/dashboard" class="pill tab-pill" style="text-decoration: none;">Today</a>
+    </TopBar>
+
+    <div id="app" class="stack" style="flex: 1;">
+      <p>Loading…</p>
+    </div>
+  </div>
+
+  <script define:vars={{ serverUser, initialData }}>
+    window.__serverUser = serverUser;
+    window.__initialData = initialData;
+  </script>
+  <script>
+    import { startContinuousScan, stopScanning } from '../../lib/scanner-client';
+    import { escapeHtml, withLoading } from '../../lib/ui';
+
+    interface ReturnRow {
+      id: string;
+      externalOrderId: string;
+      amazonRmaId: string | null;
+      asin: string | null;
+      merchantSku: string | null;
+      itemName: string | null;
+      returnReason: string | null;
+      trackingId: string | null;
+      returnRequestDate: string | null;
+      status: string;
+      skuCode: string | null;
+      skuName: string | null;
+      imageUrl: string | null;
+      customerName: string | null;
+    }
+
+    const app = document.getElementById('app')!;
+    let expected: ReturnRow[] = [];
+    let otp: { otp: string; setAt: string } | null = null;
+    let scanning = false;
+    let active: ReturnRow | null = null; // the return currently being inspected
+    let flash: { kind: 'success' | 'danger'; message: string } | null = null;
+
+    async function api(path: string, body?: unknown, method?: string) {
+      const res = await fetch(path, {
+        method: method ?? (body === undefined ? 'GET' : 'POST'),
+        headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body)
+      });
+      const data: any = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error ?? `Request failed (${res.status})`);
+      return data;
+    }
+
+    async function boot() {
+      const user = (window as any).__serverUser;
+      if (user.role !== 'packer') {
+        app.innerHTML = `<p>This account is a "${user.role}", not a packer.</p>`;
+        return;
+      }
+      const initial = (window as any).__initialData;
+      if (initial) {
+        expected = initial.expected ?? [];
+        otp = initial.otp ?? null;
+      } else {
+        await refresh();
+      }
+      render();
+      setInterval(async () => {
+        if (document.hidden || scanning || active) return;
+        await refresh();
+        render();
+      }, 15000);
+    }
+
+    async function refresh() {
+      try {
+        const data = await api(`/api/packer/returns`);
+        expected = data.expected ?? [];
+        otp = data.otp ?? null;
+      } catch {
+        // Transient — keep whatever we already had.
+      }
+    }
+
+    function flashHtml(): string {
+      return flash ? `<div class="banner banner-${flash.kind}" id="flash">${escapeHtml(flash.message)}</div>` : '<div id="flash"></div>';
+    }
+
+    // Updates just the banner in place, without touching the rest of the
+    // form — a full render() on a save error would reset the packer's
+    // in-progress status pick and any chosen photos back to the defaults,
+    // which is exactly the moment they most need those to stick around.
+    function showFlash(kind: 'success' | 'danger', message: string) {
+      flash = { kind, message };
+      const existing = document.getElementById('flash');
+      if (existing) existing.outerHTML = flashHtml();
+    }
+
+    function render() {
+      if (active) return renderInspect(active);
+      return renderQueue();
+    }
+
+    function renderQueue() {
+      app.innerHTML = `
+        ${flashHtml()}
+        <div class="card stack" style="gap: 10px;">
+          <span class="eyebrow">Today's return OTP</span>
+          ${
+            otp
+              ? `<div class="row" style="align-items: baseline; gap: 10px;">
+                   <span style="font-size: 1.6rem; font-weight: 800; letter-spacing: 0.06em; font-variant-numeric: tabular-nums;">${escapeHtml(otp.otp)}</span>
+                   <span style="font-size: 0.78rem; color: var(--muted);">Give this to the courier/agent at hand-off</span>
+                 </div>`
+              : `<p style="margin: 0;">No OTP set for today yet — ask an admin to add it (Admin → Returns).</p>`
+          }
+        </div>
+
+        <div class="row" style="justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 14px;">
+          <span class="pill">${expected.length} return${expected.length === 1 ? '' : 's'} to inspect</span>
+          <button class="btn btn-primary" id="start-scan" style="width: auto;">Scan a return</button>
+        </div>
+        <div id="scan-area"></div>
+
+        <div class="stack" style="gap: 10px; margin-top: 16px;">
+          ${
+            expected.length
+              ? expected.map((r) => queueRowHtml(r)).join('')
+              : `<p>No returns waiting to be inspected.</p>`
+          }
+        </div>`;
+
+      document.getElementById('start-scan')?.addEventListener('click', beginScanning);
+      expected.forEach((r) => {
+        document.getElementById(`open-${r.id}`)?.addEventListener('click', () => {
+          active = r;
+          flash = null;
+          render();
+        });
+      });
+    }
+
+    function queueRowHtml(r: ReturnRow): string {
+      return `<div class="item-row" id="open-${r.id}" style="cursor: pointer;">
+        ${r.imageUrl ? `<img class="thumb" src="${r.imageUrl}" alt="" />` : '<div class="thumb"></div>'}
+        <div class="stack" style="gap: 2px; flex: 1; min-width: 0;">
+          <span style="font-weight: 700;">${escapeHtml(r.itemName || r.skuName || r.merchantSku || 'Unknown item')}</span>
+          <span style="font-size: 0.78rem; color: var(--muted);">${escapeHtml(r.externalOrderId)} · ${escapeHtml(r.returnReason || 'No reason given')}</span>
+          ${r.trackingId ? `<span style="font-size: 0.75rem; color: var(--muted);">AWB ${escapeHtml(r.trackingId)}</span>` : ''}
+        </div>
+      </div>`;
+    }
+
+    function beginScanning() {
+      scanning = true;
+      const scanArea = document.getElementById('scan-area')!;
+      scanArea.innerHTML = `
+        <video class="scanner" id="video" style="margin-top: 10px;"></video>
+        <div class="row" style="margin-top: 10px; gap: 8px;">
+          <input type="text" id="manual-code" placeholder="Or type/scan the AWB or order id and press Enter" autocomplete="off" autocapitalize="off" />
+          <button class="btn btn-ghost" id="stop-scan" style="width: auto;">Cancel</button>
+        </div>`;
+      document.getElementById('stop-scan')?.addEventListener('click', endScanning);
+      document.getElementById('manual-code')?.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          const input = e.currentTarget as HTMLInputElement;
+          const code = input.value.trim();
+          if (code) {
+            input.value = '';
+            handleScannedCode(code);
+          }
+        }
+      });
+      const video = document.getElementById('video') as HTMLVideoElement;
+      startContinuousScan(video, handleScannedCode, () => {
+        scanning = false;
+        flash = { kind: 'danger', message: 'Could not open camera — use the text field to enter codes instead.' };
+        render();
+      });
+    }
+
+    function endScanning() {
+      stopScanning();
+      scanning = false;
+      render();
+    }
+
+    async function handleScannedCode(code: string) {
+      try {
+        const found = await api('/api/packer/returns/scan', { code });
+        stopScanning();
+        scanning = false;
+        active = found;
+        flash = null;
+        render();
+      } catch (err) {
+        flash = { kind: 'danger', message: (err as Error).message };
+      }
+    }
+
+    function renderInspect(r: ReturnRow) {
+      app.innerHTML = `
+        ${flashHtml()}
+        <button class="btn btn-ghost" id="back-to-queue" style="width: auto;">&larr; Back</button>
+        <div class="card stack" style="gap: 10px; margin-top: 10px;">
+          <div class="row" style="gap: 12px; align-items: flex-start;">
+            ${r.imageUrl ? `<img class="thumb" src="${r.imageUrl}" alt="" style="width: 64px; height: 64px;" />` : '<div class="thumb" style="width: 64px; height: 64px;"></div>'}
+            <div class="stack" style="gap: 2px;">
+              <span style="font-weight: 700; font-size: 1.05rem;">${escapeHtml(r.itemName || r.skuName || r.merchantSku || 'Unknown item')}</span>
+              <span style="font-size: 0.85rem; color: var(--muted);">Order ${escapeHtml(r.externalOrderId)}${r.customerName ? ` · ${escapeHtml(r.customerName)}` : ''}</span>
+              ${r.skuCode ? `<span style="font-size: 0.8rem; color: var(--muted);">SKU ${escapeHtml(r.skuCode)}</span>` : ''}
+              <span style="font-size: 0.8rem; color: var(--muted);">Reason: ${escapeHtml(r.returnReason || 'Not given')}</span>
+              ${r.trackingId ? `<span style="font-size: 0.8rem; color: var(--muted);">AWB ${escapeHtml(r.trackingId)}</span>` : ''}
+            </div>
+          </div>
+
+          <label class="stack" style="gap: 4px;">
+            <span class="eyebrow">Inspection result</span>
+            <select id="status-select">
+              <option value="ready_to_repack">Ready to repack</option>
+              <option value="unsellable">Unsellable</option>
+              <option value="safe_to_claim">Safe to claim (SAFE-T)</option>
+            </select>
+          </label>
+
+          <div id="claim-fields" class="stack" style="gap: 10px; display: none;">
+            <label class="stack" style="gap: 4px;">
+              <span class="eyebrow">Label photo</span>
+              <input type="file" id="label-photo" accept="image/jpeg,image/png,image/webp" capture="environment" />
+            </label>
+            <label class="stack" style="gap: 4px;">
+              <span class="eyebrow">Product photo</span>
+              <input type="file" id="product-photo" accept="image/jpeg,image/png,image/webp" capture="environment" />
+            </label>
+          </div>
+
+          <button class="btn btn-primary" id="save-inspection">Save</button>
+        </div>`;
+
+      document.getElementById('back-to-queue')?.addEventListener('click', () => {
+        active = null;
+        render();
+      });
+      const statusSelect = document.getElementById('status-select') as unknown as HTMLSelectElement;
+      const claimFields = document.getElementById('claim-fields')!;
+      statusSelect.addEventListener('change', () => {
+        claimFields.style.display = statusSelect.value === 'safe_to_claim' ? 'flex' : 'none';
+      });
+      document.getElementById('save-inspection')?.addEventListener('click', (e) => saveInspection(r, e.currentTarget as HTMLButtonElement));
+    }
+
+    async function uploadImage(returnId: string, kind: 'label' | 'product', file: File): Promise<string> {
+      const form = new FormData();
+      form.append('returnId', returnId);
+      form.append('type', kind);
+      form.append('file', file);
+      const res = await fetch('/api/packer/returns/upload-image', { method: 'POST', body: form });
+      const data: any = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error ?? `Upload failed (${res.status})`);
+      return data.key;
+    }
+
+    async function saveInspection(r: ReturnRow, btn: HTMLButtonElement) {
+      const status = (document.getElementById('status-select') as unknown as HTMLSelectElement).value;
+      const labelInput = document.getElementById('label-photo') as HTMLInputElement;
+      const productInput = document.getElementById('product-photo') as HTMLInputElement;
+
+      await withLoading(btn, 'Saving…', async () => {
+        try {
+          let labelImageKey: string | undefined;
+          let productImageKey: string | undefined;
+          if (status === 'safe_to_claim') {
+            if (!labelInput.files?.[0] || !productInput.files?.[0]) {
+              throw new Error('Safe-to-claim needs both a label photo and a product photo');
+            }
+            labelImageKey = await uploadImage(r.id, 'label', labelInput.files[0]);
+            productImageKey = await uploadImage(r.id, 'product', productInput.files[0]);
+          }
+          await api('/api/packer/returns/inspect', { returnId: r.id, status, labelImageKey, productImageKey });
+          active = null;
+          flash = { kind: 'success', message: `Saved — ${r.externalOrderId} marked ${status.replace(/_/g, ' ')}.` };
+          await refresh();
+          render();
+        } catch (err) {
+          showFlash('danger', (err as Error).message);
+        }
+      });
+    }
+
+    boot();
+  </script>
+</Base>

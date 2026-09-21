@@ -882,6 +882,137 @@ export async function checkEasyShipReport(reportId: string, credentials?: Partia
   return { status: 'DONE', labelBase64: btoa(binary), labelFileType: 'application/pdf' };
 }
 
+export interface ReturnsReportRow {
+  orderId: string;
+  returnRequestDate: string;
+  amazonRmaId: string;
+  merchantRmaId: string;
+  asin: string;
+  merchantSku: string;
+  itemName: string;
+  returnReason: string;
+  trackingId: string;
+  returnDeliveryDate: string;
+}
+
+/**
+ * Kicks off a GET_FLAT_FILE_RETURNS_DATA_BY_RETURN_DATE report covering
+ * [dataStartTime, dataEndTime) — the merchant-fulfilled returns report type
+ * (developer-docs.amazon.com/sp-api/docs/report-type-values-returns),
+ * built from the same data as Seller Central's own "Manage Returns" page.
+ * Async, same request->poll->download shape as the EasyShip feed/report
+ * pair above — poll with `checkReturnsReport`. There is no SP-API field
+ * anywhere for the courier hand-off OTP (checked every Returns report type
+ * in the docs) — it's Seller-Central-UI-only, hence `return_otps` being a
+ * manually-entered table rather than something synced here. See HANDOFF.md.
+ */
+export async function requestReturnsReport(dataStartTime: string, dataEndTime: string, credentials?: Partial<AmazonEnv>): Promise<{ reportId: string }> {
+  const env = getEnv(credentials);
+  const res = await spApiFetch(env, '/reports/2021-06-30/reports', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      reportType: 'GET_FLAT_FILE_RETURNS_DATA_BY_RETURN_DATE',
+      marketplaceIds: [env.AMAZON_MARKETPLACE_ID],
+      dataStartTime,
+      dataEndTime
+    })
+  });
+  if (!res.ok) throw new Error(`createReport (returns) failed: ${res.status} ${await res.text()}`);
+  const report = (await res.json()) as { reportId: string };
+  return { reportId: report.reportId };
+}
+
+export interface ReturnsReportCheckResult {
+  status: 'IN_QUEUE' | 'IN_PROGRESS' | 'DONE' | 'CANCELLED' | 'FATAL';
+  rows?: ReturnsReportRow[];
+}
+
+/**
+ * One non-blocking check of the returns report. Column names below are
+ * per Amazon's published docs but NOT yet confirmed against a real
+ * downloaded file from this account — the same docs-vs-reality gap that
+ * made GET_FLAT_FILE_ALL_ORDERS_DATA_BY_LAST_UPDATE_GENERAL's tracking
+ * column turn out not to exist at all (see the removed debug export a few
+ * lines below). Parsing is by header name, not fixed column position,
+ * specifically so a doc/reality mismatch fails loud (a logged warning
+ * naming the missing column) instead of silently shifting every field over.
+ * Re-verify the header row against a real report the first time this runs
+ * live with actual returns in the account.
+ */
+export async function checkReturnsReport(reportId: string, credentials?: Partial<AmazonEnv>): Promise<ReturnsReportCheckResult> {
+  const env = getEnv(credentials);
+  const res = await spApiFetch(env, `/reports/2021-06-30/reports/${reportId}`);
+  if (!res.ok) throw new Error(`getReport (returns) failed: ${res.status} ${await res.text()}`);
+  const report = (await res.json()) as { processingStatus: string; reportDocumentId?: string };
+
+  if (report.processingStatus !== 'DONE' || !report.reportDocumentId) {
+    return { status: report.processingStatus as ReturnsReportCheckResult['status'] };
+  }
+
+  const docRes = await spApiFetch(env, `/reports/2021-06-30/documents/${report.reportDocumentId}`);
+  if (!docRes.ok) throw new Error(`getReportDocument (returns) failed: ${docRes.status} ${await docRes.text()}`);
+  const doc = (await docRes.json()) as { url: string; compressionAlgorithm?: string };
+  const fileRes = await fetch(doc.url);
+  if (!fileRes.ok) throw new Error(`Returns report document download failed: ${fileRes.status}`);
+
+  let text: string;
+  if (doc.compressionAlgorithm === 'GZIP' && fileRes.body) {
+    const decompressed = fileRes.body.pipeThrough(new DecompressionStream('gzip'));
+    text = await new Response(decompressed).text();
+  } else {
+    text = await fileRes.text();
+  }
+
+  return { status: 'DONE', rows: parseReturnsReport(text) };
+}
+
+// Maps the flat file's own header row to our field names, tolerant of
+// spacing/casing/punctuation differences (docs show "Order ID", a real file
+// might use "order-id" or "order_id") by normalizing both sides down to
+// bare lowercase letters+digits before comparing.
+const RETURNS_COLUMN_MAP: Record<string, keyof ReturnsReportRow> = {
+  orderid: 'orderId',
+  returnrequestdate: 'returnRequestDate',
+  amazonrmaid: 'amazonRmaId',
+  merchantrmaid: 'merchantRmaId',
+  asin: 'asin',
+  merchantsku: 'merchantSku',
+  itemname: 'itemName',
+  returnreason: 'returnReason',
+  trackingid: 'trackingId',
+  returndeliverydate: 'returnDeliveryDate'
+};
+
+function normalizeReturnsHeader(h: string): string {
+  return h.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function parseReturnsReport(text: string): ReturnsReportRow[] {
+  const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0);
+  if (lines.length < 1) return [];
+  const headers = lines[0].split('\t').map(normalizeReturnsHeader);
+  const fieldForColumn = headers.map((h) => RETURNS_COLUMN_MAP[h]);
+  const missing = Object.values(RETURNS_COLUMN_MAP).filter((f) => !fieldForColumn.includes(f));
+  if (missing.length) {
+    console.error(
+      `Returns report is missing expected column(s): ${missing.join(', ')} — Amazon's actual file layout doesn't match the docs this was written from. Check the real header row in Seller Central's Reports page and fix RETURNS_COLUMN_MAP in amazon.ts.`
+    );
+  }
+
+  const rows: ReturnsReportRow[] = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cells = lines[i].split('\t');
+    const row = {} as ReturnsReportRow;
+    for (let c = 0; c < cells.length; c++) {
+      const field = fieldForColumn[c];
+      if (field) row[field] = cells[c];
+    }
+    if (row.orderId) rows.push(row);
+  }
+  return rows;
+}
+
 // A temp debugFetchGeneralOrdersReport export lived here briefly to check
 // whether GET_FLAT_FILE_ALL_ORDERS_DATA_BY_LAST_UPDATE_GENERAL carries a
 // tracking/AWB column, for the deferred AWB-scan-mismatch item (see

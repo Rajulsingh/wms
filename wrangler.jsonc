@@ -46,5 +46,15 @@
 			"database_name": "wms-db",
 			"database_id": "d71d4717-e454-4fb6-ad12-34811583b577"
 		}
+	],
+	// Returns intake photos (label + product, see lib/returns.ts) — private,
+	// served back out through an auth-gated API route, never a public bucket
+	// URL. Needs R2 enabled on the Cloudflare account once (Dashboard -> R2)
+	// before `wrangler r2 bucket create wms-returns` can run — see HANDOFF.md.
+	"r2_buckets": [
+		{
+			"binding": "RETURNS_IMAGES",
+			"bucket_name": "wms-returns"
+		}
 	]
 }

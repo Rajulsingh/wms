@@ -1,6 +1,7 @@
 import { fetchUnfulfilledOrders } from './amazon';
 import { importAmazonOrders, retryBlockedOrders } from './orders';
 import { syncOrderStatuses } from './amazon-sync';
+import { syncReturnsReport } from './returns';
 import { resolveAmazonCredentials, NOT_CONNECTED } from './org-accounts';
 
 export interface SyncJobResult {
@@ -14,6 +15,8 @@ export interface SyncJobResult {
   retried: number;
   retrySucceeded: number;
   shortOrders: Array<{ orderId: string; reason: string }>;
+  returnsImported: number;
+  returnsStatus: string;
 }
 
 /**
@@ -99,6 +102,21 @@ export async function runAmazonSyncJob(db: D1Database, sinceHours = 24): Promise
       const statusResult = await syncOrderStatuses(db, wh.id, credentials);
       const retryResult = await retryBlockedOrders(db, wh.id);
 
+      // One request-or-poll step per tick (see syncReturnsReport) — never
+      // lets a returns-report hiccup take down order sync/retry above,
+      // same isolation the outer per-warehouse try/catch gives other
+      // warehouses.
+      let returnsImported = 0;
+      let returnsStatus = 'skipped';
+      try {
+        const returnsResult = await syncReturnsReport(db, wh.id, credentials);
+        returnsImported = returnsResult.imported;
+        returnsStatus = returnsResult.status;
+      } catch (err) {
+        console.error(`Returns sync failed for warehouse ${wh.id}:`, err);
+        returnsStatus = 'error';
+      }
+
       results.push({
         warehouseId: wh.id,
         imported: importSummary.imported,
@@ -109,7 +127,9 @@ export async function runAmazonSyncJob(db: D1Database, sinceHours = 24): Promise
         statusCancelled: statusResult.cancelled,
         retried: retryResult.retried,
         retrySucceeded: retryResult.succeeded,
-        shortOrders: retryResult.shortOrders
+        shortOrders: retryResult.shortOrders,
+        returnsImported,
+        returnsStatus
       });
     } catch (err) {
       console.error(`Amazon sync job failed for warehouse ${wh.id}:`, err);

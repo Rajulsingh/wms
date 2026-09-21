@@ -1,0 +1,161 @@
+---
+import AdminShell from '../../components/AdminShell.astro';
+import { getDb } from '../../lib/db';
+import { requireAdminPage } from '../../lib/auth';
+
+const redirectTo = await requireAdminPage(Astro, getDb());
+if (redirectTo) return Astro.redirect(redirectTo);
+---
+
+<AdminShell title="Returns" current="returns">
+  <div id="app" class="stack">
+    <p>Loading…</p>
+  </div>
+
+  <script>
+    import { escapeHtml, withLoading } from '../../lib/ui';
+
+    interface ReturnRow {
+      id: string;
+      externalOrderId: string;
+      amazonRmaId: string | null;
+      itemName: string | null;
+      returnReason: string | null;
+      trackingId: string | null;
+      returnRequestDate: string | null;
+      status: string;
+      skuCode: string | null;
+      skuName: string | null;
+      imageUrl: string | null;
+      labelImageKey: string | null;
+      productImageKey: string | null;
+    }
+
+    const STATUS_LABELS: Record<string, string> = {
+      expected: 'Expected',
+      ready_to_repack: 'Ready to repack',
+      unsellable: 'Unsellable',
+      safe_to_claim: 'Safe to claim',
+      claim_filed: 'Claim filed'
+    };
+
+    const app = document.getElementById('app')!;
+    let warehouseId = '';
+    let statusFilter = 'safe_to_claim';
+    let rows: ReturnRow[] = [];
+    let otp: { otp: string; setAt: string } | null = null;
+
+    async function api(path: string, body?: unknown, method?: string) {
+      const res = await fetch(path, {
+        method: method ?? (body === undefined ? 'GET' : 'POST'),
+        headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body)
+      });
+      const data: any = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error ?? `Request failed (${res.status})`);
+      return data;
+    }
+
+    async function boot() {
+      const me = await api('/api/auth/me');
+      if (!me.user || me.user.role !== 'admin') {
+        app.innerHTML = '<p>Admin access required.</p>';
+        return;
+      }
+      warehouseId = me.user.warehouseId;
+      await Promise.all([loadReturns(), loadOtp()]);
+      render();
+    }
+
+    async function loadReturns() {
+      const data = await api(`/api/admin/returns?warehouseId=${warehouseId}&status=${statusFilter}`);
+      rows = data.returns ?? [];
+    }
+
+    async function loadOtp() {
+      const data = await api(`/api/admin/returns/otp?warehouseId=${warehouseId}`);
+      otp = data.otp ?? null;
+    }
+
+    function render() {
+      app.innerHTML = `
+        <div class="card stack" style="gap: 10px;">
+          <span class="eyebrow">Today's return OTP</span>
+          <p style="margin: 0; font-size: 0.85rem; color: var(--muted);">
+            Not available via Amazon's API — read it off Seller Central's Manage Returns page each morning and enter it here. Packers see whatever is saved for today.
+          </p>
+          <div class="row" style="gap: 8px; align-items: center; flex-wrap: wrap;">
+            <input type="text" id="otp-input" placeholder="Today's OTP" value="${otp ? escapeHtml(otp.otp) : ''}" style="max-width: 180px;" />
+            <button class="btn btn-primary" id="save-otp" style="width: auto;">Save</button>
+            ${otp ? `<span style="font-size: 0.78rem; color: var(--muted);">Last set ${new Date(otp.setAt).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}</span>` : ''}
+          </div>
+        </div>
+
+        <div class="row" style="justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 18px;">
+          <span class="eyebrow">Returns</span>
+          <select id="status-filter" style="max-width: 220px;">
+            ${Object.entries(STATUS_LABELS)
+              .map(([value, label]) => `<option value="${value}" ${value === statusFilter ? 'selected' : ''}>${label}</option>`)
+              .join('')}
+          </select>
+        </div>
+
+        <div class="stack" style="gap: 10px; margin-top: 10px;">
+          ${rows.length ? rows.map((r) => rowHtml(r)).join('') : '<p>No returns in this status.</p>'}
+        </div>`;
+
+      document.getElementById('save-otp')?.addEventListener('click', (e) => saveOtp(e.currentTarget as HTMLButtonElement));
+      document.getElementById('status-filter')?.addEventListener('change', async (e) => {
+        statusFilter = (e.currentTarget as HTMLSelectElement).value;
+        await loadReturns();
+        render();
+      });
+      rows.forEach((r) => {
+        if (r.status === 'safe_to_claim') {
+          document.getElementById(`file-claim-${r.id}`)?.addEventListener('click', (e) => fileClaim(r, e.currentTarget as HTMLButtonElement));
+        }
+      });
+    }
+
+    function rowHtml(r: ReturnRow): string {
+      return `<div class="card row" style="gap: 12px; align-items: flex-start; flex-wrap: wrap;">
+        ${r.imageUrl ? `<img class="thumb" src="${r.imageUrl}" alt="" />` : '<div class="thumb"></div>'}
+        <div class="stack" style="gap: 2px; flex: 1; min-width: 180px;">
+          <span style="font-weight: 700;">${escapeHtml(r.itemName || r.skuName || 'Unknown item')}</span>
+          <span style="font-size: 0.8rem; color: var(--muted);">Order ${escapeHtml(r.externalOrderId)}${r.skuCode ? ` · SKU ${escapeHtml(r.skuCode)}` : ''}</span>
+          <span style="font-size: 0.8rem; color: var(--muted);">Reason: ${escapeHtml(r.returnReason || 'Not given')}</span>
+          ${r.trackingId ? `<span style="font-size: 0.78rem; color: var(--muted);">AWB ${escapeHtml(r.trackingId)}</span>` : ''}
+        </div>
+        ${
+          r.status === 'safe_to_claim'
+            ? `<div class="row" style="gap: 8px; align-items: center;">
+                 ${r.labelImageKey ? `<a href="/api/returns/image?returnId=${r.id}&type=label" target="_blank" class="pill" style="text-decoration: none;">Label photo</a>` : ''}
+                 ${r.productImageKey ? `<a href="/api/returns/image?returnId=${r.id}&type=product" target="_blank" class="pill" style="text-decoration: none;">Product photo</a>` : ''}
+                 <button class="btn btn-primary" id="file-claim-${r.id}" style="width: auto;">Mark claim filed</button>
+               </div>`
+            : `<span class="pill">${STATUS_LABELS[r.status] ?? r.status}</span>`
+        }
+      </div>`;
+    }
+
+    async function saveOtp(btn: HTMLButtonElement) {
+      const value = (document.getElementById('otp-input') as HTMLInputElement).value.trim();
+      if (!value) return;
+      await withLoading(btn, 'Saving…', async () => {
+        await api('/api/admin/returns/otp', { warehouseId, otp: value });
+        await loadOtp();
+        render();
+      });
+    }
+
+    async function fileClaim(r: ReturnRow, btn: HTMLButtonElement) {
+      await withLoading(btn, 'Saving…', async () => {
+        await api('/api/admin/returns', { returnId: r.id }, 'PATCH');
+        await loadReturns();
+        render();
+      });
+    }
+
+    boot();
+  </script>
+</AdminShell>

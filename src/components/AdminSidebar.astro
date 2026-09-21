@@ -20,7 +20,8 @@ const ICONS: Record<string, string> = {
   users: '<circle cx="9" cy="8" r="3.2"></circle><path d="M3.5 20c0-3.3 2.5-6 5.5-6s5.5 2.7 5.5 6"></path><path d="M16 4.6a3.2 3.2 0 0 1 0 6"></path><path d="M15 14c2.6.3 4.5 2.8 4.5 6"></path>',
   settings: '<circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6V21a2 2 0 1 1-4 0v-.2a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.6-1H3a2 2 0 1 1 0-4h.2a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9a1.7 1.7 0 0 0 1-1.6V3a2 2 0 1 1 4 0v.2a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V9a1.7 1.7 0 0 0 1.6 1H21a2 2 0 1 1 0 4h-.2a1.7 1.7 0 0 0-1.5 1Z"></path>',
   'connect-amazon': '<path d="M21 16V8a2 2 0 0 0-1-1.7l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.7l7 4a2 2 0 0 0 2 0l7-4a2 2 0 0 0 1-1.7Z"></path><path d="m3.3 7 8.7 5 8.7-5"></path><path d="M12 22V12"></path>',
-  leads: '<path d="M22 6 12 13 2 6"></path><rect x="2" y="4" width="20" height="16" rx="2"></rect>'
+  leads: '<path d="M22 6 12 13 2 6"></path><rect x="2" y="4" width="20" height="16" rx="2"></rect>',
+  returns: '<path d="M9 14 4 9l5-5"></path><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"></path>'
 };
 
 const groups: Array<{ label: string; links: Array<{ key: string; href: string; label: string }> }> = [
@@ -34,7 +35,8 @@ const groups: Array<{ label: string; links: Array<{ key: string; href: string; l
       { key: 'orders', href: '/admin', label: 'Orders' },
       { key: 'pick-assign', href: '/admin/pick-assign', label: 'Assign picking' },
       { key: 'pick-list', href: '/admin/pick-list', label: 'Pick lists' },
-      { key: 'exceptions', href: '/admin/exceptions', label: 'Exceptions' }
+      { key: 'exceptions', href: '/admin/exceptions', label: 'Exceptions' },
+      { key: 'returns', href: '/admin/returns', label: 'Returns' }
     ]
   },
   {
