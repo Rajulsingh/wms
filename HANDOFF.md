@@ -3026,6 +3026,76 @@ fact.
   persists and logs before/after/reason; retiring a zero-reserved test row deletes it and logs
   correctly.
 
+## Recently done (2026-09-22) — merchant-fulfilled returns intake (new feature)
+
+Requested by the seller: packer receives Amazon merchant-fulfilled returns daily, needs a
+courier-handover OTP, scans each package in, inspects it against the order, and records an
+outcome — including SAFE-T claim photo evidence. Built end to end.
+
+- **New sign-out + packer hamburger nav, shipped first** — real gaps found while scoping this:
+  `clearSession`/`POST /api/auth/logout` already existed but no button anywhere called it, on
+  either admin or packer. Wired a "Sign out" link into `AdminSidebar.astro`'s footer and into a
+  new `PackerSidebar.astro`. Packer/picker pages (`packer/home`, `packer/index` "Pack",
+  `packer/scan`, `picker/index` "Pick", `dashboard.astro` "Today") had no side nav at all, just
+  the top-bar pill tabs — added a collapsible sidebar (Today/Pick/Pack/Scan/Returns + Sign out),
+  always off-canvas (unlike `AdminSidebar`, which only collapses under 900px) since these are
+  handheld-device pages. `TopBar.astro` grew a hamburger toggle button; the pill quick-access
+  tabs stay exactly where they were. Verified live at both desktop and mobile widths.
+- **Amazon's Returns Reports API confirmed via live docs research before writing any sync
+  code** (this codebase has been burned before by guessing at Amazon's API shape — see the
+  EasyShip-vs-MFN 403 saga in `amazon.ts`). `GET_FLAT_FILE_RETURNS_DATA_BY_RETURN_DATE` is real,
+  same async request→poll→download shape as the EasyShip feed/report pair, fields: order id,
+  return request date, Amazon/Merchant RMA id, ASIN, merchant SKU, item name, return reason,
+  tracking id, return delivery date. Confirmed **no OTP field exists anywhere in any Returns
+  report type** — matches seller forum threads: the courier hand-off OTP is Seller-Central-UI
+  only, stays the same for every return handled that day. So `return_otps` is a small manually-
+  entered table (admin reads it off Seller Central each morning, packer's "Get OTP" just reveals
+  the stored value) rather than anything synced.
+- **`requestReturnsReport`/`checkReturnsReport` added to `amazon.ts`**, parsing the flat file by
+  header name (not fixed column position) specifically so a docs-vs-reality mismatch — like the
+  AWB-column one this file already documents for the general orders report — fails loud (a
+  logged warning naming the missing column) instead of silently shifting every field over.
+  **Not yet verified against a real downloaded file from this account** — do that the first time
+  it runs live with actual returns.
+- **`migrations/0030_returns.sql`**: new `returns` and `return_otps` tables, plus
+  `warehouses.amazon_returns_synced_through`/`returns_report_pending_id`/
+  `returns_report_requested_at` (the report is async, so an in-flight request has to survive
+  across cron ticks — same watermark idea as `amazon_orders_synced_through` from migration 0024,
+  but a request/poll pair instead of one inline call). Also **drops and replaces the original
+  `returns` table from migration 0001** — an older, never-built concept (order_item-level
+  restocking grading: sellable/damaged/quarantine) that nothing in `src/` ever read or wrote.
+- **`lib/returns.ts`**: `syncReturnsReport` (one request-or-poll step per cron tick, wired into
+  `sync-job.ts` with its own try/catch so a returns hiccup never takes down order sync for that
+  warehouse), matching each report row to our own `orders`/`skus` by external order id / ASIN /
+  merchant SKU (best-effort — a return can arrive for an order this WMS never saw), packer queue
+  and scan-lookup queries, `recordReturnInspection` (three outcomes: ready_to_repack /
+  unsellable / safe_to_claim — the last requires both a label and product photo), OTP get/set,
+  admin listing + `markClaimFiled`.
+- **New private R2 bucket `wms-returns`** (binding `RETURNS_IMAGES` in `wrangler.jsonc`) for
+  label/product photos — R2 needed enabling on the Cloudflare account first (one-time dashboard
+  step, done this session), then `wrangler r2 bucket create`. Images are never served from a
+  public bucket URL — `POST /api/packer/returns/upload-image` stores by key only, and
+  `GET /api/returns/image` re-checks the requesting user's own warehouse against the return's
+  before streaming anything from R2.
+- **`packer/returns.astro`**: OTP display, expected-returns queue, camera scan (reusing
+  `startContinuousScan`/`stopScanning` from `lib/scanner-client.ts`, same as `packer/scan.astro`)
+  or manual code entry, inspection form with the three-way status dropdown and conditional photo
+  inputs. A save error updates just the flash banner in place (`showFlash`) rather than a full
+  re-render, so a packer's in-progress status pick and chosen photos don't get silently reset by
+  their own validation error.
+- **`admin/returns.astro`**: OTP entry, status-filtered return list, claim-filed action with
+  links to the uploaded photos.
+- Verified live end to end with seeded test data: packer queue renders and matches SKU/order
+  data correctly; scan-to-inspect flow; safe-to-claim photo upload through to R2 and back out
+  through the image-serving route (confirmed via direct `fetch` calls, since this session's
+  browser tooling can't drive a native file picker); admin claim-filed moves it out of the queue;
+  audit log entries correct for inspect/otp_set/claim_filed. Test rows cleaned up after.
+- **Not yet deployed** — migration applied to local D1 only, R2 bucket exists in Cloudflare but
+  the binding hasn't shipped to the live Worker yet. Deploying starts real `GET_FLAT_FILE_
+  RETURNS_DATA_BY_RETURN_DATE` report requests against the live Amazon account on every cron
+  tick from then on — first live run is also when the column-header parsing above gets its real
+  verification.
+
 ## Commands
 
 ```bash
