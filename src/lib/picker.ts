@@ -1,5 +1,5 @@
 import { newId, logAudit, logException } from './db';
-import { confirmPick, releaseReservation } from './inventory';
+import { confirmPick, releaseReservation, unconfirmPick } from './inventory';
 import { reserveOrderForPicking } from './orders';
 import type { PickTaskView } from './types';
 
@@ -329,10 +329,17 @@ export async function confirmQuantity(db: D1Database, userId: string, pickTaskId
   const task = await db
     .prepare(`SELECT pt.*, sk.id as sku_id_check FROM pick_tasks pt JOIN skus sk ON sk.id = pt.sku_id WHERE pt.id = ?`)
     .bind(pickTaskId)
-    .first<{ id: string; pick_batch_id: string; order_item_id: string; sku_id: string; location_id: string; quantity_required: number }>();
+    .first<{ id: string; pick_batch_id: string; order_item_id: string; sku_id: string; location_id: string; quantity_required: number; quantity_picked: number }>();
   if (!task) throw new PickerFlowError('not_found', 'Pick task not found');
-  if (quantity > task.quantity_required) {
-    throw new PickerFlowError('over_pick', `Cannot pick more than the required ${task.quantity_required} without a supervisor override`);
+  // `quantity` is what's being picked *now*, added on top of whatever this
+  // task already carries — normally 0 (a task is only ever confirmed once),
+  // but can be nonzero if unpickGroupQuantity reopened it after a partial
+  // undo. Validating/allocating against the remaining gap rather than the
+  // full quantity_required is what makes re-picking after a partial unpick
+  // land on the right total instead of silently losing the earlier progress.
+  const remainingRequired = task.quantity_required - task.quantity_picked;
+  if (quantity > remainingRequired) {
+    throw new PickerFlowError('over_pick', `Cannot pick more than the required ${remainingRequired} without a supervisor override`);
   }
 
   const inventory = await db
@@ -344,13 +351,14 @@ export async function confirmQuantity(db: D1Database, userId: string, pickTaskId
   await markBatchStarted(db, task.pick_batch_id);
 
   if (quantity > 0) await confirmPick(db, inventory.id, quantity);
-  const shortfall = task.quantity_required - quantity;
+  const newQuantityPicked = task.quantity_picked + quantity;
+  const shortfall = task.quantity_required - newQuantityPicked;
   if (shortfall > 0) await releaseReservation(db, inventory.id, shortfall);
 
   const status = shortfall > 0 ? 'short' : 'picked';
   await db
     .prepare(`UPDATE pick_tasks SET status = ?, quantity_picked = ?, picked_at = datetime('now') WHERE id = ?`)
-    .bind(status, quantity, pickTaskId)
+    .bind(status, newQuantityPicked, pickTaskId)
     .run();
   await db
     .prepare(`UPDATE order_items SET quantity_picked = quantity_picked + ?, status = ? WHERE id = ?`)
@@ -448,7 +456,7 @@ export async function confirmGroupQuantity(db: D1Database, userId: string, pickT
   const placeholders = pickTaskIds.map(() => '?').join(',');
   const tasks = await db
     .prepare(
-      `SELECT pt.id, pt.quantity_required
+      `SELECT pt.id, pt.quantity_required, pt.quantity_picked
        FROM pick_tasks pt
        JOIN order_items oi ON oi.id = pt.order_item_id
        JOIN orders o ON o.id = oi.order_id
@@ -456,11 +464,13 @@ export async function confirmGroupQuantity(db: D1Database, userId: string, pickT
        ORDER BY o.priority DESC, o.created_at ASC`
     )
     .bind(...pickTaskIds)
-    .all<{ id: string; quantity_required: number }>();
+    .all<{ id: string; quantity_required: number; quantity_picked: number }>();
 
-  const totalRequired = tasks.results.reduce((sum, t) => sum + t.quantity_required, 0);
-  if (totalQuantity > totalRequired) {
-    throw new PickerFlowError('over_pick', `Cannot pick more than the required ${totalRequired} without a supervisor override`);
+  // Remaining per task, not the full quantity_required — a task can already
+  // carry a partial quantity_picked here (see confirmQuantity), same reason.
+  const totalRemaining = tasks.results.reduce((sum, t) => sum + (t.quantity_required - t.quantity_picked), 0);
+  if (totalQuantity > totalRemaining) {
+    throw new PickerFlowError('over_pick', `Cannot pick more than the required ${totalRemaining} without a supervisor override`);
   }
 
   let remaining = totalQuantity;
@@ -468,7 +478,8 @@ export async function confirmGroupQuantity(db: D1Database, userId: string, pickT
   let batchComplete = false;
 
   for (const task of tasks.results) {
-    const allocated = Math.min(remaining, task.quantity_required);
+    const taskRemaining = task.quantity_required - task.quantity_picked;
+    const allocated = Math.min(remaining, taskRemaining);
     remaining -= allocated;
     const result = await confirmQuantity(db, userId, task.id, allocated, reason);
     perTask.push({ pickTaskId: task.id, quantity: allocated, status: result.status });
@@ -476,6 +487,94 @@ export async function confirmGroupQuantity(db: D1Database, userId: string, pickT
   }
 
   return { perTask, batchComplete };
+}
+
+export interface UnpickResult {
+  perTask: Array<{ pickTaskId: string; newQuantityPicked: number }>;
+  undone: number;
+}
+
+/**
+ * Reverses a mistaken "Picked" confirmation — a fat-fingered quantity or a
+ * card tapped by accident. Puts the undone units back on the shelf
+ * (inventory) and the task(s) they came from back into the active pick
+ * list, allocating `totalQuantity` across the given tasks in the same
+ * priority order confirmGroupQuantity used to pick them, so "unpick 3 of 6"
+ * pulls back starting with the earliest/highest-priority order first —
+ * same convention, just run in reverse.
+ *
+ * Only ever touches tasks currently 'picked' (a clean full pick, no
+ * exception on file) — a 'short'/'damaged' task already has its own
+ * exception trail and reversing it would mean unwinding that too, which
+ * this deliberately doesn't attempt; a mis-recorded short/damaged pick
+ * needs an admin correction (see api/admin/inventory.ts), not a floor
+ * undo button.
+ *
+ * A task that keeps a nonzero quantity_picked after a partial undo goes
+ * back to 'pending' anyway (not some new "partially pending" status) —
+ * the picker UI's remainingNeeded calc already accounts for quantity_picked
+ * on a pending row (required - already-picked), so this doesn't need a new
+ * status to stay correct. Also reopens a batch/order that had already
+ * auto-completed off the back of the task(s) just reversed, but only while
+ * it's still exactly where confirmGroupQuantity left it — same
+ * only-touch-what's-still-expected caution lib/reset.ts uses, so an order
+ * that's already moved on to packing is never silently pulled back.
+ */
+export async function unpickGroupQuantity(db: D1Database, userId: string, pickTaskIds: string[], totalQuantity: number): Promise<UnpickResult> {
+  if (!pickTaskIds.length) throw new PickerFlowError('not_found', 'No pick tasks given');
+
+  const placeholders = pickTaskIds.map(() => '?').join(',');
+  const tasks = await db
+    .prepare(
+      `SELECT pt.id, pt.pick_batch_id, pt.order_item_id, pt.sku_id, pt.location_id, pt.quantity_picked
+       FROM pick_tasks pt
+       JOIN order_items oi ON oi.id = pt.order_item_id
+       JOIN orders o ON o.id = oi.order_id
+       WHERE pt.id IN (${placeholders}) AND pt.status = 'picked'
+       ORDER BY o.priority DESC, o.created_at ASC`
+    )
+    .bind(...pickTaskIds)
+    .all<{ id: string; pick_batch_id: string; order_item_id: string; sku_id: string; location_id: string; quantity_picked: number }>();
+
+  const totalPicked = tasks.results.reduce((sum, t) => sum + t.quantity_picked, 0);
+  if (totalQuantity <= 0) throw new PickerFlowError('invalid_quantity', 'Unpick quantity must be greater than zero');
+  if (totalQuantity > totalPicked) throw new PickerFlowError('over_unpick', `Cannot unpick more than the ${totalPicked} currently picked`);
+
+  let remaining = totalQuantity;
+  const perTask: UnpickResult['perTask'] = [];
+  const touchedBatches = new Set<string>();
+
+  for (const task of tasks.results) {
+    if (remaining <= 0) break;
+    const undoQty = Math.min(remaining, task.quantity_picked);
+    if (undoQty <= 0) continue;
+    remaining -= undoQty;
+
+    const inventory = await db.prepare(`SELECT id FROM inventory WHERE sku_id = ? AND location_id = ?`).bind(task.sku_id, task.location_id).first<{ id: string }>();
+    if (!inventory) throw new PickerFlowError('inventory_missing', 'No inventory row for this SKU/location — data integrity issue');
+    await unconfirmPick(db, inventory.id, undoQty);
+
+    const newQuantityPicked = task.quantity_picked - undoQty;
+    await db.prepare(`UPDATE pick_tasks SET status = 'pending', quantity_picked = ?, picked_at = NULL WHERE id = ?`).bind(newQuantityPicked, task.id).run();
+    await db.prepare(`UPDATE order_items SET quantity_picked = quantity_picked - ?, status = 'pending' WHERE id = ?`).bind(undoQty, task.order_item_id).run();
+    await logAudit(db, { userId, action: 'unpick.quantity', entityType: 'pick_task', entityId: task.id, metadata: { undoQty, newQuantityPicked } });
+
+    touchedBatches.add(task.pick_batch_id);
+    perTask.push({ pickTaskId: task.id, newQuantityPicked });
+  }
+
+  for (const batchId of touchedBatches) {
+    await db.prepare(`UPDATE pick_batches SET status = 'in_progress', completed_at = NULL WHERE id = ? AND status = 'completed'`).bind(batchId).run();
+    await db
+      .prepare(
+        `UPDATE orders SET status = 'batched'
+         WHERE status = 'picked' AND id IN (SELECT DISTINCT o.id FROM orders o JOIN order_items oi ON oi.order_id = o.id JOIN pick_tasks pt ON pt.order_item_id = oi.id WHERE pt.pick_batch_id = ?)`
+      )
+      .bind(batchId)
+      .run();
+  }
+
+  return { perTask, undone: totalQuantity - remaining };
 }
 
 /** Group version of reportDamaged — every task in the group is damaged, none usable. Matches the picker UI's single "Damaged — none usable" action applied to the whole aggregate line, not a partial-damage concept that doesn't exist for a single task either. */

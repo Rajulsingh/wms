@@ -171,6 +171,11 @@ const initialBatches = user.role === 'packer' && user.warehouse_id ? await getMy
     // batches is one card, one action, one reason.
     const pendingReasonFor: Record<string, { pickTaskIds: string[]; quantity: number }> = {};
 
+    // Keyed the same way — which "Done" card currently has its unpick
+    // quantity form open. Closed by default; a picker has to deliberately
+    // tap the undo icon before any reversal is possible.
+    const unpickOpenFor: Record<string, boolean> = {};
+
     async function api(path: string, body?: unknown) {
       const res = await fetch(path, {
         method: body === undefined ? 'GET' : 'POST',
@@ -180,6 +185,27 @@ const initialBatches = user.role === 'packer' && user.warehouse_id ? await getMy
       const data: any = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error ?? `Request failed (${res.status})`);
       return data;
+    }
+
+    // A standalone toast outside #app, not part of render()'s own innerHTML
+    // — render() fully rebuilds #app on every state change, which would
+    // wipe an in-progress fade-out (or restart it mid-animation) if this
+    // lived inside it instead.
+    let flashTimer: ReturnType<typeof setTimeout> | null = null;
+    function showPickFlash(message: string) {
+      let el = document.getElementById('pick-flash');
+      if (!el) {
+        el = document.createElement('div');
+        el.id = 'pick-flash';
+        el.className = 'pick-flash-toast';
+        document.body.appendChild(el);
+      }
+      el.textContent = message;
+      el.classList.remove('show');
+      void el.offsetWidth; // force reflow so back-to-back picks each restart the animation
+      el.classList.add('show');
+      if (flashTimer) clearTimeout(flashTimer);
+      flashTimer = setTimeout(() => el?.classList.remove('show'), 1600);
     }
 
     async function boot() {
@@ -488,7 +514,12 @@ const initialBatches = user.role === 'packer' && user.warehouse_id ? await getMy
       // that same subset or the server's real total-required check (which
       // sums quantity_required over exactly those pending tasks) rejects a
       // quantity the picker was correctly shown as "still needed".
-      const remainingNeeded = pendingRows.reduce((sum, r) => sum + r.quantity_required, 0);
+      // required - picked, not just required: a pending row can carry a
+      // nonzero quantity_picked after a partial unpick (see
+      // unpickGroupQuantity in lib/picker.ts) — it never resets to 0, it
+      // just goes back to needing the rest. In the normal never-picked-yet
+      // case quantity_picked is already 0, so this is a no-op there.
+      const remainingNeeded = pendingRows.reduce((sum, r) => sum + (r.quantity_required - r.quantity_picked), 0);
       const reasonState = pendingReasonFor[groupKey];
 
       // Which orders need this SKU, collapsed into a count instead of
@@ -511,6 +542,9 @@ const initialBatches = user.role === 'packer' && user.warehouse_id ? await getMy
         .map((r) => `<strong style="color: var(--warning-fg);">${escapeHtml(r.external_order_id)} — ${escapeHtml(r.order_notes!)}</strong>`)
         .join(' · ');
 
+      const pickedTaskIds = sg.rows.filter((r) => r.status === 'picked').map((r) => r.pick_task_id);
+      const unpickOpen = !!unpickOpenFor[groupKey];
+
       let actionHtml: string;
       if (done) {
         const short = picked < required;
@@ -521,7 +555,25 @@ const initialBatches = user.role === 'packer' && user.warehouse_id ? await getMy
           const shortDetail = shortRows.map((r) => `${escapeHtml(r.external_order_id)} (got ${r.quantity_picked}/${r.quantity_required})`).join(' · ');
           actionHtml = `<div class="banner banner-warning" style="margin-top: 10px; padding: 8px 12px;">Short — ${required - picked} unresolved${shortDetail ? `<div style="font-size: 0.72rem; margin-top: 4px; font-weight: 400;">${shortDetail}</div>` : ''}</div>`;
         } else {
-          actionHtml = `<div class="banner banner-success" style="margin-top: 10px; padding: 8px 12px;">Done</div>`;
+          // Undo only ever offered for a clean full pick (never a short/
+          // damaged one — see unpickGroupQuantity in lib/picker.ts for why).
+          actionHtml = `
+            <div class="row" style="margin-top: 10px; gap: 8px; align-items: center;">
+              <div class="banner banner-success" style="padding: 8px 12px; margin: 0; flex: 1;">Done</div>
+              <button class="btn btn-ghost unpick-toggle" type="button" title="Undo pick" aria-label="Undo pick" style="width: auto; padding: 8px 10px; flex: 0 0 auto;">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="16" height="16"><path d="M3 7v6h6"></path><path d="M3.51 13a9 9 0 1 0 2.13-9.36L3 7"></path></svg>
+              </button>
+            </div>
+            ${
+              unpickOpen
+                ? `<div class="row" style="margin-top: 8px; gap: 8px; align-items: center; border-top: 1px dashed var(--border); padding-top: 10px;">
+                     <span style="font-size: 0.85rem; font-weight: 600;">Unpick</span>
+                     ${qtyStepperHtml(`<input type="number" class="unpick-qty-input" min="1" max="${picked}" value="${picked}" style="width: 64px; flex: 0 0 auto; min-height: 44px; text-align: center;" />`)}
+                     <button class="btn btn-ghost" data-action="cancel-unpick" style="flex: 1;">Cancel</button>
+                     <button class="btn btn-primary" data-action="confirm-unpick" style="flex: 1;">Unpick</button>
+                   </div>`
+                : ''
+            }`;
         }
       } else if (reasonState) {
         actionHtml = `
@@ -627,6 +679,22 @@ const initialBatches = user.role === 'packer' && user.warehouse_id ? await getMy
             submitPick(pickTaskIds, quantity, label);
           }
         });
+      } else if (done && picked >= required) {
+        el.querySelector('.unpick-toggle')?.addEventListener('click', () => {
+          if (unpickOpenFor[groupKey]) delete unpickOpenFor[groupKey];
+          else unpickOpenFor[groupKey] = true;
+          render();
+        });
+        el.querySelector('[data-action="cancel-unpick"]')?.addEventListener('click', () => {
+          delete unpickOpenFor[groupKey];
+          render();
+        });
+        el.querySelector('[data-action="confirm-unpick"]')?.addEventListener('click', () => {
+          const input = el.querySelector('.unpick-qty-input') as HTMLInputElement;
+          const qty = Number(input.value);
+          delete unpickOpenFor[groupKey];
+          submitUnpick(pickedTaskIds, qty);
+        });
       }
 
       return el;
@@ -669,10 +737,28 @@ const initialBatches = user.role === 'packer' && user.warehouse_id ? await getMy
       for (const id of ids) {
         const row = findRow(id);
         if (!row) continue;
-        const alloc = Math.min(remaining, row.quantity_required);
+        // Allocate against what's still needed, not the full requirement —
+        // a row can already carry a partial quantity_picked after an
+        // unpick (see applyOptimisticUnpick), so this has to add to that,
+        // never overwrite it. Mirrors confirmQuantity's own delta logic.
+        const taskRemaining = row.quantity_required - row.quantity_picked;
+        const alloc = Math.min(remaining, taskRemaining);
         remaining -= alloc;
-        row.quantity_picked = alloc;
-        row.status = alloc >= row.quantity_required ? 'picked' : 'short';
+        row.quantity_picked += alloc;
+        row.status = row.quantity_picked >= row.quantity_required ? 'picked' : 'short';
+      }
+    }
+
+    function applyOptimisticUnpick(ids: string[], totalQuantity: number) {
+      let remaining = totalQuantity;
+      for (const id of ids) {
+        if (remaining <= 0) break;
+        const row = findRow(id);
+        if (!row) continue;
+        const undo = Math.min(remaining, row.quantity_picked);
+        remaining -= undo;
+        row.quantity_picked -= undo;
+        row.status = 'pending';
       }
     }
 
@@ -688,8 +774,30 @@ const initialBatches = user.role === 'packer' && user.warehouse_id ? await getMy
       applyOptimisticPick(pickTaskIds, quantity);
       lastError = '';
       render();
+      // Optimistic, before the network call resolves — a fat quiet card
+      // swap read as "did that even register?" (the report this whole
+      // change was for); a visible pulse the instant you tap is worth more
+      // than waiting for round-trip confirmation, and a failure still rolls
+      // the card state back below regardless of what the toast already said.
+      if (quantity > 0) showPickFlash(`✓ ${quantity} picked`);
       try {
         const res = await api('/api/picker/mark-picked', { pickTaskIds, quantity, reason });
+        applyBatchUpdates(res.batches ?? []);
+        render();
+      } catch (err) {
+        restoreSnapshot(snapshot);
+        lastError = (err as Error).message;
+        render();
+      }
+    }
+
+    async function submitUnpick(pickTaskIds: string[], quantity: number) {
+      const snapshot = snapshotAll();
+      applyOptimisticUnpick(pickTaskIds, quantity);
+      lastError = '';
+      render();
+      try {
+        const res = await api('/api/picker/unpick', { pickTaskIds, quantity });
         applyBatchUpdates(res.batches ?? []);
         render();
       } catch (err) {

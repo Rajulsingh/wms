@@ -663,6 +663,30 @@ tbody tr:hover {
   border-color: var(--danger-border);
 }
 
+.pick-flash-toast {
+  position: fixed;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%) translateY(-14px);
+  background: var(--success-bg);
+  color: var(--success);
+  border: 1px solid var(--success-border);
+  padding: 10px 20px;
+  border-radius: 999px;
+  font-weight: 800;
+  font-size: 0.95rem;
+  box-shadow: var(--shadow-md);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s ease, transform 0.18s ease;
+  z-index: 70;
+}
+
+.pick-flash-toast.show {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
 .theme-toggle {
   position: fixed;
   top: 14px;

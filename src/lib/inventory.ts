@@ -168,4 +168,33 @@ export async function confirmPick(db: D1Database, inventoryId: string, pickedQua
   throw new Error(`Could not confirm pick for inventory ${inventoryId} after ${MAX_CAS_ATTEMPTS} attempts.`);
 }
 
+/**
+ * Reverses confirmPick — puts undone units back on hand *and* re-reserves
+ * them, since the pick_task they came from is reopening (going back to
+ * 'pending'), not disappearing. Exact mirror of confirmPick's own
+ * decrement, same CAS retry shape. See unpickGroupQuantity in
+ * lib/picker.ts — this only ever undoes a clean 'picked' task, never a
+ * 'short'/'damaged' one (those already carry their own exception trail).
+ */
+export async function unconfirmPick(db: D1Database, inventoryId: string, quantity: number): Promise<void> {
+  for (let attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {
+    const row = await db.prepare(`SELECT version FROM inventory WHERE id = ?`).bind(inventoryId).first<{ version: number }>();
+    if (!row) throw new Error(`Inventory row ${inventoryId} not found`);
+
+    const result = await db
+      .prepare(
+        `UPDATE inventory
+         SET quantity_on_hand = quantity_on_hand + ?,
+             quantity_reserved = quantity_reserved + ?,
+             version = version + 1,
+             updated_at = datetime('now')
+         WHERE id = ? AND version = ?`
+      )
+      .bind(quantity, quantity, inventoryId, row.version)
+      .run();
+    if (result.meta.changes === 1) return;
+  }
+  throw new Error(`Could not reverse pick for inventory ${inventoryId} after ${MAX_CAS_ATTEMPTS} attempts.`);
+}
+
 export { newId };
