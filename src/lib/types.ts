@@ -141,4 +141,5 @@ export type ExceptionType =
   | 'duplicate_awb'
   | 'order_cancelled'
   | 'substitution'
+  | 'shipped_before_picked'
   | 'other';
