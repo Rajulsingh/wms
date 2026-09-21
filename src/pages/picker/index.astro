@@ -343,6 +343,25 @@ const initialBatches = user.role === 'packer' && user.warehouse_id ? await getMy
         return section;
       }
 
+      // Cards still walk location-by-location, but only among what's left to
+      // pick — a finished card moves out of this list entirely (into the
+      // "Picked" list below) rather than staying in place with a banner, so
+      // the next pending card always slides up into the slot the last one
+      // occupied. A location that's fully finished drops its header too,
+      // rather than leaving an empty section a picker has to scroll past.
+      const cards = buildCards(rows);
+      const pendingCards = cards.filter((c) => !c.done);
+      const doneCards = cards.filter((c) => c.done);
+      const pendingLocationGroups: Array<{ zone: string; bin: string; cards: Card[] }> = [];
+      for (const c of pendingCards) {
+        let lg = pendingLocationGroups.find((lg) => lg.bin === c.bin);
+        if (!lg) {
+          lg = { zone: c.zone, bin: c.bin, cards: [] };
+          pendingLocationGroups.push(lg);
+        }
+        lg.cards.push(c);
+      }
+
       section.innerHTML = `
         <div class="stack" style="gap: 8px;">
           <span class="big-label" style="font-size: 1.1rem;">${escapeHtml(dateLabel(g.date))}</span>
@@ -352,10 +371,30 @@ const initialBatches = user.role === 'packer' && user.warehouse_id ? await getMy
             <span class="pill">${remaining} of ${rows.length} left</span>
           </div>
         </div>
-        <div class="stack" style="gap: 22px;" data-locations></div>`;
+        <div class="stack" style="gap: 22px;" data-locations></div>
+        ${
+          doneCards.length
+            ? `<div class="stack" style="gap: 10px; margin-top: 10px;">
+                 <span class="eyebrow">Picked (${doneCards.length})</span>
+                 <div class="stack" style="gap: 10px;" data-done></div>
+               </div>`
+            : ''
+        }`;
 
       const container = section.querySelector('[data-locations]') as HTMLElement;
-      for (const locGroup of groupByLocation(rows)) container.appendChild(renderLocationSection(locGroup));
+      for (const lg of pendingLocationGroups) {
+        const locSection = document.createElement('div');
+        locSection.className = 'stack';
+        locSection.style.gap = '8px';
+        locSection.innerHTML = `<div class="eyebrow">Zone ${escapeHtml(lg.zone)} · Bin ${escapeHtml(lg.bin)}</div>`;
+        for (const c of lg.cards) locSection.appendChild(renderSkuGroup(c.sg, `${lg.bin}__${c.sg.sku_code}`));
+        container.appendChild(locSection);
+      }
+
+      const doneContainer = section.querySelector('[data-done]') as HTMLElement | null;
+      if (doneContainer) {
+        for (const c of doneCards) doneContainer.appendChild(renderSkuGroup(c.sg, `${c.bin}__${c.sg.sku_code}`, `Zone ${c.zone} · Bin ${c.bin}`));
+      }
 
       return section;
     }
@@ -402,29 +441,39 @@ const initialBatches = user.role === 'packer' && user.warehouse_id ? await getMy
       return groups;
     }
 
-    function renderLocationSection(locGroup: LocationGroup): HTMLElement {
-      const section = document.createElement('div');
-      section.className = 'stack';
-      section.style.gap = '8px';
-      section.innerHTML = `<div class="eyebrow">Zone ${locGroup.zone} · Bin ${locGroup.bin}</div>`;
-
-      const skuGroups: SkuGroup[] = [];
-      for (const r of locGroup.rows) {
-        let sg = skuGroups.find((sg) => sg.sku_code === r.sku_code);
-        if (!sg) {
-          sg = { sku_code: r.sku_code, sku_name: r.sku_name, image_url: r.image_url, rows: [] };
-          skuGroups.push(sg);
-        }
-        sg.rows.push(r);
-      }
-      for (const sg of skuGroups) {
-        const groupKey = `${locGroup.bin}__${sg.sku_code}`;
-        section.appendChild(renderSkuGroup(sg, groupKey));
-      }
-      return section;
+    interface Card {
+      zone: string;
+      bin: string;
+      sg: SkuGroup;
+      done: boolean;
     }
 
-    function renderSkuGroup(sg: SkuGroup, groupKey: string): HTMLElement {
+    // One card per (location, SKU) — same grouping as before, just computed
+    // up front so pending and finished cards can be sorted into separate
+    // areas below instead of interleaved in walking order. `done` mirrors
+    // the same check renderSkuGroup itself used to make internally (no
+    // pending rows left in the group), just hoisted out so it can decide
+    // *where* a card renders, not just how.
+    function buildCards(rows: Row[]): Card[] {
+      const cards: Card[] = [];
+      for (const locGroup of groupByLocation(rows)) {
+        const skuGroups: SkuGroup[] = [];
+        for (const r of locGroup.rows) {
+          let sg = skuGroups.find((sg) => sg.sku_code === r.sku_code);
+          if (!sg) {
+            sg = { sku_code: r.sku_code, sku_name: r.sku_name, image_url: r.image_url, rows: [] };
+            skuGroups.push(sg);
+          }
+          sg.rows.push(r);
+        }
+        for (const sg of skuGroups) {
+          cards.push({ zone: locGroup.zone, bin: locGroup.bin, sg, done: sg.rows.every((r) => r.status !== 'pending') });
+        }
+      }
+      return cards;
+    }
+
+    function renderSkuGroup(sg: SkuGroup, groupKey: string, locationLabel?: string): HTMLElement {
       const required = sg.rows.reduce((sum, r) => sum + r.quantity_required, 0);
       const picked = sg.rows.reduce((sum, r) => sum + r.quantity_picked, 0);
       const pendingRows = sg.rows.filter((r) => r.status === 'pending');
@@ -504,6 +553,7 @@ const initialBatches = user.role === 'packer' && user.warehouse_id ? await getMy
       const el = document.createElement('div');
       el.className = 'card';
       el.innerHTML = `
+        ${locationLabel ? `<div class="eyebrow" style="margin-bottom: 8px;">${escapeHtml(locationLabel)}</div>` : ''}
         <div class="row" style="align-items: center; gap: 14px;">
           ${sg.image_url ? `<img class="thumb thumb-lg" src="${sg.image_url}" alt="" />` : '<div class="thumb thumb-lg"></div>'}
           <div class="stack" style="gap: 2px; flex: 1; min-width: 0;">
