@@ -2850,6 +2850,182 @@ collaboratively and submitted; worth knowing for next time:
   the user can state," and never fabricate specifics (named people, certifications, metrics) on
   the user's behalf.
 
+## Recently done (2026-09-22, a security-hardening pass) — public XSS, login rate limiting, security headers
+
+Full audit requested by the user before this went further as a live product. Found one genuine,
+exploitable issue and closed a class of related gaps; two other hardening items added alongside it.
+
+- **Stored XSS, public-input-to-admin-session**: `admin/leads.astro` rendered public "request
+  access" form submissions (name/email/company/phone/message — `api/access-requests.ts`, no auth
+  required to POST) straight into `innerHTML` with zero escaping. Anyone on the internet could
+  submit a payload that executes in an admin's authenticated session the moment `/admin/leads` is
+  opened — real, not theoretical, verified live with an actual `<img onerror>`/`<script>` payload
+  through the real endpoint (rendered as inert text after the fix, confirmed no alert fired).
+  Closed with `escapeHtml()`; swept the same unescaped-`innerHTML` pattern across every other admin
+  page that had it (`reports`, `pick-list`, `users`, `settings`, `inbound`, `ship`, `warehouse`) for
+  consistency, even though those sources are lower-risk (admin/Amazon-sourced text, not raw public
+  input). **`admin/inventory.astro`'s "Stock by location" table was missed in this sweep** — caught
+  and fixed later the same day, see the inventory-adjustment entry below.
+- **Rate limiting on both login endpoints** — neither the floor PIN login nor the org owner
+  email/password login had any throttling before this; a 4-digit PIN with unlimited attempts is
+  brute-forceable in seconds. New `login_attempts` table (`migrations/0028_login_attempts.sql`),
+  checked per-identifier (5 failed attempts/15min, primary — the account actually being targeted)
+  and per-IP (30/15min, backstop against enumeration) so one locked-out account doesn't take down a
+  whole shared-warehouse IP. Self-prunes on write instead of needing a cron trigger (the account's
+  Workers Free plan caps those at 5 total). **Real bug caught while building this, before it shipped**:
+  the first version compared a JS `toISOString()` cutoff (`T`/`Z` separators) against SQLite's own
+  `datetime('now')` format (space-separated) — same string-sort mismatch already documented once in
+  `dashboard.ts`'s own comment (see that entry) — which silently made the rate limit never trigger.
+  Fixed by building the cutoff with SQLite's own `datetime('now', '-N minutes')` instead of JS date
+  math, matching the established convention. Verified live: 6th attempt correctly 429s, a different
+  account from the same IP still logs in fine.
+- **Security response headers** (`src/middleware.ts`, new) — CSP, HSTS, X-Frame-Options,
+  X-Content-Type-Options, Referrer-Policy, Permissions-Policy (camera scoped to self, for the
+  barcode scanner). `script-src`/`style-src` both need `'unsafe-inline'` — checked against the real
+  production build (`astro build` + `wrangler dev`), not just dev mode: dev mode's output
+  misleadingly shows every page's `<script>` block as an external file, but the actual production
+  build inlines all of them straight into the HTML (this app has no framework — every page wires up
+  its own vanilla JS this way). A strict `script-src` would have silently broken every page
+  (login, picker, packer, all of admin) had it shipped without that check. This is a deliberate,
+  accepted trade-off, not an oversight — the escaping fixes above are the real XSS defense; this
+  header's remaining value is blocking external script/style origins, cross-origin fetch
+  exfiltration, and framing this app in someone else's page. Skipped entirely in dev
+  (`import.meta.env.DEV`) since Vite's HMR/dev toolbar inject their own inline content a
+  production-strength CSP would fight for no benefit locally.
+
+## Recently done (2026-09-22) — per-ship-by-date picklists, replacing the same-day-only gate
+
+User reported orders not showing in the pick list at all. Root cause: `isDueForPickingToday`
+(orders.ts, see its own entry earlier — "ship-by date column on admin Orders") refused to reserve
+*any* order whose ship-by date wasn't exactly today, so a confirmed, in-stock order due tomorrow sat
+`'pending'` with zero pick_tasks right alongside genuinely-blocked stock-shortage orders, with no
+way to tell the two apart from the UI. Discussed the fix with the user directly rather than
+guessing — their framing: separate picklists by ship-by date, each independently activatable, so a
+packer can work "ship by today" and "ship by tomorrow" as two clear units instead of one date
+either fully blocking or fully exposing the list.
+
+- **`reserveOrderForPicking` no longer gates on ship-by date at all** — every confirmed
+  (`amazon_order_status !== 'Pending'`, unchanged), in-stock order reserves immediately regardless
+  of how far out its ship-by is. `isDueForPickingToday` replaced with `computeShipByIstDate`, which
+  labels the batch with an IST calendar date (`YYYY-MM-DD`) instead of returning a boolean —
+  `pick_batches.ship_by_date` (`migrations/0029_pick_batches_ship_by_date.sql`), set once at
+  reservation time. `null` ship-by (manual/CSV orders) labels as today's date, the same "always due"
+  default the old gate used.
+- **Picker's "Activate pick list" gate is now one card per date** instead of one global gate —
+  `activateBatches` (lib/picker.ts) takes a required `shipByDate` and scopes its `UPDATE` to just
+  that date's batches, so activating "today" never touches "tomorrow". `getMyBatches` returns each
+  batch's `shipByDate`; `picker/index.astro`'s `dateGroups()` buckets the picker's batches by date
+  and renders gate/ready/working state per bucket rather than one global `stage` variable (the old
+  4-state FSM — `gate`/`activating`/`ready`/`working` — collapses into per-date derived state:
+  `activated` from batch status, `started` from either row progress or a local `startedDates` set).
+  Once started, each date renders as its own section (own heading, own location/SKU grouping) — the
+  same SKU at the same bin does **not** merge across dates, since picking tomorrow's stock into
+  today's box is exactly the mistake keeping dates visually distinct is meant to prevent.
+- **Follow-up, same day, after watching it against real orders**: two more asks from the user.
+  (1) A far-future order (the original Sept 27 one that started `isDueForPickingToday` in the first
+  place) was getting its own gate card, exactly the clutter per-date grouping was meant to avoid —
+  `dateGroups()` now filters to only today/tomorrow (+ the legacy null-date bucket); a far-future
+  order stays reserved and stock-locked, it just doesn't render a card until its date rolls into the
+  window (a live filter against the clock on every render, no separate job needed to release it
+  later). (2) Once every order for a date was picked, that whole section silently vanished on the
+  next reload — a completed `pick_batches` row drops out of `getMyActiveBatches` by design (packing
+  takes over from there), so nothing confirmed on screen that a date was actually done. `getMyBatches`
+  now also includes batches this picker finished earlier the same day (bounded by `completed_at >=
+  date('now')`, a loose server-side prefetch bound — the real today/tomorrow filtering is client-side
+  IST), so the section persists with "All orders picked for today" instead of disappearing. Verified
+  live end to end, including surviving a real page reload.
+
+## Recently done (2026-09-22) — packer/home sending warehouseId=undefined on every poll
+
+Real user (a named floor account, "anshul") hit "Not authorized for this warehouse" repeatedly on
+`/packer/home`, with the page visibly re-rendering every ~15s (the page's own `load()` poll
+interval, replacing its content with the error banner on every failed tick). Reproduced by watching
+live production traffic (`wrangler tail`) while the user described it — found `?warehouseId=undefined`
+on every `work-summary`/`dashboard`/`sku-demand` call from that page. Root cause: `boot()` read
+`user.warehouse_id` (snake_case) off `window.__serverUser`, but `toClientUser` (lib/auth.ts) returns
+`ClientUser` with `warehouseId` (camelCase) — the snake_case field only exists on the raw
+server-side `User` type this same page's own frontmatter uses, not the client-facing shape it hands
+to the browser. First paint looked fine (server-rendered from the correct frontmatter value); every
+poll after that broke. One-line fix. Verified the deployed bundle directly (grepped the built client
+JS for the property name) rather than trusting the source fix alone, since deploys don't always
+propagate to an already-open tab immediately — the user's live symptom after this shipped turned out
+to be exactly that: a background tab still running the pre-fix JS in memory (mobile browsers
+suspend rather than reload a backgrounded tab), not a second bug. Told them to fully close and
+reopen the tab rather than just switching back to it.
+
+## Recently done (2026-09-22) — bulk-ship/schedule-pickup crashing on the paginated orders endpoint
+
+Found during a full admin+packer workflow walkthrough the user asked for after the picklist
+redesign. Both `admin/bulk-ship.astro` and `admin/schedule-pickup.astro` called
+`/api/admin/orders` and treated the response as a bare array (`orders.filter(...)`) — but
+`getAdminOrders` (lib/admin-orders.ts) was reworked into a paginated `{ orders, totalCount, ... }`
+shape at some point (see "admin Orders page rebuilt to mirror Seller Central" entry) and these two
+callers were never updated to match. Every load threw `orders.filter is not a function` and the
+page never got past "Loading…". Fixed by reading `.orders` off the response, and passing
+`pageSize=1000` explicitly — the endpoint's own default (50) would otherwise silently truncate
+these two bulk-scheduling tools to the first page of orders, a real functional gap distinct from the
+crash itself. Verified live: both pages now render their full order lists (schedule-pickup showed
+all 30 real shippable orders).
+
+## Recently done (2026-09-22) — damage reports were blanket-flagging the whole bin, not just the units
+
+Real incident that surfaced this: user reported `COFFEE2: needs 1... only 0 in stock` despite having
+just received 50 real units. Investigated directly against production (not guessed) — found an
+inventory row with `quantity_on_hand: 50` but `status: 'damaged'`, `updated_at` a full day *after*
+the original damage-report timestamp. Root cause, traced through `reportDamaged` (lib/picker.ts):
+a picker's "Damaged — none usable" report blanket-flagged the entire `(sku, location)` inventory row
+`status = 'damaged'` regardless of how much stock was actually there — a picker reporting 1 damaged
+unit out of a 50-unit bin made the *entire* 50 units unreservable for every future order needing
+that SKU, silently, until someone happened to notice. Receiving new stock into that same bin
+afterward only ever added to `quantity_on_hand`; it never cleared `status`, so the fresh units
+inherited the stale flag too (`receiveStock`'s UPSERT fixed first — `status = 'available'` added to
+its `ON CONFLICT ... DO UPDATE`, so receiving now always un-sticks a damaged bin, matching that it's
+an explicit human confirmation of what's really there).
+
+The real fix is in `reportDamaged` itself: `confirmPick` (inventory.ts) already does exactly the
+right bookkeeping for "these N units are no longer real stock" — it CAS-decrements both
+`quantity_on_hand` and `quantity_reserved` together, correct whether the units left on a truck or
+got thrown out. `reportDamaged` now calls it directly instead of releasing the reservation and
+flagging the row, so only the actually-reported quantity comes out of stock and the rest of the bin
+stays exactly as reservable as it was — no row-level "damaged" status gets set at all going forward.
+`resetPickPackData` (reset.ts, the admin test-data-reset tool) updated to match: reverting a damaged
+task now restores `quantity_required` onto `quantity_on_hand` (mirroring its existing picked/short
+branch) instead of flipping a status flag that no longer gets set. Verified live: reported 1 of 41
+WIDGET-RED damaged (on-hand → 40, status stayed `'available'`), confirmed a second order for the
+same SKU still reserved successfully from the remaining 40.
+
+Both already-affected production rows found and corrected by hand, using their audit trail to work
+out the real quantity rather than guessing: **COFFEE2** (50 on-hand, only 1 ever actually reported
+damaged — status reset, full 50 restored) and **STNT-3A** (12 on-hand, only 1 ever reported — status
+reset, 11 restored; left genuinely alone until the audit trail confirmed no receiving had happened
+since the original report, unlike COFFEE2 where a later receive was the actual trigger). Swept all
+of production afterward — zero `status = 'damaged'` rows remain anywhere.
+
+## Recently done (2026-09-22) — reason-required stock adjustment, and a proper "retire" action
+
+Same-day follow-up: with the damage-report path now fixed, the *only* other way to correct
+inventory (miscounts, spoilage found outside an active pick, a receiving error) was direct SQL —
+exactly what the two incidents above had needed. `/admin/inventory`'s existing raw on-hand edit
+(`PATCH /api/admin/inventory`) already logged before/after to the audit trail but had no reason
+field — the same kind of silent number change that made COFFEE2/STNT-3A hard to explain after the
+fact.
+
+- **PATCH now requires `reason`** (client-side guard blocks Save with no reason before any request
+  fires; server-side check backs it up), included in the audit log alongside before/after. Refuses
+  to drop on-hand below `quantity_reserved` — can't write off units already promised to a live
+  pick_task; resolve that first (report it damaged from the floor, or cancel the order).
+- **New `DELETE /api/admin/inventory`** retires a `(sku, location)` row entirely — discontinued
+  product, decommissioned bin, or created by mistake — rather than it sitting there as a stale zero
+  forever. Refuses while anything's still reserved, same reasoning as the PATCH guard. Logged as
+  `inventory.retire` with the SKU code and quantity it held. A "Retire" button per row on
+  `admin/inventory.astro`, gated behind the existing `confirmDangerousAction` dialog.
+- **`admin/inventory.astro`'s "Stock by location" table also got the `escapeHtml` sweep** it was
+  missed by in the earlier security pass — `sku_code`/`sku_name`/`zone_name`/`location_code` were
+  still unescaped.
+- Verified live: saving a changed on-hand with no reason sends no request; saving with a reason
+  persists and logs before/after/reason; retiring a zero-reserved test row deletes it and logs
+  correctly.
+
 ## Commands
 
 ```bash
