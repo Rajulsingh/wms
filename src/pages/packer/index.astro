@@ -226,6 +226,57 @@ const initialBatches = user.role === 'packer' && user.station_id ? (await getMyP
       return sorted;
     }
 
+    interface SkuGroup {
+      key: string;
+      skuLabel: string;
+      skuName: string;
+      imageUrl: string | null;
+      rows: OrderRow[];
+    }
+
+    // A single-item order has exactly one SKU to group it under; a
+    // multi-item order doesn't (it needs its own full line list, same as
+    // today), so those never group.
+    function groupKeyFor(items: PackBatchItem[]): string | null {
+      if (items.length !== 1) return null;
+      return items[0].msku || items[0].sku_code;
+    }
+
+    // Same-SKU single-item orders are the packer's most repetitive work —
+    // "25 orders, all just one of the same SKU" — so cluster them under one
+    // header with a single "mark all packed" action instead of 25 separate
+    // cards to scroll and tap through individually. A lone order for a SKU
+    // stays an ordinary card rather than becoming a one-row "group" that
+    // adds nothing. Only applies in SKU sort mode — order-ID mode stays the
+    // classic flat per-order list with its own quantity stepper, for a
+    // packer who needs to short-pack one specific order.
+    function buildSkuGroups(rows: OrderRow[]): { groups: SkuGroup[]; rest: OrderRow[] } {
+      const byKey = new Map<string, OrderRow[]>();
+      const rest: OrderRow[] = [];
+      for (const row of rows) {
+        const key = groupKeyFor(row.items);
+        if (!key) {
+          rest.push(row);
+          continue;
+        }
+        const list = byKey.get(key) ?? [];
+        list.push(row);
+        byKey.set(key, list);
+      }
+
+      const groups: SkuGroup[] = [];
+      for (const [key, groupRows] of byKey) {
+        if (groupRows.length < 2) {
+          rest.push(...groupRows);
+          continue;
+        }
+        const first = groupRows[0].items[0];
+        groups.push({ key, skuLabel: first.msku || first.sku_code, skuName: first.sku_name, imageUrl: first.image_url, rows: groupRows });
+      }
+      groups.sort((a, b) => a.skuLabel.localeCompare(b.skuLabel));
+      return { groups, rest };
+    }
+
     function getReadyEntries(): BatchEntry[] {
       return batchList.filter((e) => e.pack.allPacked);
     }
@@ -293,8 +344,71 @@ const initialBatches = user.role === 'packer' && user.station_id ? (await getMyP
         render();
       });
 
+      const { groups, rest } = sortMode === 'sku' ? buildSkuGroups(rows) : { groups: [] as SkuGroup[], rest: rows };
       const container = document.getElementById('order-container')!;
-      for (const row of rows) container.appendChild(renderOrderCard(row));
+      for (const group of groups) container.appendChild(renderSkuGroupCard(group));
+      for (const row of rest) container.appendChild(renderOrderCard(row));
+    }
+
+    // One header per same-SKU cluster (see buildSkuGroups) with a single
+    // "mark all packed" action, plus a compact row per order underneath —
+    // not a full card each, since the whole point is fitting 25 of them on
+    // screen at once instead of 25 scrolls.
+    function renderSkuGroupCard(group: SkuGroup): HTMLElement {
+      const unpackedRows = group.rows.filter((r) => !r.order.allPacked);
+      const packedCount = group.rows.length - unpackedRows.length;
+
+      const el = document.createElement('div');
+      el.className = 'card';
+
+      const header = document.createElement('div');
+      header.className = 'row';
+      header.style.cssText = 'justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap;';
+      header.innerHTML = `
+        <div class="row" style="width: auto; gap: 10px; align-items: center;">
+          ${group.imageUrl ? `<img class="thumb" src="${group.imageUrl}" alt="" />` : '<div class="thumb"></div>'}
+          <div class="stack" style="gap: 2px;">
+            <span style="font-weight: 700;">${escapeHtml(group.skuLabel)}</span>
+            <span style="font-size: 0.78rem; color: var(--muted);">${escapeHtml(group.skuName)} · ${group.rows.length} orders</span>
+          </div>
+        </div>
+        <div class="row" style="width: auto; gap: 8px; align-items: center;">
+          <span class="status-pill ${unpackedRows.length ? 'status-neutral' : 'status-success'}">${packedCount}/${group.rows.length} packed</span>
+          ${unpackedRows.length ? `<button class="btn btn-primary" data-action="pack-group" style="width: auto;">Mark all ${unpackedRows.length} packed</button>` : ''}
+        </div>`;
+      el.appendChild(header);
+
+      const rowsEl = document.createElement('div');
+      rowsEl.className = 'stack';
+      rowsEl.style.cssText = 'gap: 0; margin-top: 10px;';
+      for (const row of group.rows) rowsEl.appendChild(renderGroupOrderRow(row));
+      el.appendChild(rowsEl);
+
+      header.querySelector('[data-action="pack-group"]')?.addEventListener('click', async (e) => {
+        await withLoading(e.currentTarget as HTMLButtonElement, 'Packing…', () => packRows(unpackedRows));
+      });
+
+      return el;
+    }
+
+    function renderGroupOrderRow(row: OrderRow): HTMLElement {
+      const { order, items } = row;
+      const qty = items.reduce((sum, i) => sum + i.quantity_required, 0);
+      const el = document.createElement('div');
+      el.className = 'row';
+      el.style.cssText = 'justify-content: space-between; align-items: center; gap: 10px; padding: 6px 0; border-top: 1px solid var(--border);';
+      el.innerHTML = `
+        <span style="font-size: 0.85rem; font-variant-numeric: tabular-nums;">${escapeHtml(order.externalOrderId)}${qty > 1 ? ` <span style="color: var(--muted);">×${qty}</span>` : ''}</span>
+        ${
+          order.allPacked
+            ? '<span class="status-pill status-success" style="font-size: 0.72rem;">Packed</span>'
+            : '<button class="btn btn-ghost" data-action="pack-one" style="width: auto; padding: 4px 12px; font-size: 0.78rem; min-height: 32px;">Pack</button>'
+        }`;
+
+      el.querySelector('[data-action="pack-one"]')?.addEventListener('click', async (e) => {
+        await withLoading(e.currentTarget as HTMLButtonElement, '…', () => packRows([row]));
+      });
+      return el;
     }
 
     function renderOrderCard(row: OrderRow): HTMLElement {
@@ -403,21 +517,19 @@ const initialBatches = user.role === 'packer' && user.station_id ? (await getMyP
       }
     }
 
-    // Bulk version of handleMarkPacked — every selected order at once, each
-    // submitted at its own full required quantity (no per-line adjustment in
-    // a bulk flow; a packer who needs to short-pack one specific order does
-    // that individually via its own "Mark order packed" instead of selecting
-    // it here). Failures across the batch are collected into one message
-    // rather than each order's own attempt clobbering the last, since
-    // there's no single call to fail or succeed here — many independent ones.
-    async function handleBulkMarkPacked() {
-      const ids = [...selectedOrderIds];
-      if (!ids.length) return;
-      const rows = flattenOrders().filter((r) => ids.includes(r.order.orderId) && !r.order.allPacked && r.items.length > 0);
-
+    // Shared by the manual-selection bulk bar and a SKU group's "mark all
+    // packed" button — every given order at once, each submitted at its own
+    // full required quantity (no per-line adjustment here; a packer who
+    // needs to short-pack one specific order does that individually via its
+    // own "Mark order packed"/"Pack" instead). Failures across the batch are
+    // collected into one message rather than each order's own attempt
+    // clobbering the last, since there's no single call to fail or succeed
+    // here — many independent ones.
+    async function packRows(rows: OrderRow[]) {
       lastError = '';
       const failed: string[] = [];
       for (const row of rows) {
+        if (row.order.allPacked || !row.items.length) continue;
         const snapshot = row.entry.pack.items.map((i) => ({ ...i }));
         const lines = row.items.map((i) => ({ orderItemId: i.order_item_id, quantity: i.quantity_required }));
         applyOptimisticPackOrder(row.entry.pack.items, lines);
@@ -430,6 +542,14 @@ const initialBatches = user.role === 'packer' && user.station_id ? (await getMyP
         }
       }
       if (failed.length) lastError = `Could not mark packed: ${failed.join(', ')}`;
+      render();
+    }
+
+    async function handleBulkMarkPacked() {
+      const ids = [...selectedOrderIds];
+      if (!ids.length) return;
+      const rows = flattenOrders().filter((r) => ids.includes(r.order.orderId) && !r.order.allPacked && r.items.length > 0);
+      await packRows(rows);
       selectedOrderIds.clear();
       render();
     }
