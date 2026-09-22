@@ -79,6 +79,19 @@ export async function getMyActivePackBatchIds(db: D1Database, stationId: string,
  * checkBatchCompletion sets them all at once), so "every order sharing a
  * pick_batch_id" is always a coherent, complete unit of packing work —
  * never a partial one. Returns null if nothing's waiting. See HANDOFF.md.
+ *
+ * The "is it unclaimed" check and the inserts below used to be two separate
+ * round-trips with nothing locking the gap — the packer page's SSR load and
+ * its own 8s client poll (or two open tabs) could both pass the check
+ * before either had inserted, each creating a full duplicate set of
+ * pack_sessions for the same batch. That shipped a real bug: the same
+ * order appeared twice in the packer UI, one copy oblivious to packed
+ * quantity the other had recorded — see migration 0035, which also added a
+ * UNIQUE(pick_batch_id, order_id) index as a hard backstop. The insert loop
+ * now runs as one db.batch() (atomic, same pattern lib/org-accounts.ts
+ * uses): either every order's session is created or none are, and if a
+ * concurrent request already won the race, the UNIQUE violation throws,
+ * which is treated as "already claimed" rather than a real error.
  */
 async function claimNextPackBatch(db: D1Database, userId: string, stationId: string, warehouseId: string): Promise<string | null> {
   const candidate = await db
@@ -107,13 +120,21 @@ async function claimNextPackBatch(db: D1Database, userId: string, stationId: str
     .bind(candidate.id)
     .all<{ id: string }>();
 
-  for (const order of orders.results) {
+  const statements = orders.results.flatMap((order) => {
     const sessionId = newId();
-    await db
-      .prepare(`INSERT INTO pack_sessions (id, order_id, packer_id, station_id, pick_batch_id, status) VALUES (?, ?, ?, ?, ?, 'in_progress')`)
-      .bind(sessionId, order.id, userId, stationId, candidate.id)
-      .run();
-    await db.prepare(`UPDATE orders SET status = 'packing' WHERE id = ?`).bind(order.id).run();
+    return [
+      db.prepare(`INSERT INTO pack_sessions (id, order_id, packer_id, station_id, pick_batch_id, status) VALUES (?, ?, ?, ?, ?, 'in_progress')`).bind(sessionId, order.id, userId, stationId, candidate.id),
+      db.prepare(`UPDATE orders SET status = 'packing' WHERE id = ?`).bind(order.id)
+    ];
+  });
+
+  try {
+    await db.batch(statements);
+  } catch {
+    // Someone else's claim landed first between our check above and this
+    // batch — not a real failure, just a lost race. Next poll will see the
+    // batch already claimed and move on to the next candidate.
+    return null;
   }
   await logAudit(db, { userId, action: 'pack.batch_start', entityType: 'pick_batch', entityId: candidate.id, metadata: { orderCount: orders.results.length } });
 
