@@ -215,25 +215,28 @@ export async function markClaimFiled(db: D1Database, returnId: string, userId: s
   await logAudit(db, { userId, action: 'return.claim_filed', entityType: 'return', entityId: returnId, metadata: {} });
 }
 
-export async function getTodayOtp(db: D1Database, warehouseId: string): Promise<{ otp: string; setAt: string } | null> {
+export async function getTodayOtp(db: D1Database, warehouseId: string): Promise<{ otp: string; setAt: string; validForCount: number | null } | null> {
   const row = await db
-    .prepare(`SELECT otp, set_at AS setAt FROM return_otps WHERE warehouse_id = ? AND otp_date = ?`)
+    .prepare(`SELECT otp, set_at AS setAt, valid_for_count AS validForCount FROM return_otps WHERE warehouse_id = ? AND otp_date = ?`)
     .bind(warehouseId, istDateString())
-    .first<{ otp: string; setAt: string }>();
+    .first<{ otp: string; setAt: string; validForCount: number | null }>();
   return row ?? null;
 }
 
-export async function setTodayOtp(db: D1Database, warehouseId: string, userId: string, otp: string): Promise<void> {
+export async function setTodayOtp(db: D1Database, warehouseId: string, userId: string, otp: string, validForCount: number | null): Promise<void> {
   const trimmed = otp.trim();
   if (!trimmed) throw new Error('OTP is required');
+  if (validForCount !== null && (!Number.isFinite(validForCount) || validForCount < 0)) {
+    throw new Error('Valid-for count must be a non-negative number');
+  }
   await db
     .prepare(
-      `INSERT INTO return_otps (warehouse_id, otp_date, otp, set_by, set_at) VALUES (?, ?, ?, ?, datetime('now'))
-       ON CONFLICT (warehouse_id, otp_date) DO UPDATE SET otp = excluded.otp, set_by = excluded.set_by, set_at = datetime('now')`
+      `INSERT INTO return_otps (warehouse_id, otp_date, otp, valid_for_count, set_by, set_at) VALUES (?, ?, ?, ?, ?, datetime('now'))
+       ON CONFLICT (warehouse_id, otp_date) DO UPDATE SET otp = excluded.otp, valid_for_count = excluded.valid_for_count, set_by = excluded.set_by, set_at = datetime('now')`
     )
-    .bind(warehouseId, istDateString(), trimmed, userId)
+    .bind(warehouseId, istDateString(), trimmed, validForCount, userId)
     .run();
-  await logAudit(db, { userId, action: 'return.otp_set', entityType: 'warehouse', entityId: warehouseId, metadata: {} });
+  await logAudit(db, { userId, action: 'return.otp_set', entityType: 'warehouse', entityId: warehouseId, metadata: { validForCount } });
 }
 
 /**

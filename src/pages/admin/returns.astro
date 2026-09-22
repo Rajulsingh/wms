@@ -63,7 +63,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
     let packerStatusFilter = 'safe_to_claim';
     let packerRows: ReturnRow[] = [];
     let receipts: ReceiptRow[] = [];
-    let otp: { otp: string; setAt: string } | null = null;
+    let otp: { otp: string; setAt: string; validForCount: number | null } | null = null;
 
     async function api(path: string, body?: unknown, method?: string) {
       const res = await fetch(path, {
@@ -116,6 +116,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
           </p>
           <div class="row" style="gap: 8px; align-items: center; flex-wrap: wrap;">
             <input type="text" id="otp-input" placeholder="Today's OTP" value="${otp ? escapeHtml(otp.otp) : ''}" style="max-width: 180px;" />
+            <input type="number" min="0" id="otp-valid-count-input" placeholder="Valid for how many returns" value="${otp?.validForCount ?? ''}" style="max-width: 190px;" />
             <button class="btn btn-primary" id="save-otp" style="width: auto;">Save</button>
             ${otp ? `<span style="font-size: 0.78rem; color: var(--muted);">Last set ${new Date(otp.setAt).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}</span>` : ''}
           </div>
@@ -248,8 +249,10 @@ if (redirectTo) return Astro.redirect(redirectTo);
     async function saveOtp(btn: HTMLButtonElement) {
       const value = (document.getElementById('otp-input') as HTMLInputElement).value.trim();
       if (!value) return;
+      const countRaw = (document.getElementById('otp-valid-count-input') as HTMLInputElement).value.trim();
+      const validForCount = countRaw === '' ? null : Number(countRaw);
       await withLoading(btn, 'Saving…', async () => {
-        await api('/api/admin/returns/otp', { warehouseId, otp: value });
+        await api('/api/admin/returns/otp', { warehouseId, otp: value, validForCount });
         await loadOtp();
         render();
       });
