@@ -410,10 +410,19 @@ export interface PackerDailyOrder {
   imageUrl: string | null;
 }
 
+export interface PackerDailySkuRow {
+  skuCode: string;
+  skuName: string;
+  msku: string | null;
+  imageUrl: string | null;
+  unitsPacked: number;
+}
+
 export interface PackerDailySummary {
   orderCount: number;
   unitsPacked: number;
   orders: PackerDailyOrder[];
+  skus: PackerDailySkuRow[];
 }
 
 /**
@@ -457,7 +466,38 @@ export async function getPackerDailySummary(db: D1Database, warehouseId: string,
     imageUrl: r.image_url
   }));
 
-  return { orderCount: orders.length, unitsPacked: orders.reduce((sum, o) => sum + o.unitsPacked, 0), orders };
+  // Same underlying pack_sessions/order_items as the per-order list above,
+  // just grouped by SKU instead of by order — "what did I actually pack
+  // today" reads faster as "KTN3 ×4, DOG-BKM-5 ×2" than a dozen one-unit
+  // order rows, especially once a packer's cleared a big same-SKU batch
+  // (see the pack page's own SKU grouping for the same reasoning on the
+  // input side). Same day-boundary/cancelled-order filtering as the
+  // per-order query, so the two totals can never disagree.
+  const skuRows = await db
+    .prepare(
+      `SELECT sk.sku_code, sk.name AS sku_name, sk.msku, sk.image_url, SUM(oi.quantity_packed) AS units_packed
+       FROM pack_sessions ps
+       JOIN orders o ON o.id = ps.order_id
+       JOIN order_items oi ON oi.order_id = o.id
+       JOIN skus sk ON sk.id = oi.sku_id
+       WHERE ps.packer_id = ? AND o.warehouse_id = ? AND ps.status IN ('completed', 'partial') AND o.status != 'cancelled'
+         AND ps.completed_at >= date('now') AND ps.completed_at < date('now', '+1 day')
+         AND oi.quantity_packed > 0
+       GROUP BY sk.id
+       ORDER BY sk.sku_code ASC`
+    )
+    .bind(packerId, warehouseId)
+    .all<{ sku_code: string; sku_name: string; msku: string | null; image_url: string | null; units_packed: number }>();
+
+  const skus: PackerDailySkuRow[] = skuRows.results.map((r) => ({
+    skuCode: r.sku_code,
+    skuName: r.sku_name,
+    msku: r.msku,
+    imageUrl: r.image_url,
+    unitsPacked: r.units_packed
+  }));
+
+  return { orderCount: orders.length, unitsPacked: orders.reduce((sum, o) => sum + o.unitsPacked, 0), orders, skus };
 }
 
 export interface AwbResult {

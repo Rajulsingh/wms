@@ -94,10 +94,18 @@ if (user.role === 'packer' && user.warehouse_id) {
       unitsPacked: number;
       imageUrl: string | null;
     }
+    interface DailySkuRow {
+      skuCode: string;
+      skuName: string;
+      msku: string | null;
+      imageUrl: string | null;
+      unitsPacked: number;
+    }
     interface DailySummary {
       orderCount: number;
       unitsPacked: number;
       orders: DailyOrder[];
+      skus: DailySkuRow[];
     }
 
     const app = document.getElementById('app')!;
@@ -157,10 +165,6 @@ if (user.role === 'packer' && user.warehouse_id) {
       } catch (err) {
         app.innerHTML = `<div class="banner banner-danger">${(err as Error).message}</div>`;
       }
-    }
-
-    function formatTime(iso: string): string {
-      return new Date(iso).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
     }
 
     function render(myBatches: MyBatch[], demand: SkuDemandRow[], unbatched: UnbatchedSummary | null, today: DailySummary | null) {
@@ -239,18 +243,19 @@ if (user.role === 'packer' && user.warehouse_id) {
         <div class="stack" style="gap: 10px; margin-top: 8px;">
           <span class="eyebrow">Today — what you've packed</span>
           ${
-            today && today.orders.length
+            today && today.skus.length
               ? `<div class="table-scroll"><table>
-                  <thead><tr><th></th><th>Order ID</th><th>Time</th><th>Units</th><th>Outcome</th></tr></thead>
+                  <thead><tr><th></th><th>SKU</th><th>Units packed</th></tr></thead>
                   <tbody>
-                    ${today.orders
+                    ${today.skus
                       .map(
-                        (o) => `<tr>
-                          <td>${o.imageUrl ? `<img class="table-thumb" src="${o.imageUrl}" alt="" />` : ''}</td>
-                          <td style="font-weight:700; font-variant-numeric: tabular-nums;">${escapeHtml(o.externalOrderId)}</td>
-                          <td>${formatTime(o.completedAt)}</td>
-                          <td>${o.unitsPacked}</td>
-                          <td><span class="status-pill ${o.outcome === 'completed' ? 'status-success' : 'status-warning'}">${o.outcome}</span></td>
+                        (s) => `<tr>
+                          <td>${s.imageUrl ? `<img class="table-thumb" src="${s.imageUrl}" alt="" />` : ''}</td>
+                          <td>
+                            <div style="font-weight: 700;">${escapeHtml(s.msku || s.skuCode)}</div>
+                            <div style="font-size: 0.78rem; color: var(--muted);">${escapeHtml(s.skuName)}</div>
+                          </td>
+                          <td style="font-weight: 700; font-variant-numeric: tabular-nums;">${s.unitsPacked}</td>
                         </tr>`
                       )
                       .join('')}
