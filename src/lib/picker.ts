@@ -651,6 +651,50 @@ export async function getMyActiveBatches(db: D1Database, warehouseId: string, pi
   return rows.results.map((r) => r.id);
 }
 
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+function istDateString(ms = Date.now()): string {
+  return new Date(ms + IST_OFFSET_MS).toISOString().slice(0, 10);
+}
+
+/**
+ * Whether a batch's ship-by date is inside the window the Pick page itself
+ * actually shows (today/tomorrow IST, or no ship-by date at all) — mirrors
+ * picker/index.astro's own client-side dateGroups() filter exactly, so this
+ * is the one place both the Pick page and the packer dashboard can agree on
+ * "is this batch real, current work" without duplicating the date math. A
+ * batch outside this window (ship-by more than a day out) stays reserved
+ * and stock-locked exactly as before — it's just not counted as active
+ * work anywhere until its date rolls into range.
+ */
+export function isShipByEligibleNow(shipByDate: string | null): boolean {
+  if (!shipByDate) return true;
+  const todayIst = istDateString();
+  const tomorrowIst = istDateString(Date.now() + 24 * 60 * 60 * 1000);
+  return shipByDate === todayIst || shipByDate === tomorrowIst;
+}
+
+/**
+ * Same as getMyActiveBatches, scoped to isShipByEligibleNow — for callers
+ * that show a count/summary of "how much pick work is there right now"
+ * outside the Pick page itself (the packer dashboard's "N orders in
+ * progress"). A real bug found live: the dashboard counted every assigned
+ * batch regardless of ship-by date, so a picker with only a far-future
+ * batch (reserved but intentionally not shown on Pick yet) saw "1 order in
+ * progress" on their dashboard and then a genuinely empty Pick page when
+ * they went to work it — two screens disagreeing about the same fact. This
+ * is the shared source of truth so that can't happen again.
+ */
+export async function getMyEligibleActiveBatches(db: D1Database, warehouseId: string, pickerId: string): Promise<string[]> {
+  const ids = await getMyActiveBatches(db, warehouseId, pickerId);
+  if (!ids.length) return [];
+  const placeholders = ids.map(() => '?').join(',');
+  const rows = await db
+    .prepare(`SELECT id, ship_by_date FROM pick_batches WHERE id IN (${placeholders})`)
+    .bind(...ids)
+    .all<{ id: string; ship_by_date: string | null }>();
+  return rows.results.filter((r) => isShipByEligibleNow(r.ship_by_date)).map((r) => r.id);
+}
+
 export interface MyBatchEntry {
   batchId: string;
   status: string;

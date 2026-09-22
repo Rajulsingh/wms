@@ -4,6 +4,7 @@ import { syncOrderStatuses } from './amazon-sync';
 import { syncReturnsReport } from './returns';
 import { backfillTrackingIds } from './shipping';
 import { resolveAmazonCredentials, NOT_CONNECTED } from './org-accounts';
+import { logException } from './db';
 
 export interface SyncJobResult {
   warehouseId: string;
@@ -99,9 +100,31 @@ export async function runAmazonSyncJob(db: D1Database, sinceHours = 24): Promise
       const credentials = await resolveAmazonCredentials(db, wh.organization_id);
       if (credentials === NOT_CONNECTED) continue;
       const since = wh.amazon_orders_synced_through ? new Date(wh.amazon_orders_synced_through) : new Date(Date.now() - sinceHours * 60 * 60 * 1000);
-      const amazonOrders = await fetchUnfulfilledOrders(since, credentials);
-      const importSummary = await importAmazonOrders(db, wh.id, amazonOrders, credentials);
-      await db.prepare(`UPDATE warehouses SET amazon_orders_synced_through = ? WHERE id = ?`).bind(runStartedAt.toISOString(), wh.id).run();
+      const fetchResult = await fetchUnfulfilledOrders(since, credentials);
+      const importSummary = await importAmazonOrders(db, wh.id, fetchResult.orders, credentials);
+
+      // A per-order GetOrderItems failure inside fetchUnfulfilledOrders used
+      // to be invisible here — the call still "succeeded" overall, so the
+      // watermark advanced to runStartedAt regardless, and that one order's
+      // update window could never be re-checked again (see
+      // FetchUnfulfilledOrdersResult in amazon.ts). The watermark now only
+      // advances as far as the oldest failed order's own LastUpdateDate (a
+      // second earlier, so the boundary comparison still includes it) —
+      // everything up to that point is safely re-fetched next run too
+      // (importAmazonOrders dedupes by external order id, so re-seeing an
+      // already-imported order is a no-op, not a duplicate).
+      const watermark =
+        fetchResult.earliestFailedLastUpdate && fetchResult.earliestFailedLastUpdate < runStartedAt
+          ? new Date(fetchResult.earliestFailedLastUpdate.getTime() - 1000)
+          : runStartedAt;
+      await db.prepare(`UPDATE warehouses SET amazon_orders_synced_through = ? WHERE id = ?`).bind(watermark.toISOString(), wh.id).run();
+      for (const failedOrderId of fetchResult.failedOrderIds) {
+        await logException(db, {
+          type: 'other',
+          userId: null,
+          notes: `Amazon order ${failedOrderId} failed to fetch during sync (GetOrderItems error) — will retry automatically on the next sync, not lost.`
+        });
+      }
       const statusResult = await syncOrderStatuses(db, wh.id, credentials);
       const retryResult = await retryBlockedOrders(db, wh.id);
 

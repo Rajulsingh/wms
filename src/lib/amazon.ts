@@ -134,6 +134,26 @@ export interface AmazonOrder {
   items: AmazonOrderItem[];
 }
 
+export interface FetchUnfulfilledOrdersResult {
+  orders: AmazonOrder[];
+  // Amazon order ids whose GetOrderItems call failed (rate limit, transient
+  // 5xx, etc.) — the order itself was seen and matched the filters, but
+  // couldn't be fully fetched this run. See earliestFailedLastUpdate below
+  // for why the caller needs these, not just a log line.
+  failedOrderIds: string[];
+  // The oldest LastUpdateDate among failedOrderIds, if any. A real incident
+  // (see HANDOFF.md): this function used to swallow a per-order fetch
+  // failure with only a console.error and still return its successful
+  // orders normally — indistinguishable from "nothing else was there" to
+  // the caller. sync-job.ts advances its watermark unconditionally past
+  // every run that doesn't throw, so a silently-dropped order's window
+  // could never be re-checked again once the watermark moved past it —
+  // gone forever, not just delayed. Returning this lets the caller hold
+  // the watermark back to (at most) this timestamp instead, guaranteeing
+  // the failed order's window gets retried on the next run.
+  earliestFailedLastUpdate: Date | null;
+}
+
 /**
  * Pulls unshipped, merchant-fulfilled orders updated since `since`. Meant to
  * run on a schedule (Cloudflare Cron Trigger) rather than only on manual click.
@@ -145,7 +165,7 @@ export interface AmazonOrder {
  * MarketplaceIds=ATVPDKIKX0DER — no FulfillmentChannels/OrderStatuses
  * filters, no real dates. Real filtering only works against production.
  */
-export async function fetchUnfulfilledOrders(since: Date, credentials?: Partial<AmazonEnv>): Promise<AmazonOrder[]> {
+export async function fetchUnfulfilledOrders(since: Date, credentials?: Partial<AmazonEnv>): Promise<FetchUnfulfilledOrdersResult> {
   const env = getEnv(credentials);
   const accessToken = await getAccessToken(env);
   const isSandbox = env.AMAZON_SPAPI_SANDBOX === 'true';
@@ -233,9 +253,11 @@ export async function fetchUnfulfilledOrders(since: Date, credentials?: Partial<
   // everything at once. Each fetch keeps its own try/catch exactly as the
   // old sequential loop did — one order's failure (a transient rate-limit or
   // 500, common here) must not cost every other order already fetched in
-  // this same call; it returns null and is filtered out below, to be
-  // retried on the next sync since `since` always looks back over the sync
-  // job's own configurable window.
+  // this same call; it's reported as a failure (not thrown) so every other
+  // order in this batch still imports, but the caller (sync-job.ts) now
+  // gets told which order and when Amazon last touched it, so the failed
+  // order's window can be retried instead of silently lost — see
+  // FetchUnfulfilledOrdersResult above.
   const withItems = await mapWithConcurrency(mfnOrders, 5, async (raw) => {
     const orderId = raw.AmazonOrderId as string;
     // Sandbox's getOrderItems only recognizes the literal path "TEST_CASE_200"
@@ -264,14 +286,23 @@ export async function fetchUnfulfilledOrders(since: Date, credentials?: Partial<
           quantityOrdered: Number(item.QuantityOrdered ?? 0)
         }))
       };
-      return order;
+      return { ok: true as const, order };
     } catch (err) {
       console.error(`SP-API GetOrderItems failed for ${orderId}, skipping this order for now:`, err);
-      return null;
+      return { ok: false as const, orderId, lastUpdate: raw.LastUpdateDate as string | undefined };
     }
   });
 
-  return withItems.filter((o): o is AmazonOrder => o !== null);
+  const orders = withItems.filter((r): r is { ok: true; order: AmazonOrder } => r.ok).map((r) => r.order);
+  const failed = withItems.filter((r): r is { ok: false; orderId: string; lastUpdate: string | undefined } => !r.ok);
+  let earliestFailedLastUpdate: Date | null = null;
+  for (const f of failed) {
+    if (!f.lastUpdate) continue;
+    const d = new Date(f.lastUpdate);
+    if (!earliestFailedLastUpdate || d < earliestFailedLastUpdate) earliestFailedLastUpdate = d;
+  }
+
+  return { orders, failedOrderIds: failed.map((f) => f.orderId), earliestFailedLastUpdate };
 }
 
 export interface AmazonOrderStatus {

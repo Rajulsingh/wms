@@ -4,7 +4,7 @@ import TopBar from '../../components/TopBar.astro';
 import PackerSidebar from '../../components/PackerSidebar.astro';
 import { getDb } from '../../lib/db';
 import { getCurrentUser, toClientUser } from '../../lib/auth';
-import { getMyActiveBatches, getPickListView, getUnassignedSkuDemand } from '../../lib/picker';
+import { getMyEligibleActiveBatches, getPickListView, getUnassignedSkuDemand } from '../../lib/picker';
 import { getUnbatchedOrderSummary } from '../../lib/orders';
 import { getPackerDailySummary } from '../../lib/packer';
 
@@ -27,7 +27,7 @@ const serverUser = toClientUser(user);
 // poll interval for anything that changes after load.
 let initialData: { myBatches: unknown[]; unbatched: unknown; today: unknown; demand: unknown } | null = null;
 if (user.role === 'packer' && user.warehouse_id) {
-  const myBatchIds = await getMyActiveBatches(db, user.warehouse_id, user.id);
+  const myBatchIds = await getMyEligibleActiveBatches(db, user.warehouse_id, user.id);
   const myBatches = [];
   for (const batchId of myBatchIds) {
     const rows = await getPickListView(db, batchId);
