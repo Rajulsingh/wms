@@ -62,6 +62,14 @@ const initialData =
       customerName: string | null;
     }
 
+    // Which scan session (if either) currently owns the camera — the
+    // receiving stage and the inspect stage each get their own scan area
+    // (different match target: 'expected' vs 'received'), but only one can
+    // reasonably be open at a time. scanner-client's own startContinuousScan
+    // stops whichever was running first, so this is just for knowing which
+    // UI to tear down/rebuild.
+    type ScanMode = 'receiving' | 'inspect' | null;
+
     interface Receipt {
       expectedCount: number;
       receivedCount: number;
@@ -73,7 +81,7 @@ const initialData =
     let received: ReturnRow[] = [];
     let otp: { otp: string; setAt: string; validForCount: number | null } | null = null;
     let receipt: Receipt | null = null;
-    let scanning = false;
+    let scanning: ScanMode = null;
     let active: ReturnRow | null = null; // the return currently being inspected
     let flash: { kind: 'success' | 'danger'; message: string } | null = null;
 
@@ -144,12 +152,13 @@ const initialData =
 
     // The sequence is deliberate, per how the floor actually works: know
     // what's still awaiting receipt before asking for the OTP (so you can
-    // sanity-check what the courier hands over), get the OTP, confirm what
-    // actually arrived — which moves those specific returns from "awaiting
-    // receipt" into "received" (see confirmTodayReceipt in lib/returns.ts)
-    // — and only *received* returns can be inspected. The receive step is
+    // sanity-check what the courier hands over), get the OTP, set a target
+    // count, then scan (or manually mark) each specific box as it's handed
+    // over — which is what actually moves that one return from "awaiting
+    // receipt" into "received" (see markReturnReceived in lib/returns.ts) —
+    // and only *received* returns can be inspected. The receive step is
     // repeatable all day, not a one-time gate: a second courier drop later
-    // just adds to today's received count.
+    // just adds to today's target.
     function renderQueue() {
       app.innerHTML = `
         ${flashHtml()}
@@ -181,9 +190,9 @@ const initialData =
 
         <div class="row" style="justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 18px;">
           <span class="eyebrow">Inspect &amp; update status (${received.length})</span>
-          ${received.length ? `<button class="btn btn-primary" id="start-scan" style="width: auto;">Scan a return</button>` : ''}
+          ${received.length ? `<button class="btn btn-primary" id="start-inspect-scan" style="width: auto;">Scan a return</button>` : ''}
         </div>
-        <div id="scan-area"></div>
+        <div id="inspect-scan-area"></div>
         <div class="stack" style="gap: 10px; margin-top: 10px;">
           ${received.length ? received.map((r) => queueRowHtml(r)).join('') : `<p>Nothing confirmed received yet — receive some above first.</p>`}
         </div>`;
@@ -191,7 +200,7 @@ const initialData =
       renderExpectedList();
       renderReceiptCard();
 
-      document.getElementById('start-scan')?.addEventListener('click', beginScanning);
+      document.getElementById('start-inspect-scan')?.addEventListener('click', beginInspectScanning);
       received.forEach((r) => {
         document.getElementById(`open-${r.id}`)?.addEventListener('click', () => {
           active = r;
@@ -201,16 +210,19 @@ const initialData =
       });
     }
 
-    // Read-only — no click handlers. This list is here so a packer knows
-    // what to expect *before* asking for the OTP, not as another way into
-    // inspecting (that's the received list below, only reachable once
-    // receipt is confirmed).
+    // Each row gets its own "Mark received" fallback for a label a scanner
+    // can't read — a deliberate per-return action the packer takes on the
+    // specific box in front of them, not a way to bulk-skip scanning
+    // everything (that's exactly the blind-guess behavior this replaced).
     function renderExpectedList() {
       const container = document.querySelector('[data-expected-list]') as HTMLElement | null;
       if (!container) return;
       container.innerHTML = expected.length
         ? expected.map((r) => expectedRowHtml(r)).join('')
         : `<p style="margin: 0; font-size: 0.85rem; color: var(--muted);">Nothing awaiting receipt.</p>`;
+      expected.forEach((r) => {
+        document.getElementById(`mark-received-${r.id}`)?.addEventListener('click', (e) => markReceivedManually(r, e.currentTarget as HTMLButtonElement));
+      });
     }
 
     function expectedRowHtml(r: ReturnRow): string {
@@ -221,37 +233,65 @@ const initialData =
           <span style="font-size: 0.78rem; color: var(--muted);">${escapeHtml(r.externalOrderId)} · ${escapeHtml(r.returnReason || 'No reason given')}</span>
           <span style="font-size: 0.72rem; color: var(--muted);">Requested ${r.returnRequestDate ? escapeHtml(r.returnRequestDate) : 'unknown date'}${r.trackingId ? ` · AWB ${escapeHtml(r.trackingId)}` : ''}</span>
         </div>
+        <button class="btn btn-ghost" id="mark-received-${r.id}" style="width: auto; padding: 6px 12px; font-size: 0.78rem;">Mark received</button>
       </div>`;
     }
 
+    // Scanning is the primary path (see beginReceivingScanning below); the
+    // count here is a target to scan up to, not an action on any return —
+    // see setReceivingTarget in lib/returns.ts for why confirmTodayReceipt's
+    // blind FIFO assignment was replaced. receivedCount always reflects the
+    // real, scan/manually-verified count, shown next to the courier's own
+    // claimed number so a mismatch is visible instead of hidden.
     function renderReceiptCard() {
       const container = document.querySelector('[data-receipt]') as HTMLElement | null;
       if (!container) return;
 
-      const summaryHtml = receipt
-        ? `<div class="row" style="align-items: baseline; gap: 10px;">
-             <span style="font-size: 1.3rem; font-weight: 800;">${receipt.receivedCount} received today</span>
-           </div>
-           <p style="margin: 0; font-size: 0.78rem; color: var(--muted);">Last confirmed ${new Date(receipt.confirmedAt).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}</p>`
-        : '';
+      const target = receipt?.expectedCount ?? 0;
+      const actual = receipt?.receivedCount ?? 0;
+      const short = receipt && actual < target;
 
       container.innerHTML = `
         <span class="eyebrow">Confirm returns received</span>
-        ${summaryHtml}
-        <p style="margin: 0; font-size: 0.85rem; color: var(--muted);">${receipt ? 'More arrived? Add them below.' : 'How many did the courier actually hand over just now?'} (${expected.length} still awaiting receipt)</p>
+        <p style="margin: 0; font-size: 0.85rem; color: var(--muted);">How many did the courier say they handed over just now? (${expected.length} awaiting receipt)</p>
         <div class="row" style="gap: 8px; align-items: center;">
-          <input type="number" id="received-count" min="0" max="${expected.length}" value="${expected.length}" style="width: 90px;" />
-          <button class="btn btn-primary" id="confirm-receipt" style="width: auto;">${receipt ? 'Add to received' : 'Confirm received'}</button>
-        </div>`;
-      document.getElementById('confirm-receipt')?.addEventListener('click', (e) => confirmReceipt(e.currentTarget as HTMLButtonElement));
+          <input type="number" id="received-count" min="0" value="" placeholder="e.g. 3" style="width: 90px;" />
+          <button class="btn btn-primary" id="confirm-receipt" style="width: auto;">Set target</button>
+        </div>
+        ${
+          receipt
+            ? `<div class="row" style="align-items: baseline; gap: 10px; margin-top: 6px;">
+                 <span style="font-size: 1.3rem; font-weight: 800; ${short ? 'color: var(--warning-fg);' : ''}">${actual} of ${target} scanned</span>
+                 ${short ? `<span class="pill" style="color: var(--warning-fg);">${target - actual} short</span>` : ''}
+               </div>
+               <p style="margin: 0; font-size: 0.78rem; color: var(--muted);">Last update ${new Date(receipt.confirmedAt).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}</p>
+               <button class="btn btn-primary" id="start-receiving-scan" style="margin-top: 8px;">Scan returns</button>
+               <div id="receiving-scan-area"></div>`
+            : ''
+        }`;
+      document.getElementById('confirm-receipt')?.addEventListener('click', (e) => confirmReceiptTarget(e.currentTarget as HTMLButtonElement));
+      document.getElementById('start-receiving-scan')?.addEventListener('click', beginReceivingScanning);
     }
 
-    async function confirmReceipt(btn: HTMLButtonElement) {
+    async function confirmReceiptTarget(btn: HTMLButtonElement) {
       const input = document.getElementById('received-count') as HTMLInputElement;
-      const receivedCount = Number(input.value);
+      const receivedCount = Number(input.value || 0);
       await withLoading(btn, 'Saving…', async () => {
         try {
           await api('/api/packer/returns/confirm-receipt', { receivedCount });
+          await refresh();
+          render();
+        } catch (err) {
+          showFlash('danger', (err as Error).message);
+        }
+      });
+    }
+
+    async function markReceivedManually(r: ReturnRow, btn: HTMLButtonElement) {
+      await withLoading(btn, '…', async () => {
+        try {
+          await api('/api/packer/returns/receive-manual', { returnId: r.id });
+          flash = { kind: 'success', message: `${r.externalOrderId} marked received.` };
           await refresh();
           render();
         } catch (err) {
@@ -271,28 +311,40 @@ const initialData =
       </div>`;
     }
 
-    function beginScanning() {
-      scanning = true;
-      const scanArea = document.getElementById('scan-area')!;
-      scanArea.innerHTML = `
-        <video class="scanner" id="video" style="margin-top: 10px;"></video>
-        <div class="stack" id="manual-code-wrap" style="margin-top: 10px; gap: 4px; cursor: text;">
+    // Generic scan-UI mount shared by both stages — receiving (matches
+    // 'expected') and inspect (matches 'received') each pass their own
+    // container/ids and code handler, since scanner-client's own
+    // startContinuousScan already stops whichever session was running
+    // first if both somehow get opened.
+    function mountScanUI(opts: {
+      containerId: string;
+      videoId: string;
+      wrapId: string;
+      inputId: string;
+      stopId: string | null;
+      placeholder: string;
+      onCode: (code: string) => void;
+      onStop?: () => void;
+    }) {
+      const container = document.getElementById(opts.containerId)!;
+      container.innerHTML = `
+        <video class="scanner" id="${opts.videoId}" style="margin-top: 10px;"></video>
+        <div class="stack" id="${opts.wrapId}" style="margin-top: 10px; gap: 4px; cursor: text;">
           <span style="font-size: 0.72rem; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.02em;">Handheld scanner input — tap here first</span>
           <div class="row" style="gap: 8px;">
-            <input type="text" id="manual-code" placeholder="Or type the AWB or order id and press Enter" autocomplete="off" autocapitalize="off" />
-            <button class="btn btn-ghost" id="stop-scan" style="width: auto;">Cancel</button>
+            <input type="text" id="${opts.inputId}" placeholder="${opts.placeholder}" autocomplete="off" autocapitalize="off" />
+            ${opts.stopId ? `<button class="btn btn-ghost" id="${opts.stopId}" style="width: auto;">Cancel</button>` : ''}
           </div>
         </div>`;
-      document.getElementById('stop-scan')?.addEventListener('click', endScanning);
-      const manualInput = document.getElementById('manual-code') as HTMLInputElement;
+      if (opts.stopId && opts.onStop) document.getElementById(opts.stopId)?.addEventListener('click', opts.onStop);
+      const manualInput = document.getElementById(opts.inputId) as HTMLInputElement;
       manualInput.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') {
           e.preventDefault();
-          const input = e.currentTarget as HTMLInputElement;
-          const code = input.value.trim();
+          const code = manualInput.value.trim();
           if (code) {
-            input.value = '';
-            handleScannedCode(code);
+            manualInput.value = '';
+            opts.onCode(code);
           }
         }
       });
@@ -302,35 +354,81 @@ const initialData =
       // packer having to first tap the tiny text field by hand; clicking
       // anywhere in the labeled row re-focuses it too, in case focus ever
       // lands elsewhere (e.g. the camera permission prompt).
-      document.getElementById('manual-code-wrap')?.addEventListener('click', (e) => {
-        if ((e.target as HTMLElement).id !== 'stop-scan') manualInput.focus();
+      document.getElementById(opts.wrapId)?.addEventListener('click', (e) => {
+        if ((e.target as HTMLElement).id !== opts.stopId) manualInput.focus();
       });
       manualInput.focus();
-      const video = document.getElementById('video') as HTMLVideoElement;
-      startContinuousScan(video, handleScannedCode, () => {
+      const video = document.getElementById(opts.videoId) as HTMLVideoElement;
+      startContinuousScan(video, opts.onCode, () => {
         // No camera/permission — swap just the video element for an inline
-        // notice and keep going in manual mode. This used to call render(),
-        // which rebuilds the whole queue view and destroys the very text
-        // field the message points the packer to — so on a device where the
-        // camera never opens, the fallback vanished before it could be
-        // used. `scanning` stays true so the 15s poll (gated on it) doesn't
-        // also tear this down a few seconds later.
+        // notice and keep going in manual mode, same fix as the Scan/Pack
+        // pages: tearing the whole UI down here would destroy the exact
+        // text field the message points the packer to.
         video.outerHTML = '<div class="banner banner-danger" style="margin-top: 10px;">Could not open camera — use the text field below to enter codes instead.</div>';
         manualInput.focus();
       });
     }
 
-    function endScanning() {
+    function beginReceivingScanning() {
+      scanning = 'receiving';
+      mountScanUI({
+        containerId: 'receiving-scan-area',
+        videoId: 'receiving-video',
+        wrapId: 'receiving-manual-code-wrap',
+        inputId: 'receiving-manual-code',
+        stopId: 'stop-receiving-scan',
+        placeholder: 'Or type the AWB or order id and press Enter',
+        onCode: handleReceivingScannedCode,
+        onStop: endReceivingScanning
+      });
+    }
+
+    function endReceivingScanning() {
       stopScanning();
-      scanning = false;
+      scanning = null;
       render();
     }
 
-    async function handleScannedCode(code: string) {
+    async function handleReceivingScannedCode(code: string) {
+      try {
+        await api('/api/packer/returns/receive-scan', { code });
+        flash = null;
+        await refresh();
+        render();
+        // Re-open the scanner immediately after a re-render — receiving is
+        // continuous (one box after another), not a single-shot action like
+        // inspect's "open this one return" handoff.
+        if (receipt && receipt.receivedCount < receipt.expectedCount) beginReceivingScanning();
+      } catch (err) {
+        showFlash('danger', (err as Error).message);
+      }
+    }
+
+    function beginInspectScanning() {
+      scanning = 'inspect';
+      mountScanUI({
+        containerId: 'inspect-scan-area',
+        videoId: 'inspect-video',
+        wrapId: 'inspect-manual-code-wrap',
+        inputId: 'inspect-manual-code',
+        stopId: 'stop-inspect-scan',
+        placeholder: 'Or type the AWB or order id and press Enter',
+        onCode: handleInspectScannedCode,
+        onStop: endInspectScanning
+      });
+    }
+
+    function endInspectScanning() {
+      stopScanning();
+      scanning = null;
+      render();
+    }
+
+    async function handleInspectScannedCode(code: string) {
       try {
         const found = await api('/api/packer/returns/scan', { code });
         stopScanning();
-        scanning = false;
+        scanning = null;
         active = found;
         flash = null;
         render();

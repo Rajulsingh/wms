@@ -1,3 +1,4 @@
+import { env } from 'cloudflare:workers';
 import { newId, logAudit } from './db';
 import { requestReturnsReport, checkReturnsReport, type ReturnsReportRow, type AmazonEnv } from './amazon';
 
@@ -26,6 +27,7 @@ export interface ReturnRow {
   customerName: string | null;
   labelImageKey: string | null;
   productImageKey: string | null;
+  receivedAt: string | null;
 }
 
 const RETURN_ROW_SELECT = `
@@ -33,13 +35,13 @@ const RETURN_ROW_SELECT = `
          r.asin, r.merchant_sku AS merchantSku, r.item_name AS itemName, r.return_reason AS returnReason,
          r.tracking_id AS trackingId, r.return_request_date AS returnRequestDate, r.return_delivery_date AS returnDeliveryDate,
          r.status, s.sku_code AS skuCode, s.name AS skuName, s.image_url AS imageUrl, o.customer_name AS customerName,
-         r.label_image_key AS labelImageKey, r.product_image_key AS productImageKey
+         r.label_image_key AS labelImageKey, r.product_image_key AS productImageKey, r.received_at AS receivedAt
   FROM returns r
   LEFT JOIN skus s ON s.id = r.sku_id
   LEFT JOIN orders o ON o.id = r.order_id
 `;
 
-/** Synced from Amazon but not yet confirmed physically received — see confirmTodayReceipt, which is what actually moves a row out of here. Oldest request first. Not filtered to "today": a return synced days ago and still sitting here genuinely hasn't been received yet, which is exactly what this list is for. */
+/** Synced from Amazon but not yet confirmed physically received — see markReturnReceived, which is what actually moves a row out of here (via scan match or manual fallback). Oldest request first. Not filtered to "today": a return synced days ago and still sitting here genuinely hasn't been received yet, which is exactly what this list is for. */
 export async function getExpectedReturns(db: D1Database, warehouseId: string): Promise<ReturnRow[]> {
   const rows = await db
     .prepare(`${RETURN_ROW_SELECT} WHERE r.warehouse_id = ? AND r.status = 'expected' ORDER BY r.return_request_date ASC`)
@@ -48,7 +50,7 @@ export async function getExpectedReturns(db: D1Database, warehouseId: string): P
   return rows.results;
 }
 
-/** Confirmed physically received (via confirmTodayReceipt) but not yet inspected — this, not the raw 'expected' backlog, is what the packer actually scans/selects against. */
+/** Confirmed physically received (via markReturnReceived) but not yet inspected — this, not the raw 'expected' backlog, is what the packer actually scans/selects against. */
 export async function getReceivedReturns(db: D1Database, warehouseId: string): Promise<ReturnRow[]> {
   const rows = await db
     .prepare(`${RETURN_ROW_SELECT} WHERE r.warehouse_id = ? AND r.status = 'received' ORDER BY r.return_request_date ASC`)
@@ -77,6 +79,96 @@ export async function findReturnByScan(db: D1Database, warehouseId: string, code
     .first<ReturnRow>();
 }
 
+/**
+ * The receiving-stage counterpart to findReturnByScan — same match order
+ * (tracking id, then Amazon order id as fallback), but scoped to 'expected'
+ * since this is what actually moves a return *into* 'received' in the first
+ * place. A real bug this replaces: confirmTodayReceipt used to take
+ * whatever number the packer typed and blindly flip that many of the
+ * *oldest* expected returns to 'received', with zero connection to which
+ * physical boxes the courier actually handed over that day — "3 received"
+ * could silently mark three unrelated returns as received while the real
+ * three sat untouched. Scanning each box's real AWB and matching it here is
+ * the fix: only a return whose own tracking id (or order id) was actually
+ * scanned ever moves to 'received'.
+ */
+export async function findExpectedReturnByScan(db: D1Database, warehouseId: string, code: string): Promise<ReturnRow | null> {
+  const trimmed = code.trim();
+  if (!trimmed) return null;
+  const byTracking = await db
+    .prepare(`${RETURN_ROW_SELECT} WHERE r.warehouse_id = ? AND r.tracking_id = ? AND r.status = 'expected' ORDER BY r.return_request_date ASC LIMIT 1`)
+    .bind(warehouseId, trimmed)
+    .first<ReturnRow>();
+  if (byTracking) return byTracking;
+  return db
+    .prepare(`${RETURN_ROW_SELECT} WHERE r.warehouse_id = ? AND r.external_order_id = ? AND r.status = 'expected' ORDER BY r.return_request_date ASC LIMIT 1`)
+    .bind(warehouseId, trimmed)
+    .first<ReturnRow>();
+}
+
+/**
+ * How many returns this warehouse has actually marked 'received' today —
+ * the real, derived count behind return_receipts.received_count,
+ * recomputed on every markReturnReceived call rather than trusted as a
+ * number someone typed in. Uses plain UTC date('now') boundaries against
+ * `received_at` (itself a datetime('now') UTC column) rather than the
+ * IST-shifted istDateString() used for otp_date/receipt_date elsewhere in
+ * this file — mixing an IST-computed boundary with a UTC-stored timestamp
+ * column is exactly the kind of day-boundary mismatch this codebase has
+ * been bitten by before (see dashboard.ts/packer.ts's own "today" counts,
+ * which use the same plain-UTC pattern for the same reason: column and
+ * boundary must be in the same timezone frame, or comparisons silently
+ * drift near the day edge).
+ */
+async function countReceivedToday(db: D1Database, warehouseId: string): Promise<number> {
+  const row = await db
+    .prepare(`SELECT COUNT(*) AS c FROM returns WHERE warehouse_id = ? AND received_at >= date('now') AND received_at < date('now', '+1 day')`)
+    .bind(warehouseId)
+    .first<{ c: number }>();
+  return row?.c ?? 0;
+}
+
+/**
+ * Moves one specific return from 'expected' to 'received' — the only way
+ * that transition happens now (see findExpectedReturnByScan above and the
+ * manual fallback below). Refuses anything not currently 'expected' so a
+ * duplicate scan of an already-received return, or a code belonging to a
+ * return that hasn't synced as expected at all, fails loudly rather than
+ * quietly re-stamping received_at. Also keeps return_receipts.received_count
+ * in sync with the real, current count — see countReceivedToday.
+ */
+export async function markReturnReceived(db: D1Database, warehouseId: string, userId: string, returnId: string, method: 'scan' | 'manual'): Promise<ReturnRow> {
+  const existing = await getReturnById(db, returnId);
+  if (!existing || existing.warehouseId !== warehouseId) throw new Error('Return not found for this warehouse');
+  if (existing.status !== 'expected') {
+    throw new Error(existing.status === 'received' ? 'This return was already marked received.' : `This return is "${existing.status}", not awaiting receipt.`);
+  }
+
+  await db.prepare(`UPDATE returns SET status = 'received', received_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`).bind(returnId).run();
+  await logAudit(db, { userId, action: 'return.received', entityType: 'return', entityId: returnId, metadata: { method } });
+
+  const receivedCount = await countReceivedToday(db, warehouseId);
+  const receiptDate = istDateString();
+  const priorTarget = (await getTodayReceipt(db, warehouseId))?.expectedCount ?? 0;
+  await db
+    .prepare(
+      `INSERT INTO return_receipts (warehouse_id, receipt_date, expected_count, received_count, confirmed_by, confirmed_at) VALUES (?, ?, ?, ?, ?, datetime('now'))
+       ON CONFLICT (warehouse_id, receipt_date) DO UPDATE SET received_count = excluded.received_count, confirmed_at = datetime('now')`
+    )
+    .bind(warehouseId, receiptDate, priorTarget, receivedCount, userId)
+    .run();
+
+  const updated = await getReturnById(db, returnId);
+  return updated!;
+}
+
+/** Scan entry point for receiving — resolves the code to a specific expected return, then marks it received. Throws a clear, packer-facing message when nothing matches, rather than falling back to guessing which return the courier actually handed over. */
+export async function receiveReturnByScan(db: D1Database, warehouseId: string, userId: string, code: string): Promise<ReturnRow> {
+  const match = await findExpectedReturnByScan(db, warehouseId, code);
+  if (!match) throw new Error(`No return awaiting receipt matches "${code.trim()}" — check the code, or use "Mark received" on the right item below if the label is damaged/unreadable.`);
+  return markReturnReceived(db, warehouseId, userId, match.id, 'scan');
+}
+
 export interface ReturnReceipt {
   expectedCount: number;
   receivedCount: number;
@@ -92,52 +184,35 @@ export async function getTodayReceipt(db: D1Database, warehouseId: string): Prom
 }
 
 /**
- * The packer's headcount reconciliation — and the only thing that actually
- * moves a return out of "expected" and into "received" (see
- * getReceivedReturns). A real bug found live: the original version of this
- * only recorded a number, never touched any individual row, so the
- * "expected today" list kept re-showing the same accumulated backlog every
- * day forever, including returns already confirmed received days earlier.
- *
- * `receivedCount` is a delta, not an absolute total — callable more than
- * once per day (a second courier drop later the same day just adds more),
- * each call transitioning that many more of the oldest still-'expected'
- * rows to 'received'. The stored `receivedCount` accumulates across calls;
- * `expectedCount` is recomputed each time as received-so-far plus
- * whatever's still outstanding, so it always reads as "the total this
- * warehouse has seen today," not a stale first-call snapshot.
+ * Records what the courier *claims* to have handed over — a target for the
+ * packer to scan up to, never itself an action on any return row anymore.
+ * Replaces the old confirmTodayReceipt, which took this same number and
+ * blindly flipped that many of the *oldest* expected returns to 'received'
+ * — a real bug found live: "3 received" had zero connection to which three
+ * physical boxes the courier actually handed over, so it could silently
+ * mark the wrong three while the real three sat untouched forever. Now
+ * this only sets `expected_count` (the target); `received_count` is always
+ * the real, derived count of returns actually scanned/marked received
+ * today (see countReceivedToday) — the two are shown side by side so a
+ * courier-claimed vs. actually-verified mismatch is visible, not hidden.
+ * Callable more than once per day (a second courier drop just adds to the
+ * target); accumulates rather than overwrites, same as before.
  */
-export async function confirmTodayReceipt(db: D1Database, warehouseId: string, userId: string, receivedCount: number): Promise<ReturnReceipt> {
-  if (!Number.isFinite(receivedCount) || receivedCount < 0) throw new Error('Received count must be a non-negative number');
-  const expected = await getExpectedReturns(db, warehouseId);
-  const toReceive = expected.slice(0, Math.min(receivedCount, expected.length));
-
-  for (const r of toReceive) {
-    await db.prepare(`UPDATE returns SET status = 'received', updated_at = datetime('now') WHERE id = ?`).bind(r.id).run();
-  }
-  if (toReceive.length) {
-    await logAudit(db, {
-      userId,
-      action: 'return.received',
-      entityType: 'warehouse',
-      entityId: warehouseId,
-      metadata: { count: toReceive.length, returnIds: toReceive.map((r) => r.id) }
-    });
-  }
-
-  const receiptDate = istDateString();
+export async function setReceivingTarget(db: D1Database, warehouseId: string, userId: string, targetCount: number): Promise<ReturnReceipt> {
+  if (!Number.isFinite(targetCount) || targetCount < 0) throw new Error('Received count must be a non-negative number');
   const existing = await getTodayReceipt(db, warehouseId);
-  const cumulativeReceived = (existing?.receivedCount ?? 0) + toReceive.length;
-  const stillExpected = expected.length - toReceive.length;
+  const cumulativeTarget = (existing?.expectedCount ?? 0) + targetCount;
+  const receivedCount = await countReceivedToday(db, warehouseId);
+  const receiptDate = istDateString();
 
   await db
     .prepare(
       `INSERT INTO return_receipts (warehouse_id, receipt_date, expected_count, received_count, confirmed_by, confirmed_at) VALUES (?, ?, ?, ?, ?, datetime('now'))
        ON CONFLICT (warehouse_id, receipt_date) DO UPDATE SET expected_count = excluded.expected_count, received_count = excluded.received_count, confirmed_by = excluded.confirmed_by, confirmed_at = datetime('now')`
     )
-    .bind(warehouseId, receiptDate, cumulativeReceived + stillExpected, cumulativeReceived, userId)
+    .bind(warehouseId, receiptDate, cumulativeTarget, receivedCount, userId)
     .run();
-  await logAudit(db, { userId, action: 'return.receipt_confirmed', entityType: 'warehouse', entityId: warehouseId, metadata: { receivedNow: toReceive.length, cumulativeReceived } });
+  await logAudit(db, { userId, action: 'return.receipt_target_set', entityType: 'warehouse', entityId: warehouseId, metadata: { addedTarget: targetCount, cumulativeTarget } });
 
   const confirmed = await getTodayReceipt(db, warehouseId);
   return confirmed!;
@@ -166,7 +241,7 @@ export type InspectionStatus = (typeof INSPECTION_STATUSES)[number];
 
 /**
  * Records the packer's inspection outcome. Requires the return to already
- * be 'received' (see confirmTodayReceipt) — a per-row gate, not a day-level
+ * be 'received' (see markReturnReceived) — a per-row gate, not a day-level
  * one: only returns actually confirmed off the courier are inspectable,
  * regardless of what else happened to be confirmed today. `safe_to_claim`
  * requires both images (label + product) — that's what lets the admin
@@ -204,6 +279,15 @@ export async function listReturnsForAdmin(db: D1Database, warehouseId: string, s
     return rows.results;
   }
   const rows = await db.prepare(`${RETURN_ROW_SELECT} WHERE r.warehouse_id = ? ORDER BY r.return_request_date DESC LIMIT 200`).bind(warehouseId).all<ReturnRow>();
+  return rows.results;
+}
+
+/** Full, uncapped export for the admin's CSV download — listReturnsForAdmin's 200-row cap is fine for the on-screen table, but a report needs everything in the given window. Date range is inclusive on returnRequestDate (Amazon's own "DD-Mon-YYYY" text, normalized to ISO at sync time — see parseAmazonReturnDate — so plain string comparison sorts correctly here too). */
+export async function listReturnsForExport(db: D1Database, warehouseId: string, fromDate: string, toDate: string): Promise<ReturnRow[]> {
+  const rows = await db
+    .prepare(`${RETURN_ROW_SELECT} WHERE r.warehouse_id = ? AND r.return_request_date >= ? AND r.return_request_date <= ? ORDER BY r.return_request_date ASC`)
+    .bind(warehouseId, fromDate, toDate)
+    .all<ReturnRow>();
   return rows.results;
 }
 
@@ -365,4 +449,43 @@ async function upsertReturnsRows(db: D1Database, warehouseId: string, rows: Retu
     imported++;
   }
   return imported;
+}
+
+/**
+ * Deletes SAFE-T claim label/product photos once Amazon's filing window has
+ * definitively closed — the seller's own reasoning, confirmed live: a claim
+ * can't be filed more than 30 days after a return is received, no matter
+ * what its status is here (safe_to_claim never filed, claim_filed, or
+ * otherwise), so past that point the photos serve no further purpose.
+ * Anchored on `received_at` (see migration 0036), not `claim_filed_at` —
+ * an unfiled safe_to_claim return past 30 days from receipt has already
+ * lost its filing window regardless, so there's no "protect it because it
+ * might still get filed" case to special-case. Existing rows from before
+ * `received_at` existed have it NULL and are simply never touched — no
+ * guessing on data this can't reconstruct precisely.
+ *
+ * Called once a day from the Amazon sync cron tick (see worker.ts) rather
+ * than its own trigger — Workers Free plan caps cron triggers at 5 total
+ * across the whole account (see wrangler.jsonc) — so this is a cheap,
+ * self-contained no-op on every tick that finds nothing due yet.
+ */
+export async function cleanupExpiredReturnImages(db: D1Database): Promise<{ deleted: number }> {
+  const rows = await db
+    .prepare(
+      `SELECT id, label_image_key, product_image_key FROM returns
+       WHERE received_at IS NOT NULL AND received_at < datetime('now', '-30 days')
+         AND (label_image_key IS NOT NULL OR product_image_key IS NOT NULL)`
+    )
+    .all<{ id: string; label_image_key: string | null; product_image_key: string | null }>();
+
+  let deleted = 0;
+  for (const row of rows.results) {
+    if (env.RETURNS_IMAGES) {
+      if (row.label_image_key) await env.RETURNS_IMAGES.delete(row.label_image_key);
+      if (row.product_image_key) await env.RETURNS_IMAGES.delete(row.product_image_key);
+    }
+    await db.prepare(`UPDATE returns SET label_image_key = NULL, product_image_key = NULL, updated_at = datetime('now') WHERE id = ?`).bind(row.id).run();
+    deleted++;
+  }
+  return { deleted };
 }

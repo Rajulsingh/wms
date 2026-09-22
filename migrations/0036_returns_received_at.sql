@@ -1,0 +1,13 @@
+-- Marks exactly when a return was confirmed physically received (via scan
+-- or manual fallback — see markReturnReceived in lib/returns.ts), separate
+-- from the generic updated_at column every later stage also touches. Two
+-- things need this precise anchor: (1) the receiving redesign that replaced
+-- blind FIFO count-assignment with per-return scan verification, and (2)
+-- the SAFE-T claim image retention policy — Amazon's claim-filing window
+-- closes a fixed number of days after the return was received, regardless
+-- of whether a claim was ever actually filed, so that's the correct anchor
+-- for auto-deleting label/product photos, not claim_filed_at. Left NULL for
+-- existing rows already past 'expected' — there's no reliable way to
+-- reconstruct when those actually arrived, and leaving it NULL means the
+-- cleanup job simply never touches them rather than guessing wrong.
+ALTER TABLE returns ADD COLUMN received_at TEXT;

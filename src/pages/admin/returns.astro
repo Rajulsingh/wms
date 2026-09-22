@@ -65,6 +65,14 @@ if (redirectTo) return Astro.redirect(redirectTo);
     let receipts: ReceiptRow[] = [];
     let otp: { otp: string; setAt: string; validForCount: number | null } | null = null;
 
+    // Defaults to the trailing 30 days — a reasonable first pull without
+    // forcing the admin to pick dates just to see recent activity; either
+    // field is freely editable before downloading.
+    const today = new Date().toISOString().slice(0, 10);
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    let exportFrom = thirtyDaysAgo;
+    let exportTo = today;
+
     async function api(path: string, body?: unknown, method?: string) {
       const res = await fetch(path, {
         method: method ?? (body === undefined ? 'GET' : 'POST'),
@@ -122,6 +130,21 @@ if (redirectTo) return Astro.redirect(redirectTo);
           </div>
         </div>
 
+        <div class="card stack" style="gap: 10px; margin-top: 14px;">
+          <span class="eyebrow">Returns report</span>
+          <div class="row" style="gap: 8px; align-items: center; flex-wrap: wrap;">
+            <label class="stack" style="gap: 2px; width: auto;">
+              <span style="font-size: 0.72rem; color: var(--muted);">From</span>
+              <input type="date" id="export-from" value="${exportFrom}" style="width: auto;" />
+            </label>
+            <label class="stack" style="gap: 2px; width: auto;">
+              <span style="font-size: 0.72rem; color: var(--muted);">To</span>
+              <input type="date" id="export-to" value="${exportTo}" style="width: auto;" />
+            </label>
+            <button class="btn" id="download-returns-csv" style="width: auto; align-self: flex-end;">Download CSV</button>
+          </div>
+        </div>
+
         <div class="row" style="gap: 8px; margin-top: 18px;">
           <button class="pill tab-pill ${activeTab === 'amazon' ? 'active' : ''}" id="tab-amazon" style="border: none; cursor: pointer;">From Amazon (${amazonRows.length})</button>
           <button class="pill tab-pill ${activeTab === 'packer' ? 'active' : ''}" id="tab-packer" style="border: none; cursor: pointer;">Reported by packers</button>
@@ -130,6 +153,7 @@ if (redirectTo) return Astro.redirect(redirectTo);
         <div style="margin-top: 14px;" data-tab-content></div>`;
 
       document.getElementById('save-otp')?.addEventListener('click', (e) => saveOtp(e.currentTarget as HTMLButtonElement));
+      document.getElementById('download-returns-csv')?.addEventListener('click', (e) => downloadReturnsCsv(e.currentTarget as HTMLButtonElement));
       document.getElementById('tab-amazon')?.addEventListener('click', () => {
         activeTab = 'amazon';
         render();
@@ -171,9 +195,10 @@ if (redirectTo) return Astro.redirect(redirectTo);
       </tr>`;
     }
 
-    // What the floor has actually reported: daily headcount confirmations
-    // (see confirmTodayReceipt in lib/returns.ts) plus the inspection
-    // outcome queue, still with the claim-filing action for safe_to_claim.
+    // What the floor has actually reported: daily receiving targets vs.
+    // actual scan/manually-verified counts (see setReceivingTarget/
+    // markReturnReceived in lib/returns.ts) plus the inspection outcome
+    // queue, still with the claim-filing action for safe_to_claim.
     function renderPackerTab(container: HTMLElement) {
       container.innerHTML = `
         <span class="eyebrow">Daily receiving confirmations</span>
@@ -255,6 +280,35 @@ if (redirectTo) return Astro.redirect(redirectTo);
         await api('/api/admin/returns/otp', { warehouseId, otp: value, validForCount });
         await loadOtp();
         render();
+      });
+    }
+
+    // Uncapped, date-ranged pull (see listReturnsForExport in lib/returns.ts)
+    // — deliberately separate from amazonRows/packerRows, which are capped
+    // for on-screen display and don't carry a date filter.
+    async function downloadReturnsCsv(btn: HTMLButtonElement) {
+      const from = (document.getElementById('export-from') as HTMLInputElement).value;
+      const to = (document.getElementById('export-to') as HTMLInputElement).value;
+      if (!from || !to) return;
+      await withLoading(btn, 'Preparing…', async () => {
+        const data = await api(`/api/admin/returns/export?warehouseId=${warehouseId}&from=${from}&to=${to}`);
+        const rows: ReturnRow[] = data.returns ?? [];
+        const csvEscape = (v: string) => `"${v.replace(/"/g, '""')}"`;
+        const header = ['Order ID', 'Item', 'MSKU/ASIN', 'Reason', 'Request date', 'Tracking', 'Status'];
+        const lines = [
+          header.join(','),
+          ...rows.map((r) =>
+            [r.externalOrderId, r.itemName || r.skuName || '', r.merchantSku || r.asin || '', r.returnReason || '', r.returnRequestDate || '', r.trackingId || '', STATUS_LABELS[r.status] ?? r.status]
+              .map((v) => csvEscape(v ?? ''))
+              .join(',')
+          )
+        ];
+        const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `returns-${from}-to-${to}.csv`;
+        a.click();
+        URL.revokeObjectURL(a.href);
       });
     }
 

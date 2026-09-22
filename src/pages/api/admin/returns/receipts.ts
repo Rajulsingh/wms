@@ -3,7 +3,7 @@ import { getDb } from '../../../../lib/db';
 import { requireUser, requireOwnWarehouse, AuthError } from '../../../../lib/auth';
 import { listRecentReceipts } from '../../../../lib/returns';
 
-/** The "as reported by packers" headcount history — see migration 0031 and confirmTodayReceipt in lib/returns.ts. */
+/** The "as reported by packers" headcount history — see migration 0031 and setReceivingTarget/markReturnReceived in lib/returns.ts. */
 export const GET: APIRoute = async (context) => {
   const db = getDb();
   try {
