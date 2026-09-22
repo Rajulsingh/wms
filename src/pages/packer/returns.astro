@@ -276,12 +276,16 @@ const initialData =
       const scanArea = document.getElementById('scan-area')!;
       scanArea.innerHTML = `
         <video class="scanner" id="video" style="margin-top: 10px;"></video>
-        <div class="row" style="margin-top: 10px; gap: 8px;">
-          <input type="text" id="manual-code" placeholder="Or type/scan the AWB or order id and press Enter" autocomplete="off" autocapitalize="off" />
-          <button class="btn btn-ghost" id="stop-scan" style="width: auto;">Cancel</button>
+        <div class="stack" id="manual-code-wrap" style="margin-top: 10px; gap: 4px; cursor: text;">
+          <span style="font-size: 0.72rem; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.02em;">Handheld scanner input — tap here first</span>
+          <div class="row" style="gap: 8px;">
+            <input type="text" id="manual-code" placeholder="Or type the AWB or order id and press Enter" autocomplete="off" autocapitalize="off" />
+            <button class="btn btn-ghost" id="stop-scan" style="width: auto;">Cancel</button>
+          </div>
         </div>`;
       document.getElementById('stop-scan')?.addEventListener('click', endScanning);
-      document.getElementById('manual-code')?.addEventListener('keydown', (e) => {
+      const manualInput = document.getElementById('manual-code') as HTMLInputElement;
+      manualInput.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') {
           e.preventDefault();
           const input = e.currentTarget as HTMLInputElement;
@@ -292,11 +296,27 @@ const initialData =
           }
         }
       });
+      // A handheld/Bluetooth scanner is a keyboard wedge — it types into
+      // whatever already has focus, no click possible mid-scan. Focusing
+      // this the moment scan mode opens means it just works without a
+      // packer having to first tap the tiny text field by hand; clicking
+      // anywhere in the labeled row re-focuses it too, in case focus ever
+      // lands elsewhere (e.g. the camera permission prompt).
+      document.getElementById('manual-code-wrap')?.addEventListener('click', (e) => {
+        if ((e.target as HTMLElement).id !== 'stop-scan') manualInput.focus();
+      });
+      manualInput.focus();
       const video = document.getElementById('video') as HTMLVideoElement;
       startContinuousScan(video, handleScannedCode, () => {
-        scanning = false;
-        flash = { kind: 'danger', message: 'Could not open camera — use the text field to enter codes instead.' };
-        render();
+        // No camera/permission — swap just the video element for an inline
+        // notice and keep going in manual mode. This used to call render(),
+        // which rebuilds the whole queue view and destroys the very text
+        // field the message points the packer to — so on a device where the
+        // camera never opens, the fallback vanished before it could be
+        // used. `scanning` stays true so the 15s poll (gated on it) doesn't
+        // also tear this down a few seconds later.
+        video.outerHTML = '<div class="banner banner-danger" style="margin-top: 10px;">Could not open camera — use the text field below to enter codes instead.</div>';
+        manualInput.focus();
       });
     }
 
